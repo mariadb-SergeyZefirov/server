@@ -484,7 +484,8 @@ static struct show_privileges_st sys_privileges[]=
   {"Binlog admin", "Server", "To purge binary logs"},
   {"Binlog monitor", "Server", "To use SHOW BINLOG STATUS and SHOW BINARY LOG"},
   {"Replication master admin", "Server", "To monitor connected slaves"},
-  {"Replication slave admin", "Server", "To start/monitor/stop slave and apply binlog events"},
+  {"Replication slave admin", "Server", "To start/stop slave and apply binlog events"},
+  {"Slave monitor", "Server", "To use SHOW SLAVE STATUS and SHOW RELAYLOG EVENTS"},
   {"Replication slave","Server Admin","To read binary log events from the master"},
   {"Select", "Tables",  "To retrieve rows from table"},
   {"Show databases","Server Admin","To see all databases with SHOW DATABASES"},
@@ -3670,12 +3671,9 @@ static bool show_status_array(THD *thd, const char *wild,
   char name_buffer[NAME_CHAR_LEN];
   int len;
   SHOW_VAR tmp, *var;
-  enum_check_fields save_count_cuted_fields= thd->count_cuted_fields;
   bool res= FALSE;
   CHARSET_INFO *charset= system_charset_info;
   DBUG_ENTER("show_status_array");
-
-  thd->count_cuted_fields= CHECK_FIELD_WARN;
 
   prefix_end=strnmov(name_buffer, prefix, sizeof(name_buffer)-1);
   if (*prefix)
@@ -3776,6 +3774,8 @@ static bool show_status_array(THD *thd, const char *wild,
         pos= get_one_variable(thd, var, scope, show_type, status_var,
                               &charset, buff, &length);
 
+        if (table->field[1]->field_length)
+          thd->count_cuted_fields= CHECK_FIELD_WARN;
         table->field[1]->store(pos, (uint32) length, charset);
         thd->count_cuted_fields= CHECK_FIELD_IGNORE;
         table->field[1]->set_notnull();
@@ -3793,7 +3793,6 @@ static bool show_status_array(THD *thd, const char *wild,
     }
   }
 end:
-  thd->count_cuted_fields= save_count_cuted_fields;
   DBUG_RETURN(res);
 }
 
@@ -4520,8 +4519,7 @@ fill_schema_table_by_open(THD *thd, MEM_ROOT *mem_root,
                           Open_tables_backup *open_tables_state_backup,
                           bool can_deadlock)
 {
-  Query_arena i_s_arena(mem_root,
-                        Query_arena::STMT_CONVENTIONAL_EXECUTION),
+  Query_arena i_s_arena(mem_root, Query_arena::STMT_CONVENTIONAL_EXECUTION),
               backup_arena, *old_arena;
   LEX *old_lex= thd->lex, temp_lex, *lex;
   LEX_CSTRING db_name, table_name;
@@ -5036,14 +5034,12 @@ end:
 class Warnings_only_error_handler : public Internal_error_handler
 {
 public:
-  bool handle_condition(THD *thd,
-                        uint sql_errno,
-                        const char* sqlstate,
+  bool handle_condition(THD *thd, uint sql_errno, const char* sqlstate,
                         Sql_condition::enum_warning_level *level,
-                        const char* msg,
-                        Sql_condition ** cond_hdl)
+                        const char* msg, Sql_condition ** cond_hdl)
   {
-    if (sql_errno == ER_TRG_NO_DEFINER || sql_errno == ER_TRG_NO_CREATION_CTX)
+    if (sql_errno == ER_TRG_NO_DEFINER || sql_errno == ER_TRG_NO_CREATION_CTX
+        || sql_errno == ER_PARSE_ERROR)
       return true;
 
     if (*level != Sql_condition::WARN_LEVEL_ERROR)
@@ -5250,6 +5246,11 @@ int get_all_tables(THD *thd, TABLE_LIST *tables, COND *cond)
               goto err;
             free_root(&tmp_mem_root, MY_MARK_BLOCKS_FREE);
           }
+        }
+        if (thd->killed == ABORT_QUERY)
+        {
+          error= 0;
+          goto err;
         }
       }
     }
@@ -8041,51 +8042,6 @@ ST_SCHEMA_TABLE *get_schema_table(enum enum_schema_tables schema_table_idx)
   return &schema_tables[schema_table_idx];
 }
 
-static void
-mark_all_fields_used_in_query(THD *thd,
-                              ST_FIELD_INFO *schema_fields,
-                              MY_BITMAP *bitmap,
-                              Item *all_items)
-{
-  Item *item;
-  DBUG_ENTER("mark_all_fields_used_in_query");
-
-  /* If not SELECT command, return all columns */
-  if (thd->lex->sql_command != SQLCOM_SELECT &&
-      thd->lex->sql_command != SQLCOM_SET_OPTION)
-  {
-    bitmap_set_all(bitmap);
-    DBUG_VOID_RETURN;
-  }
-
-  for (item= all_items ; item ; item= item->next)
-  {
-    if (item->type() == Item::FIELD_ITEM)
-    {
-      ST_FIELD_INFO *fields= schema_fields;
-      uint count;
-      Item_field *item_field= (Item_field*) item;
-
-      /* item_field can be '*' as this function is called before fix_fields */
-      if (item_field->field_name.str == star_clex_str.str)
-      {
-        bitmap_set_all(bitmap);
-        break;
-      }
-      for (count=0; !fields->end_marker(); fields++, count++)
-      {
-        if (!my_strcasecmp(system_charset_info, fields->name().str,
-                           item_field->field_name.str))
-        {
-          bitmap_set_bit(bitmap, count);
-          break;
-        }
-      }
-    }
-  }
-  DBUG_VOID_RETURN;
-}
-
 /**
   Create information_schema table using schema_table data.
 
@@ -8098,7 +8054,7 @@ mark_all_fields_used_in_query(THD *thd,
     0<decimals<10 and 0<=length<100 .
 
   @param
-    thd	       	          thread handler
+    thd                   thread handler
 
   @param table_list Used to pass I_S table information(fields info, tables
   parameters etc) and table name.
@@ -8109,32 +8065,16 @@ mark_all_fields_used_in_query(THD *thd,
 
 TABLE *create_schema_table(THD *thd, TABLE_LIST *table_list)
 {
-  uint field_count;
-  Item *all_items;
+  uint field_count= 0;
   TABLE *table;
   ST_SCHEMA_TABLE *schema_table= table_list->schema_table;
-  ST_FIELD_INFO *fields_info= schema_table->fields_info;
-  ST_FIELD_INFO *fields;
-  MY_BITMAP bitmap;
-  my_bitmap_map *buf;
+  ST_FIELD_INFO *fields= schema_table->fields_info;
+  bool need_all_fieds= table_list->schema_table_reformed || // SHOW command
+                       thd->lex->only_view_structure(); // need table structure
   DBUG_ENTER("create_schema_table");
 
-  for (field_count= 0, fields= fields_info; !fields->end_marker(); fields++)
+  for (; !fields->end_marker(); fields++)
     field_count++;
-  if (!(buf= (my_bitmap_map*) thd->alloc(bitmap_buffer_size(field_count))))
-    DBUG_RETURN(NULL);
-  my_bitmap_init(&bitmap, buf, field_count, 0);
-
-  if (!thd->stmt_arena->is_conventional() &&
-      thd->mem_root != thd->stmt_arena->mem_root)
-    all_items= thd->stmt_arena->free_list;
-  else
-    all_items= thd->free_list;
-
-  if (table_list->part_of_natural_join)
-    bitmap_set_all(&bitmap);
-  else
-    mark_all_fields_used_in_query(thd, fields_info, &bitmap, all_items);
 
   TMP_TABLE_PARAM *tmp_table_param = new (thd->mem_root) TMP_TABLE_PARAM;
   tmp_table_param->init();
@@ -8143,13 +8083,9 @@ TABLE *create_schema_table(THD *thd, TABLE_LIST *table_list)
   tmp_table_param->schema_table= 1;
   SELECT_LEX *select_lex= table_list->select_lex;
   bool keep_row_order= is_show_command(thd);
-  if (!(table= create_tmp_table_for_schema(thd, tmp_table_param,
-                                           *schema_table, bitmap,
-                                           (select_lex->options |
-                                            thd->variables.option_bits |
-                                            TMP_TABLE_ALL_COLUMNS),
-                                            table_list->alias,
-                                            keep_row_order)))
+  if (!(table= create_tmp_table_for_schema(thd, tmp_table_param, *schema_table,
+                 (select_lex->options | thd->variables.option_bits | TMP_TABLE_ALL_COLUMNS),
+                  table_list->alias, !need_all_fieds, keep_row_order)))
     DBUG_RETURN(0);
   my_bitmap_map* bitmaps=
     (my_bitmap_map*) thd->alloc(bitmap_buffer_size(field_count));
@@ -8541,6 +8477,69 @@ end:
 }
 
 
+bool optimize_schema_tables_memory_usage(List<TABLE_LIST> &tables)
+{
+  List_iterator<TABLE_LIST> tli(tables);
+
+  while (TABLE_LIST *table_list= tli++)
+  {
+    TABLE *table= table_list->table;
+    THD *thd=table->in_use;
+
+    if (!table_list->schema_table || !thd->fill_information_schema_tables())
+      continue;
+
+    if (!table->is_created())
+    {
+      TMP_TABLE_PARAM *p= table_list->schema_table_param;
+      TMP_ENGINE_COLUMNDEF *from_recinfo, *to_recinfo;
+      DBUG_ASSERT(table->s->keys == 0);
+      DBUG_ASSERT(table->s->uniques == 0);
+
+      uchar *cur= table->field[0]->ptr;
+      /* first recinfo could be a NULL bitmap, not an actual Field */
+      from_recinfo= to_recinfo= p->start_recinfo + (cur != table->record[0]);
+      for (uint i=0; i < table->s->fields; i++, from_recinfo++)
+      {
+        Field *field= table->field[i];
+        DBUG_ASSERT(field->vcol_info == 0);
+        DBUG_ASSERT(from_recinfo->length);
+        DBUG_ASSERT(from_recinfo->length == field->pack_length_in_rec());
+        if (bitmap_is_set(table->read_set, i))
+        {
+          field->move_field(cur);
+          *to_recinfo++= *from_recinfo;
+          cur+= from_recinfo->length;
+        }
+        else
+        {
+          field= new (thd->mem_root) Field_string(cur, 0, field->null_ptr,
+                                field->null_bit, Field::NONE,
+                                &field->field_name, field->dtcollation());
+          field->init(table);
+          field->field_index= i;
+          DBUG_ASSERT(field->pack_length_in_rec() == 0);
+          table->field[i]= field;
+        }
+      }
+      if ((table->s->reclength= (ulong)(cur - table->record[0])) == 0)
+      {
+        /* all fields were optimized away. Force a non-0-length row */
+        table->s->reclength= to_recinfo->length= 1;
+        to_recinfo++;
+      }
+      p->recinfo= to_recinfo;
+
+      // TODO switch from Aria to Memory if all blobs were optimized away?
+      if (instantiate_tmp_table(table, p->keyinfo, p->start_recinfo, &p->recinfo,
+                   table_list->select_lex->options | thd->variables.option_bits))
+        return 1;
+    }
+  }
+  return 0;
+}
+
+
 /*
   This is the optimizer part of get_schema_tables_result().
 */
@@ -8583,10 +8582,10 @@ bool optimize_schema_tables_reads(JOIN *join)
         cond= tab->cache_select->cond;
       }
       if (optimize_for_get_all_tables(thd, table_list, cond))
-        DBUG_RETURN(TRUE);   // Handle OOM
+        DBUG_RETURN(1);   // Handle OOM
     }
   }
-  DBUG_RETURN(FALSE);
+  DBUG_RETURN(0);
 }
 
 
@@ -8651,13 +8650,10 @@ bool get_schema_tables_result(JOIN *join,
         continue;
 
       /*
-        If schema table is already processed and
-        the statement is not a subselect then
-        we don't need to fill this table again.
-        If schema table is already processed and
-        schema_table_state != executed_place then
-        table is already processed and
-        we should skip second data processing.
+        If schema table is already processed and the statement is not a
+        subselect then we don't need to fill this table again. If schema table
+        is already processed and schema_table_state != executed_place then
+        table is already processed and we should skip second data processing.
       */
       if (table_list->schema_table_state &&
           (!is_subselect || table_list->schema_table_state != executed_place))
@@ -8693,6 +8689,7 @@ bool get_schema_tables_result(JOIN *join,
       }
 
       Switch_to_definer_security_ctx backup_ctx(thd, table_list);
+      Check_level_instant_set check_level_save(thd, CHECK_FIELD_IGNORE);
       if (table_list->schema_table->fill_table(thd, table_list, cond))
       {
         result= 1;
@@ -8719,8 +8716,7 @@ bool get_schema_tables_result(JOIN *join,
       It also means that an audit plugin cannot process the error correctly
       either. See also thd->clear_error()
     */
-    thd->get_stmt_da()->push_warning(thd,
-                                     thd->get_stmt_da()->sql_errno(),
+    thd->get_stmt_da()->push_warning(thd, thd->get_stmt_da()->sql_errno(),
                                      thd->get_stmt_da()->get_sqlstate(),
                                      Sql_condition::WARN_LEVEL_ERROR,
                                      thd->get_stmt_da()->message());
@@ -9483,7 +9479,8 @@ ST_FIELD_INFO check_constraints_fields_info[]=
   Column("CONSTRAINT_SCHEMA",  Name(),    NOT_NULL, OPEN_FULL_TABLE),
   Column("TABLE_NAME",         Name(),    NOT_NULL, OPEN_FULL_TABLE),
   Column("CONSTRAINT_NAME",    Name(),    NOT_NULL, OPEN_FULL_TABLE),
-  Column("CHECK_CLAUSE",       Name(),    NOT_NULL, OPEN_FULL_TABLE),
+  Column("CHECK_CLAUSE",       Longtext(MAX_FIELD_VARCHARLENGTH),
+                                          NOT_NULL, OPEN_FULL_TABLE),
   CEnd()
 };
 

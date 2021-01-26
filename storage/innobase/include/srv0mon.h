@@ -36,7 +36,7 @@ Created 12/15/2009	Jimmy Yang
 #define __STDC_LIMIT_MACROS
 #endif /* __STDC_LIMIT_MACROS */
 
-#include <stdint.h>
+#include <cstdint>
 #include "my_atomic.h"
 #include "my_atomic_wrapper.h"
 
@@ -195,18 +195,9 @@ enum monitor_id_t {
 	MONITOR_FLUSH_N_TO_FLUSH_REQUESTED,
 
 	MONITOR_FLUSH_N_TO_FLUSH_BY_AGE,
-	MONITOR_FLUSH_ADAPTIVE_AVG_TIME_SLOT,
-	MONITOR_LRU_BATCH_FLUSH_AVG_TIME_SLOT,
-
-	MONITOR_FLUSH_ADAPTIVE_AVG_TIME_THREAD,
-	MONITOR_LRU_BATCH_FLUSH_AVG_TIME_THREAD,
-	MONITOR_FLUSH_ADAPTIVE_AVG_TIME_EST,
-	MONITOR_LRU_BATCH_FLUSH_AVG_TIME_EST,
-	MONITOR_FLUSH_AVG_TIME,
+	MONITOR_FLUSH_ADAPTIVE_AVG_TIME,
 
 	MONITOR_FLUSH_ADAPTIVE_AVG_PASS,
-	MONITOR_LRU_BATCH_FLUSH_AVG_PASS,
-	MONITOR_FLUSH_AVG_PASS,
 
 	MONITOR_LRU_GET_FREE_LOOPS,
 	MONITOR_LRU_GET_FREE_WAITS,
@@ -234,9 +225,6 @@ enum monitor_id_t {
 	MONITOR_LRU_BATCH_EVICT_TOTAL_PAGE,
 	MONITOR_LRU_BATCH_EVICT_COUNT,
 	MONITOR_LRU_BATCH_EVICT_PAGES,
-	MONITOR_LRU_SINGLE_FLUSH_SCANNED,
-	MONITOR_LRU_SINGLE_FLUSH_SCANNED_NUM_CALL,
-	MONITOR_LRU_SINGLE_FLUSH_SCANNED_PER_CALL,
 	MONITOR_LRU_SINGLE_FLUSH_FAILURE_COUNT,
 	MONITOR_LRU_GET_FREE_SEARCH,
 	MONITOR_LRU_SEARCH_SCANNED,
@@ -326,7 +314,6 @@ enum monitor_id_t {
 	MONITOR_LSN_CHECKPOINT_AGE,
 	MONITOR_OVLD_BUF_OLDEST_LSN,
 	MONITOR_OVLD_MAX_AGE_ASYNC,
-	MONITOR_OVLD_MAX_AGE_SYNC,
 	MONITOR_PENDING_LOG_FLUSH,
 	MONITOR_PENDING_CHECKPOINT_WRITE,
 	MONITOR_LOG_IO,
@@ -402,19 +389,9 @@ enum monitor_id_t {
 	MONITOR_SRV_DICT_LRU_MICROSECOND,
 	MONITOR_SRV_DICT_LRU_EVICT_COUNT_ACTIVE,
 	MONITOR_SRV_DICT_LRU_EVICT_COUNT_IDLE,
-	MONITOR_SRV_CHECKPOINT_MICROSECOND,
 	MONITOR_OVLD_SRV_DBLWR_WRITES,
 	MONITOR_OVLD_SRV_DBLWR_PAGES_WRITTEN,
 	MONITOR_OVLD_SRV_PAGE_SIZE,
-	MONITOR_OVLD_RWLOCK_S_SPIN_WAITS,
-	MONITOR_OVLD_RWLOCK_X_SPIN_WAITS,
-	MONITOR_OVLD_RWLOCK_SX_SPIN_WAITS,
-	MONITOR_OVLD_RWLOCK_S_SPIN_ROUNDS,
-	MONITOR_OVLD_RWLOCK_X_SPIN_ROUNDS,
-	MONITOR_OVLD_RWLOCK_SX_SPIN_ROUNDS,
-	MONITOR_OVLD_RWLOCK_S_OS_WAITS,
-	MONITOR_OVLD_RWLOCK_X_OS_WAITS,
-	MONITOR_OVLD_RWLOCK_SX_OS_WAITS,
 
 	/* Data DML related counters */
 	MONITOR_MODULE_DML_STATS,
@@ -441,10 +418,6 @@ enum monitor_id_t {
 	MONITOR_ICP_NO_MATCH,
 	MONITOR_ICP_OUT_OF_RANGE,
 	MONITOR_ICP_MATCH,
-
-	/* Mutex/RW-Lock related counters */
-	MONITOR_MODULE_LATCHES,
-	MONITOR_LATCHES,
 
 	/* This is used only for control system to turn
 	on/off and reset all monitor counters */
@@ -495,23 +468,23 @@ enum mon_option_t {
 
 /** This "monitor_set_tbl" is a bitmap records whether a particular monitor
 counter has been turned on or off */
-extern ulint		monitor_set_tbl[(NUM_MONITOR + NUM_BITS_ULINT - 1) /
-					NUM_BITS_ULINT];
+extern Atomic_relaxed<ulint>
+    monitor_set_tbl[(NUM_MONITOR + NUM_BITS_ULINT - 1) / NUM_BITS_ULINT];
 
 /** Macros to turn on/off the control bit in monitor_set_tbl for a monitor
 counter option. */
-#define MONITOR_ON(monitor)					\
-	(monitor_set_tbl[unsigned(monitor) / NUM_BITS_ULINT] |=	\
-	 (ulint(1) << (unsigned(monitor) % NUM_BITS_ULINT)))
+#define MONITOR_ON(monitor)                                                   \
+  (monitor_set_tbl[unsigned(monitor) / NUM_BITS_ULINT].fetch_or(              \
+      (ulint(1) << (unsigned(monitor) % NUM_BITS_ULINT))))
 
-#define MONITOR_OFF(monitor)					\
-	(monitor_set_tbl[unsigned(monitor) / NUM_BITS_ULINT] &=	\
-	 ~(ulint(1) << (unsigned(monitor) % NUM_BITS_ULINT)))
+#define MONITOR_OFF(monitor)                                                  \
+  (monitor_set_tbl[unsigned(monitor) / NUM_BITS_ULINT].fetch_and(             \
+      ~(ulint(1) << (unsigned(monitor) % NUM_BITS_ULINT))))
 
 /** Check whether the requested monitor is turned on/off */
-#define MONITOR_IS_ON(monitor)					\
-	(monitor_set_tbl[unsigned(monitor) / NUM_BITS_ULINT] &	\
-	 (ulint(1) << (unsigned(monitor) % NUM_BITS_ULINT)))
+#define MONITOR_IS_ON(monitor)                                                \
+  (monitor_set_tbl[unsigned(monitor) / NUM_BITS_ULINT] &                      \
+   (ulint(1) << (unsigned(monitor) % NUM_BITS_ULINT)))
 
 /** The actual monitor counter array that records each monintor counter
 value */

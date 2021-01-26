@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2020, MariaDB Corporation.
+Copyright (c) 2017, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -250,8 +250,6 @@ for a gap x-lock to the lock queue.
 dberr_t
 lock_rec_insert_check_and_lock(
 /*===========================*/
-	ulint		flags,	/*!< in: if BTR_NO_LOCKING_FLAG bit is
-				set, does nothing */
 	const rec_t*	rec,	/*!< in: record after which to insert */
 	buf_block_t*	block,	/*!< in/out: buffer block of rec */
 	dict_index_t*	index,	/*!< in: index */
@@ -386,37 +384,6 @@ lock_clust_rec_read_check_and_lock_alt(
 	que_thr_t*		thr)	/*!< in: query thread */
 	MY_ATTRIBUTE((warn_unused_result));
 /*********************************************************************//**
-Checks that a record is seen in a consistent read.
-@return true if sees, or false if an earlier version of the record
-should be retrieved */
-bool
-lock_clust_rec_cons_read_sees(
-/*==========================*/
-	const rec_t*	rec,	/*!< in: user record which should be read or
-				passed over by a read cursor */
-	dict_index_t*	index,	/*!< in: clustered index */
-	const rec_offs*	offsets,/*!< in: rec_get_offsets(rec, index) */
-	ReadView*	view);	/*!< in: consistent read view */
-/*********************************************************************//**
-Checks that a non-clustered index record is seen in a consistent read.
-
-NOTE that a non-clustered index page contains so little information on
-its modifications that also in the case false, the present version of
-rec may be the right, but we must check this from the clustered index
-record.
-
-@return true if certainly sees, or false if an earlier version of the
-clustered index record might be needed */
-bool
-lock_sec_rec_cons_read_sees(
-/*========================*/
-	const rec_t*		rec,	/*!< in: user record which
-					should be read or passed over
-					by a read cursor */
-	const dict_index_t*     index,  /*!< in: index */
-	const ReadView*	view)	/*!< in: consistent read view */
-	MY_ATTRIBUTE((warn_unused_result));
-/*********************************************************************//**
 Locks the specified database table in the mode given. If the lock cannot
 be granted immediately, the query thread is put to wait.
 @return DB_SUCCESS, DB_LOCK_WAIT, or DB_DEADLOCK */
@@ -437,6 +404,17 @@ lock_table_ix_resurrect(
 /*====================*/
 	dict_table_t*	table,	/*!< in/out: table */
 	trx_t*		trx);	/*!< in/out: transaction */
+
+/** Create a table X lock object for a resurrected TRX_UNDO_EMPTY transaction.
+@param table    table to be X-locked
+@param trx      transaction */
+void lock_table_x_resurrect(dict_table_t *table, trx_t *trx);
+
+/** Release a table X lock after rolling back an insert into an empty table
+(which was covered by a TRX_UNDO_EMPTY record).
+@param table    table to be X-unlocked
+@param trx      transaction */
+void lock_table_x_unlock(dict_table_t *table, trx_t *trx);
 
 /** Sets a lock on a table based on the given mode.
 @param[in]	table	table to lock
@@ -534,16 +512,6 @@ void
 lock_print_info_all_transactions(
 /*=============================*/
 	FILE*	file);	/*!< in: file where to print */
-/*********************************************************************//**
-Return approximate number or record locks (bits set in the bitmap) for
-this transaction. Since delete-marked records may be removed, the
-record count will not be precise.
-The caller must be holding lock_sys.mutex. */
-ulint
-lock_number_of_rows_locked(
-/*=======================*/
-	const trx_lock_t*	trx_lock)	/*!< in: transaction locks */
-	MY_ATTRIBUTE((warn_unused_result));
 
 /*********************************************************************//**
 Return the number of table locks for a transaction.
@@ -659,11 +627,6 @@ lock_trx_lock_list_init(
 /*====================*/
 	trx_lock_list_t*	lock_list);	/*!< List to initialise */
 
-/*******************************************************************//**
-Set the lock system timeout event. */
-void
-lock_set_timeout_event();
-/*====================*/
 /*********************************************************************//**
 Checks that a transaction id is sensible, i.e., not in the future.
 @return true if ok */
@@ -706,17 +669,14 @@ struct lock_op_t{
 	lock_mode	mode;	/*!< lock mode */
 };
 
-typedef ib_mutex_t LockMutex;
-
 /** The lock system struct */
 class lock_sys_t
 {
   bool m_initialised;
 
+  /** mutex proteting the locks */
+  MY_ALIGNED(CACHE_LINE_SIZE) mysql_mutex_t mutex;
 public:
-	MY_ALIGNED(CACHE_LINE_SIZE)
-	LockMutex	mutex;			/*!< Mutex protecting the
-						locks */
   /** record locks */
   hash_table_t rec_hash;
   /** predicate locks for SPATIAL INDEX */
@@ -724,22 +684,13 @@ public:
   /** page locks for SPATIAL INDEX */
   hash_table_t prdt_page_hash;
 
-	MY_ALIGNED(CACHE_LINE_SIZE)
-	LockMutex	wait_mutex;		/*!< Mutex protecting the
-						next two fields */
+  /** mutex protecting waiting_threads, last_slot */
+  MY_ALIGNED(CACHE_LINE_SIZE) mysql_mutex_t wait_mutex;
 	srv_slot_t*	waiting_threads;	/*!< Array  of user threads
 						suspended while waiting for
-						locks within InnoDB, protected
-						by the lock_sys.wait_mutex;
-						os_event_set() and
-						os_event_reset() on
-						waiting_threads[]->event
-						are protected by
-						trx_t::mutex */
+						locks within InnoDB */
 	srv_slot_t*	last_slot;		/*!< highest slot ever used
-						in the waiting_threads array,
-						protected by
-						lock_sys.wait_mutex */
+						in the waiting_threads array */
 
 	ulint		n_lock_max_wait_time;	/*!< Max wait time */
 
@@ -758,6 +709,29 @@ public:
 
   bool is_initialised() { return m_initialised; }
 
+#ifdef HAVE_PSI_MUTEX_INTERFACE
+  /** Try to acquire lock_sys.mutex */
+  ATTRIBUTE_NOINLINE int mutex_trylock();
+  /** Acquire lock_sys.mutex */
+  ATTRIBUTE_NOINLINE void mutex_lock();
+  /** Release lock_sys.mutex */
+  ATTRIBUTE_NOINLINE void mutex_unlock();
+#else
+  /** Try to acquire lock_sys.mutex */
+  int mutex_trylock() { return mysql_mutex_trylock(&mutex); }
+  /** Aqcuire lock_sys.mutex */
+  void mutex_lock() { mysql_mutex_lock(&mutex); }
+  /** Release lock_sys.mutex */
+  void mutex_unlock() { mysql_mutex_unlock(&mutex); }
+#endif
+  /** Assert that mutex_lock() has been invoked */
+  void mutex_assert_locked() const { mysql_mutex_assert_owner(&mutex); }
+  /** Assert that mutex_lock() has not been invoked */
+  void mutex_assert_unlocked() const { mysql_mutex_assert_not_owner(&mutex); }
+
+  /** Wait for a lock to be granted */
+  void wait_lock(lock_t **lock, mysql_cond_t *cond)
+  { while (*lock) mysql_cond_wait(cond, &mutex); }
 
   /**
     Creates the lock system at database start.
@@ -780,7 +754,7 @@ public:
 
   /** @return the hash value for a page address */
   ulint hash(const page_id_t id) const
-  { ut_ad(mutex_own(&mutex)); return rec_hash.calc_hash(id.fold()); }
+  { mysql_mutex_assert_owner(&mutex); return rec_hash.calc_hash(id.fold()); }
 
   /** Get the first lock on a page.
   @param lock_hash   hash table to look at
@@ -929,36 +903,6 @@ lock_rec_free_all_from_discard_page(
 
 /** The lock system */
 extern lock_sys_t lock_sys;
-
-/** Test if lock_sys.mutex can be acquired without waiting. */
-#define lock_mutex_enter_nowait() 		\
-	(lock_sys.mutex.trylock(__FILE__, __LINE__))
-
-/** Test if lock_sys.mutex is owned. */
-#define lock_mutex_own() (lock_sys.mutex.is_owned())
-
-/** Acquire the lock_sys.mutex. */
-#define lock_mutex_enter() do {			\
-	mutex_enter(&lock_sys.mutex);		\
-} while (0)
-
-/** Release the lock_sys.mutex. */
-#define lock_mutex_exit() do {			\
-	lock_sys.mutex.exit();			\
-} while (0)
-
-/** Test if lock_sys.wait_mutex is owned. */
-#define lock_wait_mutex_own() (lock_sys.wait_mutex.is_owned())
-
-/** Acquire the lock_sys.wait_mutex. */
-#define lock_wait_mutex_enter() do {		\
-	mutex_enter(&lock_sys.wait_mutex);	\
-} while (0)
-
-/** Release the lock_sys.wait_mutex. */
-#define lock_wait_mutex_exit() do {		\
-	lock_sys.wait_mutex.exit();		\
-} while (0)
 
 #ifdef WITH_WSREP
 /*********************************************************************//**

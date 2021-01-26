@@ -41,6 +41,7 @@ addons:
       - g++-10   # In suites: focal, bionic (via ppa:ubuntu-toolchain-r/test)
       - gdb
       - libaio-dev
+      - libarchive-dev
       - libboost-atomic-dev
       - libboost-chrono-dev
       - libboost-date-time-dev
@@ -50,11 +51,12 @@ addons:
       - libboost-system-dev
       - libboost-thread-dev
       - libcrack2-dev
-      - libcurl3-dev
+      - libcurl4-openssl-dev
       - libdbd-mysql
       - libedit-dev
       - libjemalloc-dev
       - libjudy-dev
+      - libkrb5-dev
       - liblz4-dev
       - libncurses5-dev
       - libnuma-dev
@@ -63,7 +65,6 @@ addons:
       - libreadline-gplv2-dev
       - libsnappy-dev
       - libssl-dev
-      - libstemmer-dev
       - libxml2-dev
       - lsb-release
       - perl
@@ -114,8 +115,8 @@ compiler:
   - clang
 env:
   - CC_VERSION=7 TYPE=RelWithDebInfo MYSQL_TEST_SUITES=archive,optimizer_unfixed_bugs,parts,sys_vars,unit,vcol,innodb,innodb_gis,innodb_zip,innodb_fts
-  - CC_VERSION=7 TYPE=RelWithDebInfo MYSQL_TEST_SUITES=binlog,binlog_encryption,encryption,rocksdb,versioning,rpl
-  - CC_VERSION=7 TYPE=RelWithDebInfo MYSQL_TEST_SUITES=csv,federated,funcs_1,funcs_2,gcol,handler,heap,json,maria,perfschema,plugins,multi_source,roles
+  - CC_VERSION=7 TYPE=RelWithDebInfo MYSQL_TEST_SUITES=binlog,binlog_encryption,rocksdb,versioning,rpl
+  - CC_VERSION=7 TYPE=RelWithDebInfo MYSQL_TEST_SUITES=csv,federated,funcs_1,funcs_2,gcol,handler,heap,json,maria,perfschema,plugins,multi_source,roles,encryption
   - CC_VERSION=10 TYPE=RelWithDebInfo MYSQL_TEST_SUITES=main
 
 jobs:
@@ -136,7 +137,6 @@ jobs:
             - dh-exec
             - dh-systemd
             - fakeroot
-            - libdistro-info-perl
             - libsystemd-dev
             - libzstd-dev
             - po-debconf
@@ -191,10 +191,10 @@ jobs:
       arch: s390x
       compiler: gcc
       env: CC_VERSION=10 TYPE=RelWithDebInfo MYSQL_TEST_SUITES=main
-    # Sporadically fails on main.multi_update_big test (MDEV-23955)
-    - arch: arm64
     # Until OSX becomes a bit more stable
     - os: osx
+    # ppc64el builder frequently runs out of memory
+    - arch: ppc64le
 
 before_install:
   - if [[ "${TRAVIS_OS_NAME}" == 'osx' ]]; then

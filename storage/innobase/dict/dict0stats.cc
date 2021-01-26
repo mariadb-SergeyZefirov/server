@@ -33,7 +33,6 @@ Created Jan 06, 2010 Vasil Dimov
 #include "pars0pars.h"
 #include <mysql_com.h>
 #include "btr0btr.h"
-#include "sync0sync.h"
 
 #include <algorithm>
 #include <map>
@@ -178,8 +177,8 @@ dict_stats_persistent_storage_check(
 		{"table_name", DATA_VARMYSQL,
 			DATA_NOT_NULL, 597},
 
-		{"last_update", DATA_FIXBINARY,
-			DATA_NOT_NULL, 4},
+		{"last_update", DATA_INT,
+			DATA_NOT_NULL | DATA_UNSIGNED, 4},
 
 		{"n_rows", DATA_INT,
 			DATA_NOT_NULL | DATA_UNSIGNED, 8},
@@ -209,8 +208,8 @@ dict_stats_persistent_storage_check(
 		{"index_name", DATA_VARMYSQL,
 			DATA_NOT_NULL, 192},
 
-		{"last_update", DATA_FIXBINARY,
-			DATA_NOT_NULL, 4},
+		{"last_update", DATA_INT,
+			DATA_NOT_NULL | DATA_UNSIGNED, 4},
 
 		{"stat_name", DATA_VARMYSQL,
 			DATA_NOT_NULL, 64*3},
@@ -236,10 +235,10 @@ dict_stats_persistent_storage_check(
 	dberr_t		ret;
 
 	if (!caller_has_dict_sys_mutex) {
-		mutex_enter(&dict_sys.mutex);
+		dict_sys.mutex_lock();
 	}
 
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 
 	/* first check table_stats */
 	ret = dict_table_schema_check(&table_stats_schema, errstr,
@@ -251,7 +250,7 @@ dict_stats_persistent_storage_check(
 	}
 
 	if (!caller_has_dict_sys_mutex) {
-		mutex_exit(&dict_sys.mutex);
+		dict_sys.mutex_unlock();
 	}
 
 	if (ret != DB_SUCCESS && ret != DB_STATS_DO_NOT_EXIST) {
@@ -483,8 +482,6 @@ dict_stats_table_clone_create(
 
 	ut_d(t->magic_n = DICT_TABLE_MAGIC_N);
 
-	rw_lock_create(dict_table_stats_key, &t->stats_latch, SYNC_INDEX_TREE);
-
 	return(t);
 }
 
@@ -497,7 +494,6 @@ dict_stats_table_clone_free(
 /*========================*/
 	dict_table_t*	t)	/*!< in: dummy table object to free */
 {
-	rw_lock_free(&t->stats_latch);
 	mem_heap_free(t->heap);
 }
 
@@ -514,7 +510,7 @@ dict_stats_empty_index(
 {
 	ut_ad(!(index->type & DICT_FTS));
 	ut_ad(!dict_index_is_ibuf(index));
-	ut_ad(rw_lock_own(&index->table->stats_latch, RW_LOCK_X));
+	dict_sys.assert_locked();
 
 	ulint	n_uniq = index->n_uniq;
 
@@ -544,10 +540,9 @@ dict_stats_empty_table(
 	bool		empty_defrag_stats)
 				/*!< in: whether to empty defrag stats */
 {
+	dict_sys.mutex_lock();
+
 	/* Zero the stats members */
-
-	rw_lock_x_lock(&table->stats_latch);
-
 	table->stat_n_rows = 0;
 	table->stat_clustered_index_size = 1;
 	/* 1 page for each index, not counting the clustered */
@@ -571,8 +566,7 @@ dict_stats_empty_table(
 	}
 
 	table->stat_initialized = TRUE;
-
-	rw_lock_x_unlock(&table->stats_latch);
+	dict_sys.mutex_unlock();
 }
 
 /*********************************************************************//**
@@ -671,6 +665,8 @@ dict_stats_copy(
                                              to have the same statistics as if
                                              the table was empty */
 {
+	dict_sys.assert_locked();
+
 	dst->stats_last_recalc = src->stats_last_recalc;
 	dst->stat_n_rows = src->stat_n_rows;
 	dst->stat_clustered_index_size = src->stat_clustered_index_size;
@@ -786,9 +782,7 @@ dict_table_t*
 dict_stats_snapshot_create(
 	dict_table_t*	table)
 {
-	mutex_enter(&dict_sys.mutex);
-
-	rw_lock_s_lock(&table->stats_latch);
+	dict_sys.mutex_lock();
 
 	dict_stats_assert_initialized(table);
 
@@ -803,9 +797,7 @@ dict_stats_snapshot_create(
 	t->stats_sample_pages = table->stats_sample_pages;
 	t->stats_bg_flag = table->stats_bg_flag;
 
-	rw_lock_s_unlock(&table->stats_latch);
-
-	mutex_exit(&dict_sys.mutex);
+	dict_sys.mutex_unlock();
 
 	return(t);
 }
@@ -844,10 +836,14 @@ dict_stats_update_transient_for_index(
 		Initialize some bogus index cardinality
 		statistics, so that the data can be queried in
 		various means, also via secondary indexes. */
+		dict_sys.mutex_lock();
 		dict_stats_empty_index(index, false);
+		dict_sys.mutex_unlock();
 #if defined UNIV_DEBUG || defined UNIV_IBUF_DEBUG
 	} else if (ibuf_debug && !dict_index_is_clust(index)) {
+		dict_sys.mutex_lock();
 		dict_stats_empty_index(index, false);
+		dict_sys.mutex_unlock();
 #endif /* UNIV_DEBUG || UNIV_IBUF_DEBUG */
 	} else {
 		mtr_t	mtr;
@@ -868,7 +864,9 @@ dict_stats_update_transient_for_index(
 
 		switch (size) {
 		case ULINT_UNDEFINED:
+			dict_sys.mutex_lock();
 			dict_stats_empty_index(index, false);
+			dict_sys.mutex_unlock();
 			return;
 		case 0:
 			/* The root node of the tree is a leaf */
@@ -880,11 +878,22 @@ dict_stats_update_transient_for_index(
 		/* Do not continue if table decryption has failed or
 		table is already marked as corrupted. */
 		if (index->is_readable()) {
-			/* We don't handle the return value since it
-			will be false only when some thread is
-			dropping the table and we don't have to empty
-			the statistics of the to be dropped index */
-			btr_estimate_number_of_different_key_vals(index);
+			std::vector<index_field_stats_t> stats
+				= btr_estimate_number_of_different_key_vals(
+					index);
+
+			if (!stats.empty()) {
+				dict_sys.mutex_lock();
+				for (size_t i = 0; i < stats.size(); ++i) {
+					index->stat_n_diff_key_vals[i]
+						= stats[i].n_diff_key_vals;
+					index->stat_n_sample_sizes[i]
+						= stats[i].n_sample_sizes;
+					index->stat_n_non_null_key_vals[i]
+						= stats[i].n_non_null_key_vals;
+				}
+				dict_sys.mutex_unlock();
+			}
 		}
 	}
 }
@@ -901,6 +910,8 @@ dict_stats_update_transient(
 /*========================*/
 	dict_table_t*	table)	/*!< in/out: table */
 {
+	dict_sys.assert_not_locked();
+
 	dict_index_t*	index;
 	ulint		sum_of_index_sizes	= 0;
 
@@ -926,26 +937,24 @@ dict_stats_update_transient(
 
 		ut_ad(!dict_index_is_ibuf(index));
 
-		if (index->type & DICT_FTS || dict_index_is_spatial(index)) {
+		if (index->type & (DICT_FTS | DICT_SPATIAL)) {
 			continue;
 		}
 
-		dict_stats_empty_index(index, false);
-
-		if (dict_stats_should_ignore_index(index)) {
+		if (dict_stats_should_ignore_index(index)
+		    || !index->is_readable()) {
+			dict_sys.mutex_lock();
+			dict_stats_empty_index(index, false);
+			dict_sys.mutex_unlock();
 			continue;
-		}
-
-		/* Do not continue if table decryption has failed or
-		table is already marked as corrupted. */
-		if (!index->is_readable()) {
-			break;
 		}
 
 		dict_stats_update_transient_for_index(index);
 
 		sum_of_index_sizes += index->stat_index_size;
 	}
+
+	dict_sys.mutex_lock();
 
 	index = dict_table_get_first_index(table);
 
@@ -962,6 +971,8 @@ dict_stats_update_transient(
 	table->stat_modified_counter = 0;
 
 	table->stat_initialized = TRUE;
+
+	dict_sys.mutex_unlock();
 }
 
 /* @{ Pseudo code about the relation between the following functions
@@ -1505,7 +1516,7 @@ dict_stats_analyze_index_below_cur(
 
 		block = buf_page_get_gen(page_id, zip_size,
 					 RW_S_LATCH, NULL, BUF_GET,
-					 __FILE__, __LINE__, &mtr, &err,
+					 &mtr, &err,
 					 !index->is_clust()
 					 && 1 == btr_page_get_level(page));
 
@@ -1807,16 +1818,31 @@ dict_stats_analyze_index_for_n_prefix(
 	btr_pcur_close(&pcur);
 }
 
+/** statistics for an index */
+struct index_stats_t
+{
+  std::vector<index_field_stats_t> stats;
+  ulint index_size;
+  ulint n_leaf_pages;
+
+  index_stats_t(ulint n_uniq) : index_size(1), n_leaf_pages(1)
+  {
+    stats.reserve(n_uniq);
+    for (ulint i= 0; i < n_uniq; ++i)
+      stats.push_back(index_field_stats_t(0, 1, 0));
+  }
+};
+
 /** Set dict_index_t::stat_n_diff_key_vals[] and stat_n_sample_sizes[].
 @param[in]	n_diff_data	input data to use to derive the results
-@param[in,out]	index		index whose stat_n_diff_key_vals[] to set */
+@param[in,out]	index_stats	index stats to set */
 UNIV_INLINE
 void
 dict_stats_index_set_n_diff(
 	const n_diff_data_t*	n_diff_data,
-	dict_index_t*		index)
+	index_stats_t&		index_stats)
 {
-	for (ulint n_prefix = dict_index_get_n_unique(index);
+	for (ulint n_prefix = index_stats.stats.size();
 	     n_prefix >= 1;
 	     n_prefix--) {
 		/* n_diff_all_analyzed_pages can be 0 here if
@@ -1847,14 +1873,14 @@ dict_stats_index_set_n_diff(
 			that the total number of ordinary leaf pages is
 			T * D / (D + E). */
 			n_ordinary_leaf_pages
-				= index->stat_n_leaf_pages
+				= index_stats.n_leaf_pages
 				* data->n_leaf_pages_to_analyze
 				/ (data->n_leaf_pages_to_analyze
 				   + data->n_external_pages_sum);
 		}
 
 		/* See REF01 for an explanation of the algorithm */
-		index->stat_n_diff_key_vals[n_prefix - 1]
+		index_stats.stats[n_prefix - 1].n_diff_key_vals
 			= n_ordinary_leaf_pages
 
 			* data->n_diff_on_level
@@ -1863,7 +1889,7 @@ dict_stats_index_set_n_diff(
 			* data->n_diff_all_analyzed_pages
 			/ data->n_leaf_pages_to_analyze;
 
-		index->stat_n_sample_sizes[n_prefix - 1]
+		index_stats.stats[n_prefix - 1].n_sample_sizes
 			= data->n_leaf_pages_to_analyze;
 
 		DEBUG_PRINTF("    %s(): n_diff=" UINT64PF
@@ -1872,9 +1898,9 @@ dict_stats_index_set_n_diff(
 			     " * " UINT64PF " / " UINT64PF
 			     " * " UINT64PF " / " UINT64PF ")\n",
 			     __func__,
-			     index->stat_n_diff_key_vals[n_prefix - 1],
+			     index_stats.stats[n_prefix - 1].n_diff_key_vals,
 			     n_prefix,
-			     index->stat_n_leaf_pages,
+			     index_stats.n_leaf_pages,
 			     data->n_diff_on_level,
 			     data->n_recs_on_level,
 			     data->n_diff_all_analyzed_pages,
@@ -1882,15 +1908,12 @@ dict_stats_index_set_n_diff(
 	}
 }
 
-/*********************************************************************//**
-Calculates new statistics for a given index and saves them to the index
+/** Calculates new statistics for a given index and saves them to the index
 members stat_n_diff_key_vals[], stat_n_sample_sizes[], stat_index_size and
-stat_n_leaf_pages. This function could be slow. */
-static
-void
-dict_stats_analyze_index(
-/*=====================*/
-	dict_index_t*	index)	/*!< in/out: index to analyze */
+stat_n_leaf_pages. This function can be slow.
+@param[in]	index	index to analyze
+@return index stats */
+static index_stats_t dict_stats_analyze_index(dict_index_t* index)
 {
 	ulint		root_level;
 	ulint		level;
@@ -1901,26 +1924,28 @@ dict_stats_analyze_index(
 	ib_uint64_t	total_pages;
 	mtr_t		mtr;
 	ulint		size;
+	index_stats_t	result(index->n_uniq);
 	DBUG_ENTER("dict_stats_analyze_index");
 
 	DBUG_PRINT("info", ("index: %s, online status: %d", index->name(),
 			    dict_index_get_online_status(index)));
 
+	dict_sys.assert_not_locked(); // this function is slow
+	ut_ad(index->table->get_ref_count());
+
 	/* Disable update statistic for Rtree */
 	if (dict_index_is_spatial(index)) {
-		DBUG_VOID_RETURN;
+		DBUG_RETURN(result);
 	}
 
 	DEBUG_PRINTF("  %s(index=%s)\n", __func__, index->name());
-
-	dict_stats_empty_index(index, false);
 
 	mtr.start();
 	mtr_s_lock_index(index, &mtr);
 	size = btr_get_size(index, BTR_TOTAL_SIZE, &mtr);
 
 	if (size != ULINT_UNDEFINED) {
-		index->stat_index_size = size;
+		result.index_size = size;
 		size = btr_get_size(index, BTR_N_LEAF_PAGES, &mtr);
 	}
 
@@ -1930,13 +1955,13 @@ dict_stats_analyze_index(
 	switch (size) {
 	case ULINT_UNDEFINED:
 		dict_stats_assert_initialized_index(index);
-		DBUG_VOID_RETURN;
+		DBUG_RETURN(result);
 	case 0:
 		/* The root node of the tree is a leaf */
 		size = 1;
 	}
 
-	index->stat_n_leaf_pages = size;
+	result.n_leaf_pages = size;
 
 	mtr.start();
 	mtr_sx_lock_index(index, &mtr);
@@ -1954,7 +1979,7 @@ dict_stats_analyze_index(
 	since it will be faster and will give better results. */
 
 	if (root_level == 0
-	    || N_SAMPLE_PAGES(index) * n_uniq > index->stat_n_leaf_pages) {
+	    || N_SAMPLE_PAGES(index) * n_uniq > result.n_leaf_pages) {
 
 		if (root_level == 0) {
 			DEBUG_PRINTF("  %s(): just one page,"
@@ -1975,14 +2000,18 @@ dict_stats_analyze_index(
 					       NULL /* boundaries not needed */,
 					       &mtr);
 
-		for (ulint i = 0; i < n_uniq; i++) {
-			index->stat_n_sample_sizes[i] = total_pages;
-		}
-
 		mtr.commit();
 
-		dict_stats_assert_initialized_index(index);
-		DBUG_VOID_RETURN;
+		dict_sys.mutex_lock();
+		for (ulint i = 0; i < n_uniq; i++) {
+			result.stats[i].n_diff_key_vals = index->stat_n_diff_key_vals[i];
+			result.stats[i].n_sample_sizes = total_pages;
+			result.stats[i].n_non_null_key_vals = index->stat_n_non_null_key_vals[i];
+		}
+		result.n_leaf_pages = index->stat_n_leaf_pages;
+		dict_sys.mutex_unlock();
+
+		DBUG_RETURN(result);
 	}
 
 	/* For each level that is being scanned in the btree, this contains the
@@ -2174,13 +2203,12 @@ found_level:
 	/* n_prefix == 0 means that the above loop did not end up prematurely
 	due to tree being changed and so n_diff_data[] is set up. */
 	if (n_prefix == 0) {
-		dict_stats_index_set_n_diff(n_diff_data, index);
+		dict_stats_index_set_n_diff(n_diff_data, result);
 	}
 
 	UT_DELETE_ARRAY(n_diff_data);
 
-	dict_stats_assert_initialized_index(index);
-	DBUG_VOID_RETURN;
+	DBUG_RETURN(result);
 }
 
 /*********************************************************************//**
@@ -2198,7 +2226,7 @@ dict_stats_update_persistent(
 
 	DEBUG_PRINTF("%s(table=%s)\n", __func__, table->name);
 
-	rw_lock_x_lock(&table->stats_latch);
+	DEBUG_SYNC_C("dict_stats_update_persistent");
 
 	/* analyze the clustered index first */
 
@@ -2209,15 +2237,26 @@ dict_stats_update_persistent(
 	    || (index->type | DICT_UNIQUE) != (DICT_CLUSTERED | DICT_UNIQUE)) {
 
 		/* Table definition is corrupt */
-		rw_lock_x_unlock(&table->stats_latch);
 		dict_stats_empty_table(table, true);
 
 		return(DB_CORRUPTION);
 	}
 
 	ut_ad(!dict_index_is_ibuf(index));
+	dict_sys.mutex_lock();
+	dict_stats_empty_index(index, false);
+	dict_sys.mutex_unlock();
 
-	dict_stats_analyze_index(index);
+	index_stats_t stats = dict_stats_analyze_index(index);
+
+	dict_sys.mutex_lock();
+	index->stat_index_size = stats.index_size;
+	index->stat_n_leaf_pages = stats.n_leaf_pages;
+	for (size_t i = 0; i < stats.stats.size(); ++i) {
+		index->stat_n_diff_key_vals[i] = stats.stats[i].n_diff_key_vals;
+		index->stat_n_sample_sizes[i] = stats.stats[i].n_sample_sizes;
+		index->stat_n_non_null_key_vals[i] = stats.stats[i].n_non_null_key_vals;
+	}
 
 	ulint	n_unique = dict_index_get_n_unique(index);
 
@@ -2235,7 +2274,7 @@ dict_stats_update_persistent(
 
 		ut_ad(!dict_index_is_ibuf(index));
 
-		if (index->type & DICT_FTS || dict_index_is_spatial(index)) {
+		if (index->type & (DICT_FTS | DICT_SPATIAL)) {
 			continue;
 		}
 
@@ -2246,7 +2285,20 @@ dict_stats_update_persistent(
 		}
 
 		if (!(table->stats_bg_flag & BG_STAT_SHOULD_QUIT)) {
-			dict_stats_analyze_index(index);
+			dict_sys.mutex_unlock();
+			stats = dict_stats_analyze_index(index);
+			dict_sys.mutex_lock();
+
+			index->stat_index_size = stats.index_size;
+			index->stat_n_leaf_pages = stats.n_leaf_pages;
+			for (size_t i = 0; i < stats.stats.size(); ++i) {
+				index->stat_n_diff_key_vals[i]
+					= stats.stats[i].n_diff_key_vals;
+				index->stat_n_sample_sizes[i]
+					= stats.stats[i].n_sample_sizes;
+				index->stat_n_non_null_key_vals[i]
+					= stats.stats[i].n_non_null_key_vals;
+			}
 		}
 
 		table->stat_sum_of_other_index_sizes
@@ -2261,7 +2313,7 @@ dict_stats_update_persistent(
 
 	dict_stats_assert_initialized(table);
 
-	rw_lock_x_unlock(&table->stats_latch);
+	dict_sys.mutex_unlock();
 
 	return(DB_SUCCESS);
 }
@@ -2937,8 +2989,6 @@ dict_stats_fetch_from_ps(
 	char		db_utf8[MAX_DB_UTF8_LEN];
 	char		table_utf8[MAX_TABLE_UTF8_LEN];
 
-	ut_ad(!mutex_own(&dict_sys.mutex));
-
 	/* Initialize all stats to dummy values before fetching because if
 	the persistent storage contains incomplete stats (e.g. missing stats
 	for some index) then we would end up with (partially) uninitialized
@@ -3073,16 +3123,27 @@ dict_stats_update_for_index(
 {
 	DBUG_ENTER("dict_stats_update_for_index");
 
-	ut_ad(!mutex_own(&dict_sys.mutex));
+	dict_sys.assert_not_locked();
 
 	if (dict_stats_is_persistent_enabled(index->table)) {
 
 		if (dict_stats_persistent_storage_check(false)) {
-			rw_lock_x_lock(&index->table->stats_latch);
-			dict_stats_analyze_index(index);
+			index_stats_t stats = dict_stats_analyze_index(index);
+			dict_sys.mutex_lock();
+			index->stat_index_size = stats.index_size;
+			index->stat_n_leaf_pages = stats.n_leaf_pages;
+			for (size_t i = 0; i < stats.stats.size(); ++i) {
+				index->stat_n_diff_key_vals[i]
+					= stats.stats[i].n_diff_key_vals;
+				index->stat_n_sample_sizes[i]
+					= stats.stats[i].n_sample_sizes;
+				index->stat_n_non_null_key_vals[i]
+					= stats.stats[i].n_non_null_key_vals;
+			}
 			index->table->stat_sum_of_other_index_sizes
 				+= index->stat_index_size;
-			rw_lock_x_unlock(&index->table->stats_latch);
+			dict_sys.mutex_unlock();
+
 			dict_stats_save(index->table, &index->id);
 			DBUG_VOID_RETURN;
 		}
@@ -3103,9 +3164,7 @@ dict_stats_update_for_index(
 		}
 	}
 
-	rw_lock_x_lock(&index->table->stats_latch);
 	dict_stats_update_transient_for_index(index);
-	rw_lock_x_unlock(&index->table->stats_latch);
 
 	DBUG_VOID_RETURN;
 }
@@ -3124,7 +3183,7 @@ dict_stats_update(
 					the persistent statistics
 					storage */
 {
-	ut_ad(!mutex_own(&dict_sys.mutex));
+	dict_sys.assert_not_locked();
 
 	if (!table->is_readable()) {
 		return (dict_stats_report_error(table));
@@ -3259,7 +3318,7 @@ dict_stats_update(
 		switch (err) {
 		case DB_SUCCESS:
 
-			rw_lock_x_lock(&table->stats_latch);
+			dict_sys.mutex_lock();
 
 			/* Pass reset_ignored_indexes=true as parameter
 			to dict_stats_copy. This will cause statictics
@@ -3268,7 +3327,7 @@ dict_stats_update(
 
 			dict_stats_assert_initialized(table);
 
-			rw_lock_x_unlock(&table->stats_latch);
+			dict_sys.mutex_unlock();
 
 			dict_stats_table_clone_free(t);
 
@@ -3322,12 +3381,7 @@ dict_stats_update(
 	}
 
 transient:
-
-	rw_lock_x_lock(&table->stats_latch);
-
 	dict_stats_update_transient(table);
-
-	rw_lock_x_unlock(&table->stats_latch);
 
 	return(DB_SUCCESS);
 }
@@ -3359,7 +3413,7 @@ dict_stats_drop_index(
 	pars_info_t*	pinfo;
 	dberr_t		ret;
 
-	ut_ad(!mutex_own(&dict_sys.mutex));
+	dict_sys.assert_not_locked();
 
 	/* skip indexes whose table names do not contain a database name
 	e.g. if we are dropping an index from SYS_TABLES */
@@ -3895,7 +3949,7 @@ test_dict_table_schema_check()
 	/* prevent any data dictionary modifications while we are checking
 	the tables' structure */
 
-	mutex_enter(&dict_sys.mutex);
+	dict_sys.mutex_lock();
 
 	/* check that a valid table is reported as valid */
 	schema.n_cols = 7;
@@ -3971,7 +4025,7 @@ test_dict_table_schema_check()
 
 test_dict_table_schema_check_end:
 
-	mutex_exit(&dict_sys.mutex);
+	dict_sys.mutex_unlock();
 }
 /* @} */
 

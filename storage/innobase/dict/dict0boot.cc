@@ -35,15 +35,6 @@ Created 4/18/1996 Heikki Tuuri
 #include "log0recv.h"
 #include "os0file.h"
 
-/** @return the DICT_HDR block, x-latched */
-buf_block_t *dict_hdr_get(mtr_t* mtr)
-{
-  buf_block_t *block= buf_page_get(page_id_t(DICT_HDR_SPACE, DICT_HDR_PAGE_NO),
-				   0, RW_X_LATCH, mtr);
-  buf_block_dbg_add_level(block, SYNC_DICT_HEADER);
-  return block;
-}
-
 /**********************************************************************//**
 Returns a new table, index, or space id. */
 void
@@ -93,27 +84,16 @@ dict_hdr_get_new_id(
 	mtr.commit();
 }
 
-/**********************************************************************//**
-Writes the current value of the row id counter to the dictionary header file
-page. */
-void
-dict_hdr_flush_row_id(void)
-/*=======================*/
+/** Update dict_sys.row_id in the dictionary header file page. */
+void dict_hdr_flush_row_id(row_id_t id)
 {
-	row_id_t	id;
-	mtr_t		mtr;
-
-	ut_ad(mutex_own(&dict_sys.mutex));
-
-	id = dict_sys.row_id;
-
-	mtr.start();
-
-	buf_block_t* d = dict_hdr_get(&mtr);
-
-	mtr.write<8>(*d, DICT_HDR + DICT_HDR_ROW_ID + d->frame, id);
-
-	mtr.commit();
+  mtr_t mtr;
+  mtr.start();
+  buf_block_t* d= dict_hdr_get(&mtr);
+  byte *row_id= DICT_HDR + DICT_HDR_ROW_ID + d->frame;
+  if (mach_read_from_8(row_id) < id)
+    mtr.write<8>(*d, row_id, id);
+  mtr.commit();
 }
 
 /*****************************************************************//**
@@ -255,7 +235,7 @@ dict_boot(void)
 
 	heap = mem_heap_create(450);
 
-	mutex_enter(&dict_sys.mutex);
+	dict_sys.mutex_lock();
 
 	/* Get the dictionary header */
 	const byte* dict_hdr = &dict_hdr_get(&mtr)->frame[DICT_HDR];
@@ -270,9 +250,12 @@ dict_boot(void)
 	..._MARGIN, it will immediately be updated to the disk-based
 	header. */
 
-	dict_sys.row_id = DICT_HDR_ROW_ID_WRITE_MARGIN
-		+ ut_uint64_align_up(mach_read_from_8(dict_hdr + DICT_HDR_ROW_ID),
-				     DICT_HDR_ROW_ID_WRITE_MARGIN);
+	dict_sys.recover_row_id(mach_read_from_8(dict_hdr + DICT_HDR_ROW_ID));
+	if (ulint max_space_id = mach_read_from_4(dict_hdr
+						  + DICT_HDR_MAX_SPACE_ID)) {
+		max_space_id--;
+		fil_assign_new_space_id(&max_space_id);
+	}
 
 	/* Insert into the dictionary cache the descriptions of the basic
 	system tables */
@@ -446,7 +429,7 @@ dict_boot(void)
 		dict_load_sys_table(dict_sys.sys_fields);
 	}
 
-	mutex_exit(&dict_sys.mutex);
+	dict_sys.mutex_unlock();
 
 	return(err);
 }

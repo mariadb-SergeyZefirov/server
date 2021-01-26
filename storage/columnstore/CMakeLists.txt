@@ -12,9 +12,7 @@ macro(APPEND_FOR_CPACK V)
 endmacro()
 
 IF(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64" OR
-CMAKE_SYSTEM_PROCESSOR STREQUAL "amd64" OR
-CMAKE_SYSTEM_PROCESSOR STREQUAL "i386" OR
-CMAKE_SYSTEM_PROCESSOR STREQUAL "i686")
+CMAKE_SYSTEM_PROCESSOR STREQUAL "amd64")
     add_subdirectory(columnstore)
 
     IF(TARGET columnstore)
@@ -29,6 +27,7 @@ CMAKE_SYSTEM_PROCESSOR STREQUAL "i686")
             SET(CPACK_RPM_columnstore-engine_PRE_INSTALL_SCRIPT_FILE ${CMAKE_CURRENT_SOURCE_DIR}/columnstore/build/preInstall_storage_engine.sh PARENT_SCOPE)
             SET(CPACK_RPM_columnstore-engine_POST_INSTALL_SCRIPT_FILE ${CMAKE_CURRENT_SOURCE_DIR}/columnstore/build/postInstall_storage_engine.sh PARENT_SCOPE)
             SET(CPACK_RPM_columnstore-engine_PRE_UNINSTALL_SCRIPT_FILE ${CMAKE_CURRENT_SOURCE_DIR}/columnstore/build/preUn_storage_engine.sh PARENT_SCOPE)
+            APPEND_FOR_CPACK(CPACK_RPM_columnstore-engine_PACKAGE_VERSION  "")
         ENDIF()
         INSTALL_MYSQL_TEST("${CMAKE_CURRENT_SOURCE_DIR}/mysql-test/" "plugin/columnstore")
     ENDIF()

@@ -1,5 +1,5 @@
 /* Copyright 2008-2015 Codership Oy <http://www.codership.com>
-   Copyright (c) 2020, MariaDB
+   Copyright (c) 2020, 2021, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -110,6 +110,7 @@ ulong wsrep_mysql_replication_bundle;
 
 bool              wsrep_gtid_mode;              // Enable WSREP native GTID support
 Wsrep_gtid_server wsrep_gtid_server;
+uint  wsrep_gtid_domain_id=0;                   // Domain id on above structure
 
 /* Other configuration variables and their default values. */
 my_bool wsrep_incremental_data_collection= 0;   // Incremental data collection
@@ -319,29 +320,31 @@ wsp::node_status           local_status;
  */
 Wsrep_schema *wsrep_schema= 0;
 
-static void wsrep_log_cb(wsrep::log::level level, const char *msg)
+static void wsrep_log_cb(wsrep::log::level level,
+                         const char*, const char *msg)
 {
   /*
     Silence all wsrep related logging from lib and provider if
     wsrep is not enabled.
   */
-  if (WSREP_ON)
-  {
-    switch (level) {
-    case wsrep::log::info:
-      sql_print_information("WSREP: %s", msg);
-      break;
-    case wsrep::log::warning:
-      sql_print_warning("WSREP: %s", msg);
-      break;
-    case wsrep::log::error:
-      sql_print_error("WSREP: %s", msg);
+  if (!WSREP_ON) return;
+
+  switch (level) {
+  case wsrep::log::info:
+    WSREP_INFO("%s", msg);
     break;
-    case wsrep::log::debug:
-      if (wsrep_debug) sql_print_information ("[Debug] WSREP: %s", msg);
-    default:
-      break;
-    }
+  case wsrep::log::warning:
+    WSREP_WARN("%s", msg);
+    break;
+  case wsrep::log::error:
+    WSREP_ERROR("%s", msg);
+    break;
+  case wsrep::log::debug:
+    WSREP_DEBUG("%s", msg);
+    break;
+  case wsrep::log::unknown:
+    WSREP_UNKNOWN("%s", msg);
+    break;
   }
 }
 
@@ -786,6 +789,7 @@ int wsrep_init_server()
 
 void wsrep_init_globals()
 {
+  wsrep_gtid_server.domain_id= wsrep_gtid_domain_id;
   wsrep_init_sidno(Wsrep_server_state::instance().connected_gtid().id());
   wsrep_init_gtid();
   /* Recover last written wsrep gtid */
@@ -1261,6 +1265,51 @@ void wsrep_keys_free(wsrep_key_arr_t* key_arr)
     key_arr->keys_len= 0;
 }
 
+void
+wsrep_append_fk_parent_table(THD* thd, TABLE_LIST* tables, wsrep::key_array* keys)
+{
+  if (!WSREP(thd) || !WSREP_CLIENT(thd)) return;
+    TABLE_LIST *table;
+
+    thd->release_transactional_locks();
+    uint counter;
+    MDL_savepoint mdl_savepoint= thd->mdl_context.mdl_savepoint();
+
+    if (thd->open_temporary_tables(tables) ||
+         open_tables(thd, &tables, &counter, MYSQL_OPEN_FORCE_SHARED_HIGH_PRIO_MDL))
+    {
+      WSREP_DEBUG("unable to open table for FK checks for %s", thd->query());
+    }
+
+    for (table= tables; table; table= table->next_local)
+    {
+      if (!is_temporary_table(table) && table->table)
+      {
+        FOREIGN_KEY_INFO *f_key_info;
+        List<FOREIGN_KEY_INFO> f_key_list;
+
+        table->table->file->get_foreign_key_list(thd, &f_key_list);
+        List_iterator_fast<FOREIGN_KEY_INFO> it(f_key_list);
+        while ((f_key_info=it++))
+        {
+          WSREP_DEBUG("appended fkey %s", f_key_info->referenced_table->str);
+          keys->push_back(wsrep_prepare_key_for_toi(f_key_info->referenced_db->str,
+                                                    f_key_info->referenced_table->str,
+                                                    wsrep::key::shared));
+        }
+      }
+    }
+
+    /* close the table and release MDL locks */
+    close_thread_tables(thd);
+    thd->mdl_context.rollback_to_savepoint(mdl_savepoint);
+    for (table= tables; table; table= table->next_local)
+    {
+      table->table= NULL;
+      table->mdl_request.ticket= NULL;
+    }
+}
+
 /*!
  * @param db      Database string
  * @param table   Table string
@@ -1511,10 +1560,11 @@ wsrep_prepare_keys_for_alter_add_fk(const char* child_table_db,
   return ret;
 }
 
-wsrep::key_array wsrep_prepare_keys_for_toi(const char* db,
-                                            const char* table,
-                                            const TABLE_LIST* table_list,
-                                            const Alter_info* alter_info)
+wsrep::key_array wsrep_prepare_keys_for_toi(const char *db,
+                                            const char *table,
+                                            const TABLE_LIST *table_list,
+                                            const Alter_info *alter_info,
+                                            const wsrep::key_array *fk_tables)
 {
   wsrep::key_array ret;
   if (db || table)
@@ -1534,8 +1584,13 @@ wsrep::key_array wsrep_prepare_keys_for_toi(const char* db,
       ret.insert(ret.end(), fk.begin(), fk.end());
     }
   }
+  if (fk_tables && !fk_tables->empty())
+  {
+    ret.insert(ret.end(), fk_tables->begin(), fk_tables->end());
+  }
   return ret;
 }
+
 /*
  * Construct Query_log_Event from thd query and serialize it
  * into buffer.
@@ -2069,9 +2124,10 @@ fail:
   -1: TOI replication failed
  */
 static int wsrep_TOI_begin(THD *thd, const char *db, const char *table,
-                           const TABLE_LIST* table_list,
-                           const Alter_info* alter_info,
-                           const HA_CREATE_INFO* create_info)
+                           const TABLE_LIST *table_list,
+                           const Alter_info *alter_info,
+                           const wsrep::key_array *fk_tables,
+                           const HA_CREATE_INFO *create_info)
 {
   DBUG_ASSERT(wsrep_OSU_method_get(thd) == WSREP_OSU_TOI);
 
@@ -2102,7 +2158,7 @@ static int wsrep_TOI_begin(THD *thd, const char *db, const char *table,
   struct wsrep_buf buff= { buf, buf_len };
 
   wsrep::key_array key_array=
-    wsrep_prepare_keys_for_toi(db, table, table_list, alter_info);
+    wsrep_prepare_keys_for_toi(db, table, table_list, alter_info, fk_tables);
 
   if (thd->has_read_only_protection())
   {
@@ -2250,8 +2306,9 @@ static void wsrep_RSU_end(THD *thd)
 
 int wsrep_to_isolation_begin(THD *thd, const char *db_, const char *table_,
                              const TABLE_LIST* table_list,
-                             const Alter_info* alter_info,
-                             const HA_CREATE_INFO* create_info)
+                             const Alter_info *alter_info,
+                             const wsrep::key_array *fk_tables,
+                             const HA_CREATE_INFO *create_info)
 {
   /*
     No isolation for applier or replaying threads.
@@ -2305,7 +2362,8 @@ int wsrep_to_isolation_begin(THD *thd, const char *db_, const char *table_,
   {
     switch (wsrep_OSU_method_get(thd)) {
     case WSREP_OSU_TOI:
-      ret= wsrep_TOI_begin(thd, db_, table_, table_list, alter_info, create_info);
+      ret= wsrep_TOI_begin(thd, db_, table_, table_list, alter_info, fk_tables,
+                           create_info);
       break;
     case WSREP_OSU_RSU:
       ret= wsrep_RSU_begin(thd, db_, table_);
@@ -2595,10 +2653,12 @@ static my_bool kill_remaining_threads(THD *thd, THD *caller_thd)
   if (is_client_connection(thd) &&
       !abort_replicated(thd)    &&
       !is_replaying_connection(thd) &&
+      thd_is_connection_alive(thd) &&
       thd != caller_thd)
   {
+
     WSREP_INFO("killing local connection: %lld", (longlong) thd->thread_id);
-    close_connection(thd, 0);
+    close_connection(thd);
   }
 #endif
   return 0;

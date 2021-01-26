@@ -1442,16 +1442,12 @@ int Item::save_in_field_no_warnings(Field *field, bool no_conversions)
   int res;
   TABLE *table= field->table;
   THD *thd= table->in_use;
-  enum_check_fields tmp= thd->count_cuted_fields;
-  my_bitmap_map *old_map= dbug_tmp_use_all_columns(table, table->write_set);
+  Check_level_instant_set check_level_save(thd, CHECK_FIELD_IGNORE);
   Sql_mode_save sms(thd);
   thd->variables.sql_mode&= ~(MODE_NO_ZERO_IN_DATE | MODE_NO_ZERO_DATE);
   thd->variables.sql_mode|= MODE_INVALID_DATES;
-  thd->count_cuted_fields= CHECK_FIELD_IGNORE;
-
+  my_bitmap_map *old_map= dbug_tmp_use_all_columns(table, table->write_set);
   res= save_in_field(field, no_conversions);
-
-  thd->count_cuted_fields= tmp;
   dbug_tmp_restore_column_map(table->write_set, old_map);
   return res;
 }
@@ -3634,7 +3630,7 @@ String *Item_int::val_str(String *str)
 
 void Item_int::print(String *str, enum_query_type query_type)
 {
-  StringBuffer<LONGLONG_BUFFER_SIZE> buf;
+  StringBuffer<LONGLONG_BUFFER_SIZE+1> buf;
   // my_charset_bin is good enough for numbers
   buf.set_int(value, unsigned_flag, &my_charset_bin);
   str->append(buf);
@@ -4926,7 +4922,8 @@ double Item_copy_string::val_real()
   int err_not_used;
   char *end_not_used;
   return (null_value ? 0.0 :
-          str_value.charset()->strntod((char*) str_value.ptr(), str_value.length(),
+          str_value.charset()->strntod((char*) str_value.ptr(),
+                                       str_value.length(),
                                        &end_not_used, &err_not_used));
 }
 
@@ -4934,8 +4931,8 @@ longlong Item_copy_string::val_int()
 {
   int err;
   return null_value ? 0 : str_value.charset()->strntoll(str_value.ptr(),
-                                                        str_value.length(), 10, (char**) 0,
-                                                        &err);
+                                                        str_value.length(), 10,
+                                                        (char**) 0, &err);
 }
 
 
@@ -5036,9 +5033,11 @@ bool Item_ref_null_helper::val_native(THD *thd, Native *to)
 }
 
 
-bool Item_ref_null_helper::get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate)
+bool Item_ref_null_helper::get_date(THD *thd, MYSQL_TIME *ltime,
+                                    date_mode_t fuzzydate)
 {  
-  return (owner->was_null|= null_value= (*ref)->get_date_result(thd, ltime, fuzzydate));
+  return (owner->was_null|= null_value= (*ref)->get_date_result(thd, ltime,
+                                                                fuzzydate));
 }
 
 
@@ -5755,7 +5754,8 @@ Item_field::fix_outer_field(THD *thd, Field **from_field, Item **reference)
       Item_ref *rf;
       rf= new (thd->mem_root) Item_ref(thd, context,
                                        (*from_field)->table->s->db,
-                                       Lex_cstring_strlen((*from_field)->table->alias.c_ptr()),
+                                       Lex_cstring_strlen((*from_field)->
+                                                          table->alias.c_ptr()),
                                        field_name);
       if (!rf)
         return -1;
@@ -5912,8 +5912,9 @@ bool Item_field::fix_fields(THD *thd, Item **reference)
               return TRUE;
            
             thd->change_item_tree(reference,
-                                  select->context_analysis_place == IN_GROUP_BY && 
-				  alias_name_used  ?  *rf->ref : rf);
+                                  select->context_analysis_place ==
+                                  IN_GROUP_BY &&
+                                  alias_name_used ? *rf->ref : rf);
 
             /*
               We can not "move" aggregate function in the place where
@@ -8895,7 +8896,8 @@ bool Item_cache_wrapper::is_null()
   Get the date value of the possibly cached item
 */
 
-bool Item_cache_wrapper::get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate)
+bool Item_cache_wrapper::get_date(THD *thd, MYSQL_TIME *ltime,
+                                  date_mode_t fuzzydate)
 {
   Item *cached_value;
   DBUG_ENTER("Item_cache_wrapper::get_date");
@@ -9438,7 +9440,8 @@ my_decimal *Item_default_value::val_decimal(my_decimal *decimal_value)
   return Item_field::val_decimal(decimal_value);
 }
 
-bool Item_default_value::get_date(THD *thd, MYSQL_TIME *ltime,date_mode_t fuzzydate)
+bool Item_default_value::get_date(THD *thd, MYSQL_TIME *ltime,
+                                  date_mode_t fuzzydate)
 {
   calculate();
   return Item_field::get_date(thd, ltime, fuzzydate);
@@ -9795,8 +9798,8 @@ void Item_cache::store(Item *item)
 
 void Item_cache::print(String *str, enum_query_type query_type)
 {
-  if (example &&                                          // There is a cached item
-      (query_type & QT_NO_DATA_EXPANSION))                // Caller is show-create-table
+  if (example &&                                 // There is a cached item
+      (query_type & QT_NO_DATA_EXPANSION))       // Caller is show-create-table
   {
     // Instead of "cache" or the cached value, print the cached item name
     example->print(str, query_type);
@@ -9975,15 +9978,12 @@ Item *Item_cache_temporal::clone_item(THD *thd)
 
 Item *Item_cache_temporal::convert_to_basic_const_item(THD *thd)
 {
-  Item *new_item;
   DBUG_ASSERT(value_cached || example != 0);
   if (!value_cached)
     cache_value();
   if (null_value)
     return new (thd->mem_root) Item_null(thd);
-  else
-    return make_literal(thd);
-  return new_item;
+  return make_literal(thd);
 }
 
 Item *Item_cache_datetime::make_literal(THD *thd)
@@ -10285,8 +10285,8 @@ bool Item_cache_row::setup(THD *thd, Item *item)
     return 1;
   for (uint i= 0; i < item_count; i++)
   {
-    Item *el= item->element_index(i);
     Item_cache *tmp;
+    Item *el= item->element_index(i);
     if (!(tmp= values[i]= el->get_cache(thd)))
       return 1;
     tmp->setup(thd, el);

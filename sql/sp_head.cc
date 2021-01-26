@@ -1211,6 +1211,7 @@ sp_head::execute(THD *thd, bool merge_da_on_success)
   Query_arena execute_arena(&execute_mem_root, STMT_INITIALIZED_FOR_SP),
               backup_arena;
   query_id_t old_query_id;
+  CSET_STRING old_query;
   TABLE *old_derived_tables;
   TABLE *old_rec_tables;
   LEX *old_lex;
@@ -1291,6 +1292,7 @@ sp_head::execute(THD *thd, bool merge_da_on_success)
     be able properly do close_thread_tables() in instructions.
   */
   old_query_id= thd->query_id;
+  old_query= thd->query_string;
   old_derived_tables= thd->derived_tables;
   thd->derived_tables= 0;
   old_rec_tables= thd->rec_tables;
@@ -1567,6 +1569,7 @@ sp_head::execute(THD *thd, bool merge_da_on_success)
   old_change_list.move_elements_to(thd);
   thd->lex= old_lex;
   thd->set_query_id(old_query_id);
+  thd->set_query_inner(old_query);
   DBUG_ASSERT(!thd->derived_tables);
   thd->derived_tables= old_derived_tables;
   thd->rec_tables= old_rec_tables;
@@ -2387,10 +2390,10 @@ sp_head::execute_procedure(THD *thd, List<Item> *args)
       if (thd->transaction_rollback_request)
       {
         trans_rollback_implicit(thd);
-        thd->mdl_context.release_transactional_locks();
+        thd->release_transactional_locks();
       }
       else if (! thd->in_multi_stmt_transaction_mode())
-        thd->mdl_context.release_transactional_locks();
+        thd->release_transactional_locks();
       else
         thd->mdl_context.release_statement_locks();
     }
@@ -3515,10 +3518,10 @@ sp_lex_keeper::reset_lex_and_exec_core(THD *thd, uint *nextp,
       if (thd->transaction_rollback_request)
       {
         trans_rollback_implicit(thd);
-        thd->mdl_context.release_transactional_locks();
+        thd->release_transactional_locks();
       }
       else if (! thd->in_multi_stmt_transaction_mode())
-        thd->mdl_context.release_transactional_locks();
+        thd->release_transactional_locks();
       else
         thd->mdl_context.release_statement_locks();
     }

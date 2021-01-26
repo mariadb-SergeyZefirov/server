@@ -35,6 +35,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1335  USA
 #include "common.h"
 #include "read_filt.h"
 #include "xtrabackup.h"
+#include "backup_debug.h"
 
 /* Size of read buffer in pages (640 pages = 10M for 16K sized pages) */
 #define XB_FIL_CUR_PAGES 640
@@ -90,16 +91,14 @@ xb_fil_node_close_file(
 {
 	ibool	ret;
 
-	mutex_enter(&fil_system.mutex);
+	mysql_mutex_lock(&fil_system.mutex);
 
 	ut_ad(node);
-	ut_a(node->n_pending == 0);
-	ut_a(node->n_pending_flushes == 0);
 	ut_a(!node->being_extended);
 
 	if (!node->is_open()) {
 
-		mutex_exit(&fil_system.mutex);
+		mysql_mutex_unlock(&fil_system.mutex);
 
 		return;
 	}
@@ -111,17 +110,7 @@ xb_fil_node_close_file(
 
 	ut_a(fil_system.n_open > 0);
 	fil_system.n_open--;
-
-	if (node->space->purpose == FIL_TYPE_TABLESPACE &&
-	    fil_is_user_tablespace_id(node->space->id)) {
-
-		ut_a(UT_LIST_GET_LEN(fil_system.LRU) > 0);
-
-		/* The node is in the LRU list, remove it */
-		UT_LIST_REMOVE(fil_system.LRU, node);
-	}
-
-	mutex_exit(&fil_system.mutex);
+	mysql_mutex_unlock(&fil_system.mutex);
 }
 
 /************************************************************************
@@ -180,18 +169,8 @@ xb_fil_cur_open(
 
 			return(XB_FIL_CUR_SKIP);
 		}
-		mutex_enter(&fil_system.mutex);
 
 		fil_system.n_open++;
-
-		if (node->space->purpose == FIL_TYPE_TABLESPACE &&
-		    fil_is_user_tablespace_id(node->space->id)) {
-
-			/* Put the node to the LRU list */
-			UT_LIST_ADD_FIRST(fil_system.LRU, node);
-		}
-
-		mutex_exit(&fil_system.mutex);
 	}
 
 	ut_ad(node->is_open());
@@ -251,12 +230,12 @@ xb_fil_cur_open(
 	    && os_file_read(IORequestRead,
 			    node->handle, cursor->buf, 0,
 			    cursor->page_size) == DB_SUCCESS) {
-		mutex_enter(&fil_system.mutex);
+		mysql_mutex_lock(&fil_system.mutex);
 		if (!node->space->crypt_data) {
 			node->space->crypt_data = fil_space_read_crypt_data(
 				node->space->zip_size(), cursor->buf);
 		}
-		mutex_exit(&fil_system.mutex);
+		mysql_mutex_unlock(&fil_system.mutex);
 	}
 
 	cursor->space_size = (ulint)(cursor->statinfo.st_size
@@ -373,19 +352,18 @@ static bool page_is_corrupted(const byte *page, ulint page_no,
 	return buf_page_is_corrupted(true, page, space->flags);
 }
 
-/************************************************************************
-Reads and verifies the next block of pages from the source
+/** Reads and verifies the next block of pages from the source
 file. Positions the cursor after the last read non-corrupted page.
-
+@param[in,out] cursor source file cursor
+@param[out] corrupted_pages adds corrupted pages if
+opt_log_innodb_page_corruption is set
 @return XB_FIL_CUR_SUCCESS if some have been read successfully, XB_FIL_CUR_EOF
 if there are no more pages to read and XB_FIL_CUR_ERROR on error. */
-xb_fil_cur_result_t
-xb_fil_cur_read(
-/*============*/
-	xb_fil_cur_t*	cursor)	/*!< in/out: source file cursor */
+xb_fil_cur_result_t xb_fil_cur_read(xb_fil_cur_t*	cursor,
+                                    CorruptedPages &corrupted_pages)
 {
 	byte*			page;
-	ulint			i;
+	unsigned			i;
 	ulint			npages;
 	ulint			retry_count;
 	xb_fil_cur_result_t	ret;
@@ -427,7 +405,7 @@ xb_fil_cur_read(
 	retry_count = 10;
 	ret = XB_FIL_CUR_SUCCESS;
 
-	fil_space_t *space = fil_space_acquire_for_io(cursor->space_id);
+	fil_space_t *space = fil_space_t::get(cursor->space_id);
 
 	if (!space) {
 		return XB_FIL_CUR_ERROR;
@@ -439,7 +417,7 @@ read_retry:
 	cursor->buf_read = 0;
 	cursor->buf_npages = 0;
 	cursor->buf_offset = offset;
-	cursor->buf_page_no = (ulint)(offset / page_size);
+	cursor->buf_page_no = static_cast<unsigned>(offset / page_size);
 
 	if (os_file_read(IORequestRead, cursor->file, cursor->buf, offset,
 			  (ulint) to_read) != DB_SUCCESS) {
@@ -450,33 +428,54 @@ read_retry:
 	partially written pages */
 	for (page = cursor->buf, i = 0; i < npages;
 	     page += page_size, i++) {
-		ulint page_no = cursor->buf_page_no + i;
+		unsigned page_no = cursor->buf_page_no + i;
 
 		if (page_is_corrupted(page, page_no, cursor, space)){
 			retry_count--;
 
 			if (retry_count == 0) {
+				const char *ignore_corruption_warn = opt_log_innodb_page_corruption ?
+					" WARNING!!! The corruption is ignored due to"
+					" log-innodb-page-corruption option, the backup can contain"
+					" corrupted data." : "";
 				msg(cursor->thread_n,
 				    "Error: failed to read page after "
 				    "10 retries. File %s seems to be "
-				    "corrupted.", cursor->abs_path);
-				ret = XB_FIL_CUR_ERROR;
+				    "corrupted.%s", cursor->abs_path, ignore_corruption_warn);
 				ut_print_buf(stderr, page, page_size);
-				break;
+				if (opt_log_innodb_page_corruption) {
+					corrupted_pages.add_page(cursor->node->name, cursor->node->space->id,
+						page_no);
+					retry_count = 1;
+				}
+				else {
+					ret = XB_FIL_CUR_ERROR;
+					break;
+				}
 			}
-			msg(cursor->thread_n, "Database page corruption detected at page "
-			    ULINTPF ", retrying...", 
-			    page_no);
-			os_thread_sleep(100000);
-			goto read_retry;
+			else {
+				msg(cursor->thread_n, "Database page corruption detected at page "
+				    UINT32PF ", retrying...",
+				    page_no);
+				os_thread_sleep(100000);
+				goto read_retry;
+			}
 		}
+		DBUG_EXECUTE_FOR_KEY("add_corrupted_page_for", cursor->node->space->name,
+			{
+				unsigned corrupted_page_no =
+					static_cast<unsigned>(strtoul(dbug_val, NULL, 10));
+				if (page_no == corrupted_page_no)
+					corrupted_pages.add_page(cursor->node->name, cursor->node->space->id,
+						corrupted_page_no);
+			});
 		cursor->buf_read += page_size;
 		cursor->buf_npages++;
 	}
 
 	posix_fadvise(cursor->file, offset, to_read, POSIX_FADV_DONTNEED);
 func_exit:
-	space->release_for_io();
+	space->release();
 	return(ret);
 }
 

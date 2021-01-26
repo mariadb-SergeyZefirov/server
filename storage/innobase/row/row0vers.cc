@@ -77,7 +77,7 @@ index record.
 @param[in]	offsets		rec_get_offsets(rec, index)
 @param[in,out]	mtr		mini-transaction
 @return	the active transaction; state must be rechecked after
-trx_mutex_enter(), and trx->release_reference() must be invoked
+acquiring trx->mutex, and trx->release_reference() must be invoked
 @retval	NULL if the record was committed */
 UNIV_INLINE
 trx_t*
@@ -193,10 +193,10 @@ row_vers_impl_x_locked_low(
 			heap, &prev_version, NULL,
 			dict_index_has_virtual(index) ? &vrow : NULL, 0);
 
-		trx_mutex_enter(trx);
+		ut_d(trx->mutex.wr_lock());
 		const bool committed = trx_state_eq(
 			trx, TRX_STATE_COMMITTED_IN_MEMORY);
-		trx_mutex_exit(trx);
+		ut_d(trx->mutex.wr_unlock());
 
 		/* The oldest visible clustered index version must not be
 		delete-marked, because we never start a transaction by
@@ -381,7 +381,7 @@ index record.
 @param[in]	index	secondary index
 @param[in]	offsets	rec_get_offsets(rec, index)
 @return	the active transaction; state must be rechecked after
-trx_mutex_enter(), and trx->release_reference() must be invoked
+acquiring trx->mutex, and trx->release_reference() must be invoked
 @retval	NULL if the record was committed */
 trx_t*
 row_vers_impl_x_locked(
@@ -395,7 +395,7 @@ row_vers_impl_x_locked(
 	const rec_t*	clust_rec;
 	dict_index_t*	clust_index;
 
-	ut_ad(!lock_mutex_own());
+	lock_sys.mutex_assert_unlocked();
 
 	mtr_start(&mtr);
 
@@ -1124,7 +1124,6 @@ row_vers_build_for_consistent_read(
 	ut_ad(index->is_primary());
 	ut_ad(mtr->memo_contains_page_flagged(rec, MTR_MEMO_PAGE_X_FIX
 					      | MTR_MEMO_PAGE_S_FIX));
-	ut_ad(!rw_lock_own(&(purge_sys.latch), RW_LOCK_S));
 
 	ut_ad(rec_offs_validate(rec, index, *offsets));
 
@@ -1237,7 +1236,6 @@ row_vers_build_for_semi_consistent_read(
 	ut_ad(index->is_primary());
 	ut_ad(mtr->memo_contains_page_flagged(rec, MTR_MEMO_PAGE_X_FIX
 					      | MTR_MEMO_PAGE_S_FIX));
-	ut_ad(!rw_lock_own(&(purge_sys.latch), RW_LOCK_S));
 
 	ut_ad(rec_offs_validate(rec, index, *offsets));
 

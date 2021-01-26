@@ -321,19 +321,18 @@ static bool convert_const_to_int(THD *thd, Item_field *field_item,
   if ((*item)->const_item() && !(*item)->is_expensive())
   {
     TABLE *table= field->table;
-    sql_mode_t orig_sql_mode= thd->variables.sql_mode;
-    enum_check_fields orig_count_cuted_fields= thd->count_cuted_fields;
+    Sql_mode_save sql_mode(thd);
+    Check_level_instant_set check_level_save(thd, CHECK_FIELD_IGNORE);
     my_bitmap_map *old_maps[2] = { NULL, NULL };
     ulonglong UNINIT_VAR(orig_field_val); /* original field value if valid */
 
     /* table->read_set may not be set if we come here from a CREATE TABLE */
     if (table && table->read_set)
-      dbug_tmp_use_all_columns(table, old_maps, 
+      dbug_tmp_use_all_columns(table, old_maps,
                                table->read_set, table->write_set);
     /* For comparison purposes allow invalid dates like 2000-01-32 */
-    thd->variables.sql_mode= (orig_sql_mode & ~MODE_NO_ZERO_DATE) | 
+    thd->variables.sql_mode= (thd->variables.sql_mode & ~MODE_NO_ZERO_DATE) |
                              MODE_INVALID_DATES;
-    thd->count_cuted_fields= CHECK_FIELD_IGNORE;
 
     /*
       Store the value of the field/constant because the call to save_in_field
@@ -370,8 +369,6 @@ static bool convert_const_to_int(THD *thd, Item_field *field_item,
       /* orig_field_val must be a valid value that can be restored back. */
       DBUG_ASSERT(!result);
     }
-    thd->variables.sql_mode= orig_sql_mode;
-    thd->count_cuted_fields= orig_count_cuted_fields;
     if (table && table->read_set)
       dbug_tmp_restore_column_maps(table->read_set, table->write_set, old_maps);
   }
@@ -868,6 +865,8 @@ int Arg_comparator::compare_decimal()
     {
       if (set_null)
         owner->null_value= 0;
+      val1.round_self_if_needed((*a)->decimals, HALF_UP);
+      val2.round_self_if_needed((*b)->decimals, HALF_UP);
       return val1.cmp(val2);
     }
   }
@@ -890,6 +889,8 @@ int Arg_comparator::compare_e_decimal()
   VDec val1(*a), val2(*b);
   if (val1.is_null() || val2.is_null())
     return MY_TEST(val1.is_null() && val2.is_null());
+  val1.round_self_if_needed((*a)->decimals, HALF_UP);
+  val2.round_self_if_needed((*b)->decimals, HALF_UP);
   return MY_TEST(val1.cmp(val2) == 0);
 }
 
@@ -2331,7 +2332,7 @@ longlong Item_func_between::val_int_cmp_real()
 
 void Item_func_between::print(String *str, enum_query_type query_type)
 {
-  args[0]->print_parenthesised(str, query_type, precedence());
+  args[0]->print_parenthesised(str, query_type, higher_precedence());
   if (negated)
     str->append(STRING_WITH_LEN(" not"));
   str->append(STRING_WITH_LEN(" between "));
@@ -3348,27 +3349,28 @@ Item* Item_func_case_simple::propagate_equal_fields(THD *thd,
 }
 
 
-void Item_func_case::print_when_then_arguments(String *str,
-                                               enum_query_type query_type,
-                                               Item **items, uint count)
+inline void Item_func_case::print_when_then_arguments(String *str,
+                                                      enum_query_type
+                                                      query_type,
+                                                      Item **items, uint count)
 {
-  for (uint i=0 ; i < count ; i++)
+  for (uint i= 0; i < count; i++)
   {
     str->append(STRING_WITH_LEN("when "));
-    items[i]->print_parenthesised(str, query_type, precedence());
+    items[i]->print(str, query_type);
     str->append(STRING_WITH_LEN(" then "));
-    items[i + count]->print_parenthesised(str, query_type, precedence());
+    items[i + count]->print(str, query_type);
     str->append(' ');
   }
 }
 
 
-void Item_func_case::print_else_argument(String *str,
-                                         enum_query_type query_type,
-                                         Item *item)
+inline void Item_func_case::print_else_argument(String *str,
+                                                enum_query_type query_type,
+                                                Item *item)
 {
   str->append(STRING_WITH_LEN("else "));
-  item->print_parenthesised(str, query_type, precedence());
+  item->print(str, query_type);
   str->append(' ');
 }
 
@@ -5600,18 +5602,21 @@ void Item_func_like::print(String *str, enum_query_type query_type)
     str->append(STRING_WITH_LEN(" not "));
   str->append(func_name());
   str->append(' ');
-  args[1]->print_parenthesised(str, query_type, precedence());
   if (escape_used_in_parsing)
   {
+    args[1]->print_parenthesised(str, query_type, precedence());
     str->append(STRING_WITH_LEN(" escape "));
-    escape_item->print(str, query_type);
+    escape_item->print_parenthesised(str, query_type, higher_precedence());
   }
+  else
+    args[1]->print_parenthesised(str, query_type, higher_precedence());
 }
 
 
 longlong Item_func_like::val_int()
 {
   DBUG_ASSERT(fixed == 1);
+  DBUG_ASSERT(escape != -1);
   String* res= args[0]->val_str(&cmp_value1);
   if (args[0]->null_value)
   {
@@ -5698,15 +5703,29 @@ bool fix_escape_item(THD *thd, Item *escape_item, String *tmp_str,
                      bool escape_used_in_parsing, CHARSET_INFO *cmp_cs,
                      int *escape)
 {
-  if (!escape_item->const_during_execution())
+  /*
+    ESCAPE clause accepts only constant arguments and Item_param.
+
+    Subqueries during context_analysis_only might decide they're
+    const_during_execution, but not quite const yet, not evaluate-able.
+    This is fine, as most of context_analysis_only modes will never
+    reach val_int(), so we won't need the value.
+    CONTEXT_ANALYSIS_ONLY_DERIVED being a notable exception here.
+  */
+  if (!escape_item->const_during_execution() ||
+     (!escape_item->const_item() &&
+      !(thd->lex->context_analysis_only & ~CONTEXT_ANALYSIS_ONLY_DERIVED)))
   {
     my_error(ER_WRONG_ARGUMENTS,MYF(0),"ESCAPE");
     return TRUE;
   }
-  
+
+  IF_DBUG(*escape= -1,);
+
   if (escape_item->const_item())
   {
     /* If we are on execution stage */
+    /* XXX is it safe to evaluate is_expensive() items here? */
     String *escape_str= escape_item->val_str(tmp_str);
     if (escape_str)
     {

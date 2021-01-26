@@ -169,10 +169,10 @@ void
 rtr_non_leaf_stack_push(
 /*====================*/
 	rtr_node_path_t*	path,		/*!< in/out: search path */
-	ulint			pageno,		/*!< in: pageno to insert */
+	uint32_t		pageno,		/*!< in: pageno to insert */
 	node_seq_t		seq_no,		/*!< in: Node sequence num */
 	ulint			level,		/*!< in: index level */
-	ulint			child_no,	/*!< in: child page no */
+	uint32_t		child_no,	/*!< in: child page no */
 	btr_pcur_t*		cursor,		/*!< in: position cursor */
 	double			mbr_inc);	/*!< in: MBR needs to be
 						enlarged */
@@ -303,10 +303,8 @@ rtr_store_parent_path(
 Initializes and opens a persistent cursor to an index tree. It should be
 closed with btr_pcur_close. */
 void
-rtr_pcur_open_low(
-/*==============*/
+rtr_pcur_open(
 	dict_index_t*	index,	/*!< in: index */
-	ulint		level,	/*!< in: level in the btree */
 	const dtuple_t*	tuple,	/*!< in: tuple on which search done */
 	page_cur_mode_t	mode,	/*!< in: PAGE_CUR_L, ...;
 				NOTE that if the search is made using a unique
@@ -316,12 +314,7 @@ rtr_pcur_open_low(
 				record! */
 	ulint		latch_mode,/*!< in: BTR_SEARCH_LEAF, ... */
 	btr_pcur_t*	cursor,	/*!< in: memory buffer for persistent cursor */
-	const char*	file,	/*!< in: file name */
-	unsigned	line,	/*!< in: line where called */
 	mtr_t*		mtr);	/*!< in: mtr */
-
-#define rtr_pcur_open(i,t,md,l,c,m)			\
-	rtr_pcur_open_low(i,0,t,md,l,c,__FILE__,__LINE__,m)
 
 struct btr_cur_t;
 

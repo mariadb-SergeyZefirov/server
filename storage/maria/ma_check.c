@@ -2360,6 +2360,14 @@ static int initialize_variables_for_repair(HA_CHECK *param,
 {
   MARIA_SHARE *share= info->s;
 
+  /*
+    We have to clear these variables first, as the cleanup-in-case-of-error
+    handling may touch these.
+  */
+  bzero((char*) sort_info,  sizeof(*sort_info));
+  bzero((char*) sort_param, sizeof(*sort_param));
+  bzero(&info->rec_cache, sizeof(info->rec_cache));
+
   if (share->data_file_type == NO_RECORD)
   {
     _ma_check_print_error(param,
@@ -2373,9 +2381,6 @@ static int initialize_variables_for_repair(HA_CHECK *param,
   /* Repair code relies on share->state.state so we have to update it here */
   if (share->lock.update_status)
     (*share->lock.update_status)(info->lock.status_param);
-
-  bzero((char*) sort_info,  sizeof(*sort_info));
-  bzero((char*) sort_param, sizeof(*sort_param));
 
   param->testflag|= T_REP;                     /* for easy checking */
   if (share->options & (HA_OPTION_CHECKSUM | HA_OPTION_COMPRESS_RECORD))
@@ -2404,7 +2409,6 @@ static int initialize_variables_for_repair(HA_CHECK *param,
   set_data_file_type(sort_info, info->s);
   sort_info->org_data_file_type= share->data_file_type;
 
-  bzero(&info->rec_cache, sizeof(info->rec_cache));
   info->rec_cache.file= info->dfile.file;
   info->update= (short) (HA_STATE_CHANGED | HA_STATE_ROW_CHANGED);
 
@@ -2560,6 +2564,9 @@ static int maria_drop_all_indexes(HA_CHECK *param, MARIA_HA *info,
     DBUG_PRINT("repair", ("declared all indexes disabled"));
   }
 
+  /* Flush obsolete index data from key cache */
+  _ma_flush_table_files(info, MARIA_FLUSH_INDEX,
+                        FLUSH_IGNORE_CHANGED, FLUSH_IGNORE_CHANGED);
   /* Clear index root block pointers. */
   for (i= 0; i < share->base.keys; i++)
     state->key_root[i]= HA_OFFSET_ERROR;
@@ -2888,9 +2895,13 @@ err:
   _ma_reset_state(info);
 
   end_io_cache(&param->read_cache);
-  end_io_cache(&sort_info.new_info->rec_cache);
+  if (sort_info.new_info)
+  {
+    end_io_cache(&sort_info.new_info->rec_cache);
+    sort_info.new_info->opt_flag&= ~(READ_CACHE_USED | WRITE_CACHE_USED);
+  }
   info->opt_flag&= ~(READ_CACHE_USED | WRITE_CACHE_USED);
-  sort_info.new_info->opt_flag&= ~(READ_CACHE_USED | WRITE_CACHE_USED);
+
   sort_param.sort_info->info->in_check_table= 0;
   /* this below could fail, shouldn't we detect error? */
   if (got_error)
@@ -4107,10 +4118,13 @@ err:
     maria_scan_end(sort_info.info);
   _ma_reset_state(info);
 
-  end_io_cache(&sort_info.new_info->rec_cache);
+  if (sort_info.new_info)
+  {
+    end_io_cache(&sort_info.new_info->rec_cache);
+    sort_info.new_info->opt_flag&= ~(READ_CACHE_USED | WRITE_CACHE_USED);
+  }
   end_io_cache(&param->read_cache);
   info->opt_flag&= ~(READ_CACHE_USED | WRITE_CACHE_USED);
-  sort_info.new_info->opt_flag&= ~(READ_CACHE_USED | WRITE_CACHE_USED);
   if (got_error)
   {
     if (! param->error_printed)
@@ -4639,10 +4653,13 @@ err:
     the share by remove_io_thread() or it was not yet started (if the
     error happend before creating the thread).
   */
-  end_io_cache(&sort_info.new_info->rec_cache);
+  if (sort_info.new_info)
+  {
+    end_io_cache(&sort_info.new_info->rec_cache);
+    sort_info.new_info->opt_flag&= ~(READ_CACHE_USED | WRITE_CACHE_USED);
+  }
   end_io_cache(&param->read_cache);
   info->opt_flag&= ~(READ_CACHE_USED | WRITE_CACHE_USED);
-  sort_info.new_info->opt_flag&= ~(READ_CACHE_USED | WRITE_CACHE_USED);
   /*
     Destroy the new data cache in case of non-quick repair. All slave
     threads did either detach from the share by remove_io_thread()

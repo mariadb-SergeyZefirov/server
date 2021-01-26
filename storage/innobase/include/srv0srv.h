@@ -3,7 +3,7 @@
 Copyright (c) 1995, 2017, Oracle and/or its affiliates. All rights reserved.
 Copyright (c) 2008, 2009, Google Inc.
 Copyright (c) 2009, Percona Inc.
-Copyright (c) 2013, 2020, MariaDB Corporation.
+Copyright (c) 2013, 2021, MariaDB Corporation.
 
 Portions of this file contain modifications contributed and copyrighted by
 Google, Inc. Those modifications are gratefully acknowledged and are described
@@ -42,15 +42,38 @@ Created 10/10/1995 Heikki Tuuri
 #pragma once
 
 #include "log0log.h"
-#include "os0event.h"
 #include "que0types.h"
 #include "trx0types.h"
 #include "fil0fil.h"
+#include "ut0counter.h"
 
 #include "mysql/psi/mysql_stage.h"
 #include "mysql/psi/psi.h"
 #include <tpool.h>
 #include <memory>
+
+/** Simple non-atomic counter
+@tparam	Type  the integer type of the counter */
+template <typename Type>
+struct MY_ALIGNED(CPU_LEVEL1_DCACHE_LINESIZE) simple_counter
+{
+  /** Increment the counter */
+  Type inc() { return add(1); }
+  /** Decrement the counter */
+  Type dec() { return add(Type(~0)); }
+
+  /** Add to the counter
+  @param i  amount to be added
+  @return the value of the counter after adding */
+  Type add(Type i) { return m_counter += i; }
+
+  /** @return the value of the counter */
+  operator Type() const { return m_counter; }
+
+private:
+  /** The counter */
+  Type m_counter;
+};
 
 /** Global counters used inside InnoDB. */
 struct srv_stats_t
@@ -75,20 +98,12 @@ struct srv_stats_t
 	/** Amount of data written to the log files in bytes */
 	lsn_ctr_1_t		os_log_written;
 
-	/** Number of writes being done to the log files.
-	Protected by log_sys.write_mutex. */
+	/** Number of writes being done to the log files */
 	ulint_ctr_1_t		os_log_pending_writes;
 
 	/** We increase this counter, when we don't have enough
 	space in the log buffer and have to flush it */
 	ulint_ctr_1_t		log_waits;
-
-	/** Count the number of times the doublewrite buffer was flushed */
-	ulint_ctr_1_t		dblwr_writes;
-
-	/** Store the number of pages that have been flushed to the
-	doublewrite buffer */
-	ulint_ctr_1_t		dblwr_pages_written;
 
 #if defined(LINUX_NATIVE_AIO)
 	ulint_ctr_1_t buffered_aio_submitted;
@@ -96,15 +111,6 @@ struct srv_stats_t
 
 	/** Store the number of write requests issued */
 	ulint_ctr_1_t		buf_pool_write_requests;
-
-	/** Store the number of times when we had to wait for a free page
-	in the buffer pool. It happens when the buffer pool is full and we
-	need to make a flush, in order to be able to read or create a page. */
-	ulint_ctr_1_t		buf_pool_wait_free;
-
-	/** Count the number of pages that were written from buffer
-	pool to the disk */
-	ulint_ctr_1_t		buf_pool_flushed;
 
 	/** Number of buffer pool reads that led to the reading of
 	a disk page */
@@ -197,7 +203,7 @@ struct srv_stats_t
 };
 
 /** We are prepared for a situation that we have this many threads waiting for
-a semaphore inside InnoDB. srv_start() sets the value. */
+a transactional lock inside InnoDB. srv_start() sets the value. */
 extern ulint srv_max_n_threads;
 
 extern const char*	srv_main_thread_op_info;
@@ -222,15 +228,13 @@ at a time */
 #define SRV_AUTO_EXTEND_INCREMENT (srv_sys_space.get_autoextend_increment())
 
 /** Mutex protecting page_zip_stat_per_index */
-extern ib_mutex_t	page_zip_stat_per_index_mutex;
-/* Mutex for locking srv_monitor_file. Not created if srv_read_only_mode */
-extern ib_mutex_t	srv_monitor_file_mutex;
+extern mysql_mutex_t page_zip_stat_per_index_mutex;
+/** Mutex for locking srv_monitor_file */
+extern mysql_mutex_t srv_monitor_file_mutex;
 /* Temporary file for innodb monitor output */
 extern FILE*	srv_monitor_file;
-/* Mutex for locking srv_misc_tmpfile. Only created if !srv_read_only_mode.
-This mutex has a very low rank; threads reserving it should not
-acquire any further latches or sleep before releasing this one. */
-extern ib_mutex_t	srv_misc_tmpfile_mutex;
+/** Mutex for locking srv_misc_tmpfile */
+extern mysql_mutex_t srv_misc_tmpfile_mutex;
 /* Temporary file for miscellanous diagnostic output */
 extern FILE*	srv_misc_tmpfile;
 
@@ -314,8 +318,10 @@ extern my_bool	srv_adaptive_flushing;
 extern my_bool	srv_flush_sync;
 
 #ifdef WITH_INNODB_DISALLOW_WRITES
-/* When this event is reset we do not allow any file writes to take place. */
-extern os_event_t	srv_allow_writes_event;
+extern my_bool innodb_disallow_writes;
+void innodb_wait_allow_writes();
+#else
+# define innodb_wait_allow_writes() do {} while (0)
 #endif /* WITH_INNODB_DISALLOW_WRITES */
 
 /* If this flag is TRUE, then we will load the indexes' (and tables') metadata
@@ -350,11 +356,11 @@ extern ulong srv_buf_pool_load_pages_abort;
 /** Lock table size in bytes */
 extern ulint	srv_lock_table_size;
 
-extern ulint	srv_n_file_io_threads;
+extern uint	srv_n_file_io_threads;
 extern my_bool	srv_random_read_ahead;
 extern ulong	srv_read_ahead_threshold;
-extern ulong	srv_n_read_io_threads;
-extern ulong	srv_n_write_io_threads;
+extern uint	srv_n_read_io_threads;
+extern uint	srv_n_write_io_threads;
 
 /* Defragmentation, Origianlly facebook default value is 100, but it's too high */
 #define SRV_DEFRAGMENT_FREQUENCY_DEFAULT 40
@@ -365,8 +371,6 @@ extern uint	srv_defragment_fill_factor_n_recs;
 extern double	srv_defragment_fill_factor;
 extern uint	srv_defragment_frequency;
 extern ulonglong	srv_defragment_interval;
-
-extern ulong	srv_idle_flush_pct;
 
 extern uint	srv_change_buffer_max_size;
 
@@ -386,7 +390,7 @@ extern ulong	srv_innodb_stats_method;
 
 extern ulint	srv_max_n_open_files;
 
-extern double	srv_max_dirty_pages_pct;
+extern double	srv_max_buf_pool_modified_pct;
 extern double	srv_max_dirty_pages_pct_lwm;
 
 extern double	srv_adaptive_flushing_lwm;
@@ -411,13 +415,10 @@ extern unsigned long long	srv_stats_modified_counter;
 extern my_bool			srv_stats_sample_traditional;
 
 extern my_bool	srv_use_doublewrite_buf;
-extern ulong	srv_doublewrite_batch_size;
 extern ulong	srv_checksum_algorithm;
 
-extern double	srv_max_buf_pool_modified_pct;
 extern my_bool	srv_force_primary_key;
 
-extern double	srv_max_buf_pool_modified_pct;
 extern ulong	srv_max_purge_lag;
 extern ulong	srv_max_purge_lag_delay;
 
@@ -465,7 +466,6 @@ extern ulint	srv_log_writes_and_flush;
 
 #ifdef UNIV_DEBUG
 extern my_bool	innodb_evict_tables_on_commit_debug;
-extern my_bool	srv_sync_debug;
 extern my_bool	srv_purge_view_update_only_debug;
 
 /** Value of MySQL global used to disable master thread. */
@@ -490,9 +490,6 @@ extern uint srv_n_purge_threads;
 
 /* the number of pages to purge in one batch */
 extern ulong srv_purge_batch_size;
-
-/* the number of sync wait arrays */
-extern ulong srv_sync_array_size;
 
 /* print all user-level transactions deadlocks to mysqld stderr */
 extern my_bool srv_print_all_deadlocks;
@@ -521,7 +518,6 @@ extern ulong srv_buf_dump_status_frequency;
 
 # ifdef UNIV_PFS_THREAD
 extern mysql_pfs_key_t	page_cleaner_thread_key;
-extern mysql_pfs_key_t	recv_writer_thread_key;
 extern mysql_pfs_key_t	trx_rollback_clean_thread_key;
 extern mysql_pfs_key_t	thread_pool_thread_key;
 
@@ -659,18 +655,11 @@ void
 srv_export_innodb_status(void);
 /*==========================*/
 /*******************************************************************//**
-Get current server activity count. We don't hold srv_sys::mutex while
-reading this value as it is only used in heuristics.
+Get current server activity count.
 @return activity count. */
 ulint
 srv_get_activity_count(void);
 /*========================*/
-
-/** Check if there has been any activity.
-@param[in,out]  activity_count  recent activity count to be returned
-if there is a change
-@return FALSE if no change in activity counter. */
-bool srv_check_activity(ulint *activity_count);
 
 /******************************************************************//**
 Increment the server activity counter. */
@@ -717,13 +706,6 @@ Complete the shutdown tasks such as background DROP TABLE,
 and optionally change buffer merge (on innodb_fast_shutdown=0). */
 void srv_shutdown(bool ibuf_merge);
 
-
-/*************************************************************************
-A task which prints warnings about semaphore waits which have lasted
-too long. These can be used to track bugs which cause hangs.
-*/
-void srv_error_monitor_task(void*);
-
 } /* extern "C" */
 
 #ifdef UNIV_DEBUG
@@ -744,6 +726,9 @@ void srv_init_purge_tasks();
 void
 srv_master_thread_disabled_debug_update(THD*, st_mysql_sys_var*, void*,
 					const void* save);
+
+/** Enable the master thread on shutdown. */
+void srv_master_thread_enable();
 #endif /* UNIV_DEBUG */
 
 /** Status variables to be passed to MySQL */
@@ -767,9 +752,7 @@ struct export_var_t{
 	ulint innodb_buffer_pool_pages_old;
 	ulint innodb_buffer_pool_read_requests;	/*!< buf_pool.stat.n_page_gets */
 	ulint innodb_buffer_pool_reads;		/*!< srv_buf_pool_reads */
-	ulint innodb_buffer_pool_wait_free;	/*!< srv_buf_pool_wait_free */
-	ulint innodb_buffer_pool_pages_flushed;	/*!< srv_buf_pool_flushed */
-	ulint innodb_buffer_pool_write_requests;/*!< srv_buf_pool_write_requests */
+	ulint innodb_buffer_pool_write_requests;/*!< srv_stats.buf_pool_write_requests */
 	ulint innodb_buffer_pool_read_ahead_rnd;/*!< srv_read_ahead_rnd */
 	ulint innodb_buffer_pool_read_ahead;	/*!< srv_read_ahead */
 	ulint innodb_buffer_pool_read_ahead_evicted;/*!< srv_read_ahead evicted*/
@@ -822,7 +805,6 @@ struct export_var_t{
 	ulint innodb_system_rows_inserted; /*!< srv_n_system_rows_inserted */
 	ulint innodb_system_rows_updated; /*!< srv_n_system_rows_updated */
 	ulint innodb_system_rows_deleted; /*!< srv_n_system_rows_deleted*/
-	ulint innodb_num_open_files;		/*!< fil_system_t::n_open */
 	ulint innodb_truncated_status_writes;	/*!< srv_truncated_status_writes */
 
 	/** Number of undo tablespace truncation operations */
@@ -893,11 +875,8 @@ struct export_var_t{
 
 /** Thread slot in the thread table.  */
 struct srv_slot_t{
-	ibool		in_use;			/*!< TRUE if this slot
+	bool		in_use;			/*!< true if this slot
 						is in use */
-	ibool		suspended;		/*!< TRUE if the thread is
-						waiting for the event of this
-						slot */
  	/** time(NULL) when the thread was suspended.
  	FIXME: Use my_interval_timer() or similar, to avoid bogus
  	timeouts in lock_wait_check_and_cancel() or lock_wait_suspend_thread()
@@ -911,21 +890,23 @@ struct srv_slot_t{
 						Initialized by
 						lock_wait_table_reserve_slot()
 						for lock wait */
-	os_event_t	event;			/*!< event used in suspending
-						the thread when it has nothing
-						to do */
+	mysql_cond_t	cond;			/*!< condition variable for
+						waking up suspended thread,
+						under lock_sys.mutex */
 	que_thr_t*	thr;			/*!< suspended query thread
 						(only used for user threads) */
 };
 
 extern tpool::thread_pool *srv_thread_pool;
 extern std::unique_ptr<tpool::timer> srv_master_timer;
-extern std::unique_ptr<tpool::timer> srv_error_monitor_timer;
 extern std::unique_ptr<tpool::timer> srv_monitor_timer;
+
+/** The interval at which srv_monitor_task is invoked, in milliseconds */
+constexpr unsigned SRV_MONITOR_INTERVAL= 15000; /* 4 times per minute */
 
 static inline void srv_monitor_timer_schedule_now()
 {
-  srv_monitor_timer->set_time(0, 5000);
+  srv_monitor_timer->set_time(0, SRV_MONITOR_INTERVAL);
 }
 static inline void srv_start_periodic_timer(std::unique_ptr<tpool::timer>& t,
                                             void (*func)(void*), int period)

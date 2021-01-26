@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1997, 2017, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2020, MariaDB Corporation.
+Copyright (c) 2017, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -442,21 +442,19 @@ row_purge_remove_sec_if_poss_leaf(
 
 	/* Set the purge node for the call to row_purge_poss_sec(). */
 	pcur.btr_cur.purge_node = node;
-	if (dict_index_is_spatial(index)) {
-		rw_lock_sx_lock(dict_index_get_lock(index));
+	if (index->is_spatial()) {
 		pcur.btr_cur.thr = NULL;
+		index->lock.u_lock(SRW_LOCK_CALL);
+		search_result = row_search_index_entry(
+			index, entry, mode, &pcur, &mtr);
+		index->lock.u_unlock();
 	} else {
 		/* Set the query thread, so that ibuf_insert_low() will be
 		able to invoke thd_get_trx(). */
 		pcur.btr_cur.thr = static_cast<que_thr_t*>(
 			que_node_get_parent(node));
-	}
-
-	search_result = row_search_index_entry(
-		index, entry, mode, &pcur, &mtr);
-
-	if (dict_index_is_spatial(index)) {
-		rw_lock_sx_unlock(dict_index_get_lock(index));
+		search_result = row_search_index_entry(
+			index, entry, mode, &pcur, &mtr);
 	}
 
 	switch (search_result) {
@@ -834,8 +832,6 @@ skip_secondaries:
 				page_id_t(rseg->space->id, page_no),
 				0, RW_X_LATCH, &mtr);
 
-			buf_block_dbg_add_level(block, SYNC_TRX_UNDO_PAGE);
-
 			data_field = buf_block_get_frame(block)
 				+ offset + internal_offset;
 
@@ -896,6 +892,7 @@ row_purge_parse_undo_rec(
 	switch (type) {
 	case TRX_UNDO_RENAME_TABLE:
 		return false;
+	case TRX_UNDO_EMPTY:
 	case TRX_UNDO_INSERT_METADATA:
 	case TRX_UNDO_INSERT_REC:
 		/* These records do not store any transaction identifier.
@@ -986,6 +983,9 @@ err_exit:
 	if (type == TRX_UNDO_INSERT_METADATA) {
 		node->ref = &trx_undo_metadata;
 		return(true);
+	} else if (type == TRX_UNDO_EMPTY) {
+		node->ref = nullptr;
+		return true;
 	}
 
 	ptr = trx_undo_rec_get_row_ref(ptr, clust_index, &(node->ref),
@@ -1043,6 +1043,8 @@ row_purge_record_func(
 	ut_ad(!trx_undo_roll_ptr_is_insert(node->roll_ptr));
 
 	switch (node->rec_type) {
+	case TRX_UNDO_EMPTY:
+		break;
 	case TRX_UNDO_DEL_MARK_REC:
 		purged = row_purge_del_mark(node);
 		if (purged) {

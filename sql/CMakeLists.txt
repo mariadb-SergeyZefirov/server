@@ -36,7 +36,14 @@ IF(WITH_WSREP AND NOT EMBEDDED_LIBRARY)
     wsrep_plugin.cc
     service_wsrep.cc
   )
-  MYSQL_ADD_PLUGIN(wsrep ${WSREP_SOURCES} MANDATORY NOT_EMBEDDED EXPORT_SYMBOLS LINK_LIBRARIES wsrep-lib wsrep_api_v26)
+  MYSQL_ADD_PLUGIN(wsrep ${WSREP_SOURCES} MANDATORY NOT_EMBEDDED LINK_LIBRARIES wsrep-lib wsrep_api_v26)
+  IF(VISIBILITY_HIDDEN_FLAG AND TARGET wsrep)
+    # wsrep_info plugin needs some wsrep symbols from inside mysqld
+    # we have to remove -fvisibility=hidden from wsrep
+    GET_TARGET_PROPERTY(f wsrep COMPILE_FLAGS)
+    STRING(REPLACE "${VISIBILITY_HIDDEN_FLAG}" "" f ${f})
+    SET_TARGET_PROPERTIES(wsrep PROPERTIES COMPILE_FLAGS "${f}")
+  ENDIF()
 ELSE()
   ADD_LIBRARY(wsrep STATIC wsrep_dummy.cc)
   ADD_DEPENDENCIES(wsrep GenError)
@@ -193,7 +200,7 @@ DTRACE_INSTRUMENT(sql)
 TARGET_LINK_LIBRARIES(sql
   mysys mysys_ssl dbug strings vio pcre2-8
   tpool
-  ${LIBWRAP} ${LIBCRYPT} ${LIBDL} ${CMAKE_THREAD_LIBS_INIT}
+  ${LIBWRAP} ${LIBCRYPT} ${CMAKE_DL_LIBS} ${CMAKE_THREAD_LIBS_INIT}
   ${SSL_LIBRARIES}
   ${LIBSYSTEMD})
 
@@ -214,17 +221,22 @@ ELSE()
   SET(MYSQLD_SOURCE main.cc ${DTRACE_PROBES_ALL})
 ENDIF()
 
-IF(MSVC)
+IF(MSVC OR CMAKE_SYSTEM_NAME MATCHES AIX)
   SET(libs_to_export_symbols sql mysys dbug strings)
   # Create shared library of already compiled object
   # Export all symbols from selected libraries, to be used
   # by plugins
+  IF(MSVC)
+    SET(VERSIONINFO_RC ${PROJECT_BINARY_DIR}/versioninfo_dll.rc)
+  ELSE()
+    SET(VERSIONINFO_RC)
+  ENDIF()
   ADD_LIBRARY(server SHARED
     $<TARGET_OBJECTS:sql>
     $<TARGET_OBJECTS:mysys>
     $<TARGET_OBJECTS:dbug>
     $<TARGET_OBJECTS:strings>
-    ${PROJECT_BINARY_DIR}/versioninfo_dll.rc
+    ${VERSIONINFO_RC}
   )
 
   # We need to add all dependencies of sql/mysys/dbug/strings
@@ -245,7 +257,11 @@ IF(MSVC)
    ${all_deps}
    sql_builtins
   )
-  SET_TARGET_PROPERTIES(server PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+  IF(MSVC)
+    SET_TARGET_PROPERTIES(server PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+  ELSE()
+    SET_TARGET_PROPERTIES(server PROPERTIES AIX_EXPORT_ALL_SYMBOLS TRUE)
+  ENDIF()
   MYSQL_INSTALL_TARGETS(server DESTINATION  ${INSTALL_BINDIR} COMPONENT Server)
 ENDIF()
 
@@ -272,7 +288,7 @@ IF(NOT WITHOUT_DYNAMIC_PLUGINS)
   ENDIF()
 ENDIF(NOT WITHOUT_DYNAMIC_PLUGINS)
 
-IF(MSVC)
+IF(MSVC OR CMAKE_SYSTEM_NAME MATCHES AIX)
   TARGET_LINK_LIBRARIES(mariadbd server)
 ELSE()
   TARGET_LINK_LIBRARIES(mariadbd LINK_PRIVATE sql sql_builtins)

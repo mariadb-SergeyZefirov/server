@@ -20,6 +20,7 @@
 #include "sql_const.h"
 #include "sql_class.h"
 #include "sql_time.h"
+#include "sql_string.h"
 #include "item.h"
 #include "log.h"
 #include "tztime.h"
@@ -2655,8 +2656,7 @@ Field *Type_handler_set::make_conversion_table_field(MEM_ROOT *root,
 
 Field *Type_handler_enum::make_schema_field(MEM_ROOT *root, TABLE *table,
                                             const Record_addr &addr,
-                                            const ST_FIELD_INFO &def,
-                                            bool show_field) const
+                                            const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
   const Typelib *typelib= def.typelib();
@@ -3861,8 +3861,7 @@ Field *Type_handler_set::make_table_field(MEM_ROOT *root,
 
 Field *Type_handler_float::make_schema_field(MEM_ROOT *root, TABLE *table,
                                              const Record_addr &addr,
-                                             const ST_FIELD_INFO &def,
-                                             bool show_field) const
+                                             const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
   return new (root)
@@ -3876,8 +3875,7 @@ Field *Type_handler_float::make_schema_field(MEM_ROOT *root, TABLE *table,
 
 Field *Type_handler_double::make_schema_field(MEM_ROOT *root, TABLE *table,
                                               const Record_addr &addr,
-                                              const ST_FIELD_INFO &def,
-                                              bool show_field) const
+                                              const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
   return new (root)
@@ -3892,8 +3890,7 @@ Field *Type_handler_double::make_schema_field(MEM_ROOT *root, TABLE *table,
 Field *Type_handler_decimal_result::make_schema_field(MEM_ROOT *root,
                                                       TABLE *table,
                                                       const Record_addr &addr,
-                                                      const ST_FIELD_INFO &def,
-                                                      bool show_field) const
+                                                      const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
   uint dec= def.decimal_scale();
@@ -3909,28 +3906,20 @@ Field *Type_handler_decimal_result::make_schema_field(MEM_ROOT *root,
 
 Field *Type_handler_blob_common::make_schema_field(MEM_ROOT *root, TABLE *table,
                                                    const Record_addr &addr,
-                                                   const ST_FIELD_INFO &def,
-                                                   bool show_field) const
+                                                   const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
-  if (show_field)
-  {
-    return new (root)
-       Field_blob(addr.ptr(), addr.null_ptr(), addr.null_bit(),
-                  Field::NONE, &name, table->s,
-                  length_bytes(),
-                  &my_charset_bin);
-  }
-  else
-    return new (root)
-      Field_null(addr.ptr(), 0, Field::NONE, &name, &my_charset_bin);
+  return new (root)
+     Field_blob(addr.ptr(), addr.null_ptr(), addr.null_bit(),
+                Field::NONE, &name, table->s,
+                length_bytes(),
+                &my_charset_bin);
 }
 
 
 Field *Type_handler_varchar::make_schema_field(MEM_ROOT *root, TABLE *table,
                                                const Record_addr &addr,
-                                               const ST_FIELD_INFO &def,
-                                               bool show_field) const
+                                               const ST_FIELD_INFO &def) const
 {
   DBUG_ASSERT(def.char_length());
   LEX_CSTRING name= def.name();
@@ -3944,7 +3933,7 @@ Field *Type_handler_varchar::make_schema_field(MEM_ROOT *root, TABLE *table,
       field->field_length= octet_length;
     return field;
   }
-  else if (show_field)
+  else
   {
     return new (root)
       Field_varstring(addr.ptr(), octet_length,
@@ -3953,16 +3942,12 @@ Field *Type_handler_varchar::make_schema_field(MEM_ROOT *root, TABLE *table,
                       Field::NONE, &name,
                       table->s, system_charset_info);
   }
-  else
-    return new (root)
-      Field_null(addr.ptr(), 0, Field::NONE, &name, system_charset_info);
 }
 
 
 Field *Type_handler_tiny::make_schema_field(MEM_ROOT *root, TABLE *table,
                                             const Record_addr &addr,
-                                            const ST_FIELD_INFO &def,
-                                            bool show_field) const
+                                            const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
   return new (root)
@@ -3974,8 +3959,7 @@ Field *Type_handler_tiny::make_schema_field(MEM_ROOT *root, TABLE *table,
 
 Field *Type_handler_short::make_schema_field(MEM_ROOT *root, TABLE *table,
                                              const Record_addr &addr,
-                                             const ST_FIELD_INFO &def,
-                                             bool show_field) const
+                                             const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
   return new (root)
@@ -3987,8 +3971,7 @@ Field *Type_handler_short::make_schema_field(MEM_ROOT *root, TABLE *table,
 
 Field *Type_handler_long::make_schema_field(MEM_ROOT *root, TABLE *table,
                                             const Record_addr &addr,
-                                            const ST_FIELD_INFO &def,
-                                            bool show_field) const
+                                            const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
   return new (root)
@@ -4000,8 +3983,7 @@ Field *Type_handler_long::make_schema_field(MEM_ROOT *root, TABLE *table,
 
 Field *Type_handler_longlong::make_schema_field(MEM_ROOT *root, TABLE *table,
                                                 const Record_addr &addr,
-                                                const ST_FIELD_INFO &def,
-                                                bool show_field) const
+                                                const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
   return new (root)
@@ -4013,8 +3995,7 @@ Field *Type_handler_longlong::make_schema_field(MEM_ROOT *root, TABLE *table,
 
 Field *Type_handler_date_common::make_schema_field(MEM_ROOT *root, TABLE *table,
                                                    const Record_addr &addr,
-                                                   const ST_FIELD_INFO &def,
-                                                   bool show_field) const
+                                                   const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
   return new (root)
@@ -4025,8 +4006,7 @@ Field *Type_handler_date_common::make_schema_field(MEM_ROOT *root, TABLE *table,
 
 Field *Type_handler_time_common::make_schema_field(MEM_ROOT *root, TABLE *table,
                                                    const Record_addr &addr,
-                                                   const ST_FIELD_INFO &def,
-                                                   bool show_field) const
+                                                   const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
   return new_Field_time(root,
@@ -4038,8 +4018,7 @@ Field *Type_handler_time_common::make_schema_field(MEM_ROOT *root, TABLE *table,
 Field *Type_handler_datetime_common::make_schema_field(MEM_ROOT *root,
                                                        TABLE *table,
                                                        const Record_addr &addr,
-                                                       const ST_FIELD_INFO &def,
-                                                       bool show_field) const
+                                                       const ST_FIELD_INFO &def) const
 {
   LEX_CSTRING name= def.name();
   return new (root) Field_datetimef(addr.ptr(),
@@ -5703,10 +5682,12 @@ cmp_item *Type_handler_timestamp_common::make_cmp_item(THD *thd,
 
 /***************************************************************************/
 
-static int srtcmp_in(CHARSET_INFO *cs, const String *x,const String *y)
+static int srtcmp_in(const void *cs_, const void *x_, const void *y_)
 {
-  return cs->strnncollsp(x->ptr(), x->length(),
-                         y->ptr(), y->length());
+  const CHARSET_INFO *cs= static_cast<const CHARSET_INFO *>(cs_);
+  const String *x= static_cast<const String *>(x_);
+  const String *y= static_cast<const String *>(y_);
+  return cs->strnncollsp(x->ptr(), x->length(), y->ptr(), y->length());
 }
 
 in_vector *Type_handler_string_result::make_in_vector(THD *thd,
@@ -6956,6 +6937,24 @@ bool Type_handler_string_result::
 
 /***************************************************************************/
 
+const Vers_type_handler* Type_handler_temporal_result::vers() const
+{
+  return &vers_type_timestamp;
+}
+
+const Vers_type_handler* Type_handler_string_result::vers() const
+{
+  return &vers_type_timestamp;
+}
+
+const Vers_type_handler* Type_handler_blob_common::vers() const
+
+{
+  return &vers_type_timestamp;
+}
+
+/***************************************************************************/
+
 uint Type_handler::Item_time_precision(THD *thd, Item *item) const
 {
   return MY_MIN(item->decimals, TIME_SECOND_PART_DIGITS);
@@ -7079,7 +7078,8 @@ uint Type_handler_timestamp_common::Item_decimal_precision(const Item *item) con
 
 bool Type_handler_real_result::
        subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const
+                                            const Item *outer,
+                                            bool is_in_predicate) const
 {
   DBUG_ASSERT(inner->cmp_type() == REAL_RESULT);
   return outer->cmp_type() == REAL_RESULT;
@@ -7088,7 +7088,8 @@ bool Type_handler_real_result::
 
 bool Type_handler_int_result::
        subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const
+                                            const Item *outer,
+                                            bool is_in_predicate) const
 {
   DBUG_ASSERT(inner->cmp_type() == INT_RESULT);
   return outer->cmp_type() == INT_RESULT;
@@ -7097,7 +7098,8 @@ bool Type_handler_int_result::
 
 bool Type_handler_decimal_result::
        subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const
+                                            const Item *outer,
+                                            bool is_in_predicate) const
 {
   DBUG_ASSERT(inner->cmp_type() == DECIMAL_RESULT);
   return outer->cmp_type() == DECIMAL_RESULT;
@@ -7106,23 +7108,37 @@ bool Type_handler_decimal_result::
 
 bool Type_handler_string_result::
        subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const
+                                            const Item *outer,
+                                            bool is_in_predicate) const
 {
   DBUG_ASSERT(inner->cmp_type() == STRING_RESULT);
-  return outer->cmp_type() == STRING_RESULT &&
-         outer->collation.collation == inner->collation.collation &&
-         /*
-           Materialization also is unable to work when create_tmp_table() will
-           create a blob column because item->max_length is too big.
-           The following test is copied from varstring_type_handler().
-         */
-         !inner->too_big_for_varchar();
+  if (outer->cmp_type() == STRING_RESULT &&
+      /*
+        Materialization also is unable to work when create_tmp_table() will
+        create a blob column because item->max_length is too big.
+        The following test is copied from varstring_type_handler().
+      */
+      !inner->too_big_for_varchar())
+  {
+    if (outer->collation.collation == inner->collation.collation)
+      return true;
+    if (is_in_predicate)
+    {
+      Charset inner_col(inner->collation.collation);
+      if (inner_col.encoding_allows_reinterpret_as(outer->
+                                                   collation.collation) &&
+          inner_col.eq_collation_specific_names(outer->collation.collation))
+        return true;
+    }
+  }
+  return false;
 }
 
 
 bool Type_handler_temporal_result::
        subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const
+                                            const Item *outer,
+                                            bool is_in_predicate) const
 {
   DBUG_ASSERT(inner->cmp_type() == TIME_RESULT);
   return mysql_timestamp_type() ==
@@ -9273,11 +9289,18 @@ LEX_CSTRING Charset::collation_specific_name() const
     for character sets and collations, so a collation
     name not necessarily starts with the character set name.
   */
+  LEX_CSTRING retval;
   size_t csname_length= strlen(m_charset->csname);
   if (strncmp(m_charset->name, m_charset->csname, csname_length))
-    return {NULL, 0};
+  {
+    retval.str= NULL;
+    retval.length= 0;
+    return retval;
+  }
   const char *ptr= m_charset->name + csname_length;
-  return {ptr, strlen(ptr) };
+  retval.str= ptr;
+  retval.length= strlen(ptr);
+  return retval;
 }
 
 

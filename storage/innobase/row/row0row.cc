@@ -295,12 +295,14 @@ row_build_index_entry_low(
 			continue;
 		}
 
+		ut_ad(!(index->type & DICT_FTS));
+
 		ulint len = dfield_get_len(dfield);
 
 		if (f.prefix_len == 0
 		    && (!dfield_is_ext(dfield)
 			|| dict_index_is_clust(index))) {
-			/* The dfield_copy() above suffices for
+			/* The *dfield = *dfield2 above suffices for
 			columns that are stored in-page, or for
 			clustered index record columns that are not
 			part of a column prefix in the PRIMARY KEY. */
@@ -1292,7 +1294,7 @@ row_search_index_entry(
 	ut_ad(dtuple_check_typed(entry));
 
 	if (dict_index_is_spatial(index)) {
-		ut_ad(mode & BTR_MODIFY_LEAF || mode & BTR_MODIFY_TREE);
+		ut_ad(mode & (BTR_MODIFY_LEAF | BTR_MODIFY_TREE));
 		rtr_pcur_open(index, entry, PAGE_CUR_RTREE_LOCATE,
 			      mode, pcur, mtr);
 	} else {
@@ -1301,7 +1303,8 @@ row_search_index_entry(
 
 	switch (btr_pcur_get_btr_cur(pcur)->flag) {
 	case BTR_CUR_DELETE_REF:
-		ut_a(mode & BTR_DELETE && !dict_index_is_spatial(index));
+		ut_ad(mode & BTR_DELETE);
+		ut_ad(!index->is_spatial());
 		return(ROW_NOT_DELETED_REF);
 
 	case BTR_CUR_DEL_MARK_IBUF:

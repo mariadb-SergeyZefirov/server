@@ -20,6 +20,8 @@ connection master;
 
 create table t1 (a int, b int) engine=aria;
 insert into t1 select seq,seq+10 from seq_1_to_10;
+sync_slave_with_master;
+connection master;
 alter table t1 engine=s3;
 show create table t1;
 
@@ -116,12 +118,18 @@ connection slave;
 stop slave;
 connection master;
 rename table t1 to t2;
-create table t1 (a int, b int) engine=aria;
+# Check the different create options with the table
+create table t1 (a int) engine=aria;
+drop table t1;
+create table if not exists t1 (a int, b int) engine=aria;
+drop table t1;
+create or replace table t1 (a int, b int, c int) engine=aria;
 alter table t1 engine=s3;
 connection slave;
 start slave;
 connection master;
 sync_slave_with_master;
+show create table t1;
 select * from t1 limit 2;
 select * from t2 limit 2;
 connection master;
@@ -169,6 +177,26 @@ drop table if exists t1,t2;
 sync_slave_with_master;
 --let $binlog_database=$database
 --source include/show_binlog_events.inc
+connection master;
+
+--echo #
+--echo # MDEV-24351: S3, same-backend replication: Dropping a table on master
+--echo #             causes error on slave
+--echo #
+show variables like 's3_replicate_alter_as_create_select';
+
+connection slave;
+create table t3 (a int, b int) engine=aria;
+insert into t3 values (1,1),(2,2),(3,3);
+alter table t3 engine=s3;
+
+connection master;
+let $binlog_start= query_get_value("SHOW MASTER STATUS", Position, 1);
+drop table t3;
+--echo # Must show "DROP TABLE IF EXISTS t3", not just "DROP TABLE t3"
+--source include/show_binlog_events.inc
+
+sync_slave_with_master;
 connection master;
 
 --echo #

@@ -416,8 +416,6 @@ btr_pcur_open_low(
 				record! */
 	ulint		latch_mode,/*!< in: BTR_SEARCH_LEAF, ... */
 	btr_pcur_t*	cursor, /*!< in: memory buffer for persistent cursor */
-	const char*	file,	/*!< in: file name */
-	unsigned	line,	/*!< in: line where called */
 	ib_uint64_t	autoinc,/*!< in: PAGE_ROOT_AUTO_INC to be written
 				(0 if none) */
 	mtr_t*		mtr)	/*!< in: mtr */
@@ -443,13 +441,11 @@ btr_pcur_open_low(
 #ifdef BTR_CUR_HASH_ADAPT
 		NULL,
 #endif /* BTR_CUR_HASH_ADAPT */
-		file, line, mtr, autoinc);
+		mtr, autoinc);
 
 	if (UNIV_UNLIKELY(err != DB_SUCCESS)) {
 		ib::warn() << "btr_pcur_open_low"
 			   << " level: " << level
-			   << " called from file: "
-			   << file << " line: " << line
 			   << " table: " << index->table->name
 			   << " index: " << index->name
 			   << " error: " << err;
@@ -483,12 +479,9 @@ btr_pcur_open_with_no_init_func(
 				that the ahi_latch protects the record! */
 	btr_pcur_t*	cursor, /*!< in: memory buffer for persistent cursor */
 #ifdef BTR_CUR_HASH_ADAPT
-	rw_lock_t*	ahi_latch,
-				/*!< in: adaptive hash index latch held
-				by the caller, or NULL if none */
+	srw_lock*	ahi_latch,
+				/*!< in: currently held AHI rdlock, or NULL */
 #endif /* BTR_CUR_HASH_ADAPT */
-	const char*	file,	/*!< in: file name */
-	unsigned	line,	/*!< in: line where called */
 	mtr_t*		mtr)	/*!< in: mtr */
 {
 	btr_cur_t*	btr_cursor;
@@ -506,7 +499,7 @@ btr_pcur_open_with_no_init_func(
 #ifdef BTR_CUR_HASH_ADAPT
 		ahi_latch,
 #endif /* BTR_CUR_HASH_ADAPT */
-		file, line, mtr);
+		mtr);
 
 	cursor->pos_state = BTR_PCUR_IS_POSITIONED;
 
@@ -560,13 +553,10 @@ Positions a cursor at a randomly chosen position within a B-tree.
 if the index is unavailable */
 UNIV_INLINE
 bool
-btr_pcur_open_at_rnd_pos_func(
-/*==========================*/
+btr_pcur_open_at_rnd_pos(
 	dict_index_t*	index,		/*!< in: index */
 	ulint		latch_mode,	/*!< in: BTR_SEARCH_LEAF, ... */
 	btr_pcur_t*	cursor,		/*!< in/out: B-tree pcur */
-	const char*	file,		/*!< in: file name */
-	unsigned	line,		/*!< in: line where called */
 	mtr_t*		mtr)		/*!< in: mtr */
 {
 	/* Initialize the cursor */
@@ -578,9 +568,9 @@ btr_pcur_open_at_rnd_pos_func(
 
 	bool	available;
 
-	available = btr_cur_open_at_rnd_pos_func(index, latch_mode,
-						 btr_pcur_get_btr_cur(cursor),
-						 file, line, mtr);
+	available = btr_cur_open_at_rnd_pos(index, latch_mode,
+					    btr_pcur_get_btr_cur(cursor),
+					    mtr);
 	cursor->pos_state = BTR_PCUR_IS_POSITIONED;
 	cursor->old_stored = false;
 

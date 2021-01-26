@@ -1872,6 +1872,9 @@ SEL_ARG::SEL_ARG(SEL_ARG &arg) :Sql_alloc()
   next_key_part=arg.next_key_part;
   max_part_no= arg.max_part_no;
   use_count=1; elements=1;
+  next= 0;
+  if (next_key_part)
+    ++next_key_part->use_count;
 }
 
 
@@ -7798,6 +7801,30 @@ SEL_TREE *Item_func_in::get_func_mm_tree(RANGE_OPT_PARAM *param,
       if (array->count > NOT_IN_IGNORE_THRESHOLD || !value_item)
         DBUG_RETURN(0);
 
+      /*
+        If this is "unique_key NOT IN (...)", do not consider it sargable (for
+        any index, not just the unique one). The logic is as follows:
+         - if there are only a few constants, this condition is not selective
+           (unless the table is also very small in which case we won't gain
+           anything)
+         - If there are a lot of constants, the overhead of building and
+           processing enormous range list is not worth it.
+      */
+      if (param->using_real_indexes)
+      {
+        key_map::Iterator it(field->key_start);
+        uint key_no;
+        while ((key_no= it++) != key_map::Iterator::BITMAP_END)
+        {
+          KEY *key_info= &field->table->key_info[key_no];
+          if (key_info->user_defined_key_parts == 1 &&
+              (key_info->flags & HA_NOSAME))
+          {
+            DBUG_RETURN(0);
+          }
+        }
+      }
+
       /* Get a SEL_TREE for "(-inf|NULL) < X < c_0" interval.  */
       uint i=0;
       do
@@ -10346,10 +10373,11 @@ key_or(RANGE_OPT_PARAM *param, SEL_ARG *key1,SEL_ARG *key2)
 
       if (!tmp->next_key_part)
       {
-        if (key2->use_count)
+	SEL_ARG *key2_next= key2->next;
+	if (key2_shared)
 	{
 	  SEL_ARG *key2_cpy= new SEL_ARG(*key2);
-          if (key2_cpy)
+          if (!key2_cpy)
             return 0;
           key2= key2_cpy;
 	}
@@ -10370,7 +10398,7 @@ key_or(RANGE_OPT_PARAM *param, SEL_ARG *key1,SEL_ARG *key2)
             Move on to next range in key2
           */
           key2->increment_use_count(-1); // Free not used tree
-          key2=key2->next;
+          key2=key2_next;
           continue;
         }
         else
@@ -15637,6 +15665,113 @@ static void print_ror_scans_arr(TABLE *table, const char *msg,
     tmp.append(STRING_WITH_LEN("(empty)"));
   DBUG_PRINT("info", ("ROR key scans (%s): %s", msg, tmp.c_ptr()));
   DBUG_VOID_RETURN;
+}
+
+static String dbug_print_sel_arg_buf;
+
+static void
+print_sel_arg_key(Field *field, const uchar *key, String *out)
+{
+  TABLE *table= field->table;
+  my_bitmap_map *old_sets[2];
+  dbug_tmp_use_all_columns(table, old_sets, table->read_set, table->write_set);
+
+  if (field->real_maybe_null())
+  {
+    if (*key)
+    {
+      out->append("NULL");
+      goto end;
+    }
+    key++;					// Skip null byte
+  }
+
+  field->set_key_image(key, field->pack_length());
+
+  if (field->type() == MYSQL_TYPE_BIT)
+    (void) field->val_int_as_str(out, 1);
+  else
+    field->val_str(out);
+
+end:
+  dbug_tmp_restore_column_maps(table->read_set, table->write_set, old_sets);
+}
+
+
+/*
+  @brief
+    Produce a string representation of an individual SEL_ARG and return pointer
+    to it
+
+  @detail
+    Intended usage:
+
+     (gdb) p dbug_print_sel_arg(ptr)
+*/
+
+const char *dbug_print_sel_arg(SEL_ARG *sel_arg)
+{
+  StringBuffer<64> buf;
+  String &out= dbug_print_sel_arg_buf;
+  out.length(0);
+
+  if (!sel_arg)
+  {
+    out.append("NULL");
+    goto end;
+  }
+
+  out.append("SEL_ARG(");
+
+  const char *stype;
+  switch(sel_arg->type) {
+  case SEL_ARG::IMPOSSIBLE:
+    stype="IMPOSSIBLE";
+    break;
+  case SEL_ARG::MAYBE:
+    stype="MAYBE";
+    break;
+  case SEL_ARG::MAYBE_KEY:
+    stype="MAYBE_KEY";
+    break;
+  case SEL_ARG::KEY_RANGE:
+  default:
+    stype= NULL;
+  }
+
+  if (stype)
+  {
+    out.append("type=");
+    out.append(stype);
+    goto end;
+  }
+
+  if (sel_arg->min_flag & NO_MIN_RANGE)
+    out.append("-inf");
+  else
+  {
+    print_sel_arg_key(sel_arg->field, sel_arg->min_value, &buf);
+    out.append(buf);
+  }
+
+  out.append((sel_arg->min_flag & NEAR_MIN)? "<" : "<=");
+
+  out.append(sel_arg->field->field_name);
+
+  out.append((sel_arg->max_flag & NEAR_MAX)? "<" : "<=");
+
+  if (sel_arg->max_flag & NO_MAX_RANGE)
+    out.append("+inf");
+  else
+  {
+    print_sel_arg_key(sel_arg->field, sel_arg->max_value, &buf);
+    out.append(buf);
+  }
+
+  out.append(")");
+
+end:
+  return dbug_print_sel_arg_buf.c_ptr_safe();
 }
 
 

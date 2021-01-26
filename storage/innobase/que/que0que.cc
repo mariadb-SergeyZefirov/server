@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2020, MariaDB Corporation.
+Copyright (c) 2017, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -182,8 +182,7 @@ que_thr_end_lock_wait(
 {
 	que_thr_t*	thr;
 
-	ut_ad(lock_mutex_own());
-	ut_ad(trx_mutex_own(trx));
+	lock_sys.mutex_assert_locked();
 
 	thr = trx->lock.wait_thr;
 
@@ -231,7 +230,7 @@ que_fork_scheduler_round_robin(
 	que_fork_t*	fork,		/*!< in: a query fork */
 	que_thr_t*	thr)		/*!< in: current pos */
 {
-	trx_mutex_enter(fork->trx);
+	fork->trx->mutex.wr_lock();
 
 	/* If no current, start first available. */
 	if (thr == NULL) {
@@ -261,7 +260,7 @@ que_fork_scheduler_round_robin(
 		}
 	}
 
-	trx_mutex_exit(fork->trx);
+	fork->trx->mutex.wr_unlock();
 
 	return(thr);
 }
@@ -334,7 +333,6 @@ que_fork_start_command(
 
 		case QUE_THR_RUNNING:
 		case QUE_THR_LOCK_WAIT:
-		case QUE_THR_PROCEDURE_WAIT:
 			ut_error;
 		}
 	}
@@ -590,22 +588,18 @@ que_thr_node_step(
 		return(thr);
 	}
 
-	trx_mutex_enter(thr_get_trx(thr));
+	auto mutex = &thr->graph->trx->mutex;
 
-	if (que_thr_peek_stop(thr)) {
+	mutex->wr_lock();
 
-		trx_mutex_exit(thr_get_trx(thr));
-
-		return(thr);
+	if (!que_thr_peek_stop(thr)) {
+		/* Thread execution completed */
+		thr->state = QUE_THR_COMPLETED;
+		thr = NULL;
 	}
 
-	/* Thread execution completed */
-
-	thr->state = QUE_THR_COMPLETED;
-
-	trx_mutex_exit(thr_get_trx(thr));
-
-	return(NULL);
+	mutex->wr_unlock();
+	return(thr);
 }
 
 /**********************************************************************//**
@@ -621,8 +615,6 @@ que_thr_stop(
 	trx_t*		trx = thr_get_trx(thr);
 
 	graph = thr->graph;
-
-	ut_ad(trx_mutex_own(trx));
 
 	if (graph->state == QUE_FORK_COMMAND_WAIT) {
 
@@ -675,7 +667,6 @@ que_thr_dec_refer_count(
 	trx = thr_get_trx(thr);
 
 	ut_a(thr->is_active);
-	ut_ad(trx_mutex_own(trx));
 
 	if (thr->state == QUE_THR_RUNNING) {
 
@@ -725,31 +716,28 @@ que_thr_stop_for_mysql(
 
 	trx = thr_get_trx(thr);
 
-	trx_mutex_enter(trx);
+	trx->mutex.wr_lock();
 
 	if (thr->state == QUE_THR_RUNNING) {
-
-		if (trx->error_state != DB_SUCCESS
-		    && trx->error_state != DB_LOCK_WAIT) {
-
-			/* Error handling built for the MySQL interface */
+		switch (trx->error_state) {
+		default:
+			/* Error handling built for the MariaDB interface */
 			thr->state = QUE_THR_COMPLETED;
-		} else {
+			break;
+		case DB_SUCCESS:
+		case DB_LOCK_WAIT:
 			/* It must have been a lock wait but the lock was
 			already released, or this transaction was chosen
 			as a victim in selective deadlock resolution */
-
-			trx_mutex_exit(trx);
-
-			return;
+			goto func_exit;
 		}
 	}
 
 	ut_ad(thr->is_active);
 	ut_d(thr->set_active(false));
 	thr->is_active= false;
-
-	trx_mutex_exit(trx);
+func_exit:
+	trx->mutex.wr_unlock();
 }
 
 #ifdef UNIV_DEBUG
@@ -987,7 +975,6 @@ que_run_threads_low(
 
 	ut_ad(thr->state == QUE_THR_RUNNING);
 	ut_a(thr_get_trx(thr)->error_state == DB_SUCCESS);
-	ut_ad(!trx_mutex_own(thr_get_trx(thr)));
 
 	/* cumul_resource counts how much resources the OS thread (NOT the
 	query thread) has spent in this function */
@@ -1009,28 +996,23 @@ que_run_threads_low(
 		next_thr = que_thr_step(thr);
 		/*-------------------------*/
 
-		trx_mutex_enter(trx);
-
-		ut_a(next_thr == NULL || trx->error_state == DB_SUCCESS);
-
-		if (next_thr != thr) {
-			ut_a(next_thr == NULL);
-
+		if (next_thr) {
+			ut_a(trx->error_state == DB_SUCCESS);
+			ut_a(next_thr == thr);
+		} else {
 			/* This can change next_thr to a non-NULL value
 			if there was a lock wait that already completed. */
 
+			trx->mutex.wr_lock();
 			que_thr_dec_refer_count(thr, &next_thr);
+			trx->mutex.wr_unlock();
 
 			if (next_thr != NULL) {
-
 				thr = next_thr;
 			}
 		}
 
 		ut_ad(trx == thr_get_trx(thr));
-
-		trx_mutex_exit(trx);
-
 	} while (next_thr != NULL);
 }
 
@@ -1041,14 +1023,18 @@ que_run_threads(
 /*============*/
 	que_thr_t*	thr)	/*!< in: query thread */
 {
-	ut_ad(!trx_mutex_own(thr_get_trx(thr)));
-
 loop:
 	ut_a(thr_get_trx(thr)->error_state == DB_SUCCESS);
 
 	que_run_threads_low(thr);
 
 	switch (thr->state) {
+	default:
+		ut_error;
+	case QUE_THR_COMPLETED:
+	case QUE_THR_COMMAND_WAIT:
+		/* Do nothing */
+		break;
 
 	case QUE_THR_RUNNING:
 		/* There probably was a lock wait, but it already ended
@@ -1058,30 +1044,21 @@ loop:
 
 	case QUE_THR_LOCK_WAIT:
 		lock_wait_suspend_thread(thr);
+		trx_t* trx = thr->graph->trx;
 
-		trx_mutex_enter(thr_get_trx(thr));
-
-		ut_a(thr_get_trx(thr)->id != 0);
-
-		if (thr_get_trx(thr)->error_state != DB_SUCCESS) {
+		trx->mutex.wr_lock();
+		ut_ad(trx->id);
+		const dberr_t err = trx->error_state;
+		if (err != DB_SUCCESS) {
 			/* thr was chosen as a deadlock victim or there was
 			a lock wait timeout */
-
 			que_thr_dec_refer_count(thr, NULL);
-			trx_mutex_exit(thr_get_trx(thr));
-			break;
 		}
+		trx->mutex.wr_unlock();
 
-		trx_mutex_exit(thr_get_trx(thr));
-		goto loop;
-
-	case QUE_THR_COMPLETED:
-	case QUE_THR_COMMAND_WAIT:
-		/* Do nothing */
-		break;
-
-	default:
-		ut_error;
+		if (err == DB_SUCCESS) {
+			goto loop;
+		}
 	}
 }
 
@@ -1107,13 +1084,13 @@ que_eval_sql(
 	ut_a(trx->error_state == DB_SUCCESS);
 
 	if (reserve_dict_mutex) {
-		mutex_enter(&dict_sys.mutex);
+		dict_sys.mutex_lock();
 	}
 
 	graph = pars_sql(info, sql);
 
 	if (reserve_dict_mutex) {
-		mutex_exit(&dict_sys.mutex);
+		dict_sys.mutex_unlock();
 	}
 
 	graph->trx = trx;
@@ -1126,13 +1103,13 @@ que_eval_sql(
 	que_run_threads(thr);
 
 	if (reserve_dict_mutex) {
-		mutex_enter(&dict_sys.mutex);
+		dict_sys.mutex_lock();
 	}
 
 	que_graph_free(graph);
 
 	if (reserve_dict_mutex) {
-		mutex_exit(&dict_sys.mutex);
+		dict_sys.mutex_unlock();
 	}
 
 	DBUG_RETURN(trx->error_state);

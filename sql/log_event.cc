@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2000, 2018, Oracle and/or its affiliates.
-   Copyright (c) 2009, 2020, MariaDB
+   Copyright (c) 2009, 2021, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -42,7 +42,6 @@
 #include <mysql/psi/mysql_statement.h>
 #include <strfunc.h>
 #include "compat56.h"
-#include "wsrep_mysqld.h"
 #include "sql_insert.h"
 #else
 #include "mysqld_error.h"
@@ -56,7 +55,9 @@
 
 #define my_b_write_string(A, B) my_b_write((A), (uchar*)(B), (uint) (sizeof(B) - 1))
 
+#ifndef _AIX
 PSI_memory_key key_memory_log_event;
+#endif
 PSI_memory_key key_memory_Incident_log_event_message;
 PSI_memory_key key_memory_Rows_query_log_event_rows_query;
 
@@ -1074,7 +1075,7 @@ Log_event* Log_event::read_log_event(const char* buf, uint event_len,
     else
       DBUG_RETURN(NULL);
 #else
-    *error= ER(ER_BINLOG_READ_EVENT_CHECKSUM_FAILURE);
+    *error= ER_THD_OR_DEFAULT(current_thd, ER_BINLOG_READ_EVENT_CHECKSUM_FAILURE);
     sql_print_error("%s", *error);
     DBUG_RETURN(NULL);
 #endif

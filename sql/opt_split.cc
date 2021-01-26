@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2017 MariaDB
+   Copyright (c) 2017, 2020, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -749,13 +749,13 @@ void JOIN::add_keyuses_for_splitting()
   if (allocate_dynamic(&keyuse, save_qep->keyuse.elements + added_keyuse_count))
     goto err;
 
-  memcpy(keyuse.buffer,
-         save_qep->keyuse.buffer,
-         (size_t) save_qep->keyuse.elements * keyuse.size_of_element);
-  keyuse.elements= save_qep->keyuse.elements;
+  idx= keyuse.elements= save_qep->keyuse.elements;
+  if (keyuse.elements)
+    memcpy(keyuse.buffer,
+           save_qep->keyuse.buffer,
+           (size_t) keyuse.elements * keyuse.size_of_element);
 
   keyuse_ext= &ext_keyuses_for_splitting->at(0);
-  idx= save_qep->keyuse.elements;
   for (i=0; i < added_keyuse_count; i++, keyuse_ext++, idx++)
   {
     set_dynamic(&keyuse, (KEYUSE *) keyuse_ext, idx);
@@ -1147,7 +1147,7 @@ bool JOIN_TAB::fix_splitting(SplM_plan_info *spl_plan,
 bool JOIN::fix_all_splittings_in_plan()
 {
   table_map prev_tables= 0;
-  table_map all_tables= (1 << table_count) - 1;
+  table_map all_tables= (table_map(1) << table_count) - 1;
   for (uint tablenr= 0; tablenr < table_count; tablenr++)
   {
     POSITION *cur_pos= &best_positions[tablenr];

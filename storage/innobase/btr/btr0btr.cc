@@ -2,7 +2,7 @@
 
 Copyright (c) 1994, 2016, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
-Copyright (c) 2014, 2020, MariaDB Corporation.
+Copyright (c) 2014, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -55,7 +55,7 @@ bool
 btr_can_merge_with_page(
 /*====================*/
 	btr_cur_t*	cursor,		/*!< in: cursor on the page to merge */
-	ulint		page_no,	/*!< in: a sibling page */
+	uint32_t	page_no,	/*!< in: a sibling page */
 	buf_block_t**	merge_block,	/*!< out: the merge block */
 	mtr_t*		mtr);		/*!< in: mini-transaction */
 
@@ -280,7 +280,7 @@ the index.
 ulint
 btr_height_get(
 /*===========*/
-	dict_index_t*	index,	/*!< in: index tree */
+	const dict_index_t*	index,	/*!< in: index tree */
 	mtr_t*		mtr)	/*!< in/out: mini-transaction */
 {
 	ulint		height=0;
@@ -299,8 +299,6 @@ btr_height_get(
 
 		/* Release the S latch on the root page. */
 		mtr->memo_release(root_block, MTR_MEMO_PAGE_S_FIX);
-
-		ut_d(sync_check_unlock(&root_block->lock));
 	}
 
 	return(height);
@@ -361,14 +359,11 @@ btr_root_adjust_on_import(
 	buf_block_t* block = buf_page_get_gen(
 		page_id_t(table->space->id, index->page),
 		table->space->zip_size(), RW_X_LATCH, NULL, BUF_GET,
-		__FILE__, __LINE__,
 		&mtr, &err);
 	if (!block) {
 		ut_ad(err != DB_SUCCESS);
 		goto func_exit;
 	}
-
-	buf_block_dbg_add_level(block, SYNC_TREE_NODE);
 
 	page = buf_block_get_frame(block);
 	page_zip = buf_block_get_page_zip(block);
@@ -393,11 +388,11 @@ btr_root_adjust_on_import(
 			tf &= ~FSP_FLAGS_MEM_MASK;
 			if (fil_space_t::is_flags_equal(tf, sf)
 			    || fil_space_t::is_flags_equal(sf, tf)) {
-				mutex_enter(&fil_system.mutex);
+				mysql_mutex_lock(&fil_system.mutex);
 				table->space->flags = (table->space->flags
 						       & ~FSP_FLAGS_MEM_MASK)
 					| (tf & FSP_FLAGS_MEM_MASK);
-				mutex_exit(&fil_system.mutex);
+				mysql_mutex_unlock(&fil_system.mutex);
 				err = DB_SUCCESS;
 			} else {
 				err = DB_CORRUPTION;
@@ -492,8 +487,6 @@ btr_page_alloc_for_ibuf(
 		index->table->space->zip_size(),
 		RW_X_LATCH, mtr);
 
-	buf_block_dbg_add_level(new_block, SYNC_IBUF_TREE_NODE_NEW);
-
 	flst_remove(root, PAGE_HEADER + PAGE_BTR_IBUF_FREE_LIST,
 		    new_block, PAGE_HEADER + PAGE_BTR_IBUF_FREE_LIST_NODE,
 		    mtr);
@@ -511,7 +504,7 @@ buf_block_t*
 btr_page_alloc_low(
 /*===============*/
 	dict_index_t*	index,		/*!< in: index */
-	ulint		hint_page_no,	/*!< in: hint of a good page */
+	uint32_t	hint_page_no,	/*!< in: hint of a good page */
 	byte		file_direction,	/*!< in: direction where a possible
 					page split is made */
 	ulint		level,		/*!< in: level where the page is placed
@@ -548,7 +541,7 @@ buf_block_t*
 btr_page_alloc(
 /*===========*/
 	dict_index_t*	index,		/*!< in: index */
-	ulint		hint_page_no,	/*!< in: hint of a good page */
+	uint32_t	hint_page_no,	/*!< in: hint of a good page */
 	byte		file_direction,	/*!< in: direction where a possible
 					page split is made */
 	ulint		level,		/*!< in: level where the page is placed
@@ -559,21 +552,13 @@ btr_page_alloc(
 					for x-latching and initializing
 					the page */
 {
-	buf_block_t*	new_block;
-
 	if (dict_index_is_ibuf(index)) {
 
 		return(btr_page_alloc_for_ibuf(index, mtr));
 	}
 
-	new_block = btr_page_alloc_low(
+	return btr_page_alloc_low(
 		index, hint_page_no, file_direction, level, mtr, init_mtr);
-
-	if (new_block) {
-		buf_block_dbg_add_level(new_block, SYNC_TREE_NODE_NEW);
-	}
-
-	return(new_block);
 }
 
 /**************************************************************//**
@@ -582,7 +567,7 @@ Gets the number of pages in a B-tree.
 ulint
 btr_get_size(
 /*=========*/
-	dict_index_t*	index,	/*!< in: index */
+	const dict_index_t*	index,	/*!< in: index */
 	ulint		flag,	/*!< in: BTR_N_LEAF_PAGES or BTR_TOTAL_SIZE */
 	mtr_t*		mtr)	/*!< in/out: mini-transaction where index
 				is s-latched */
@@ -604,7 +589,7 @@ btr_get_size(
 	if (!root) {
 		return ULINT_UNDEFINED;
 	}
-	mtr_x_lock_space(index->table->space, mtr);
+	mtr->x_lock_space(index->table->space);
 	if (flag == BTR_N_LEAF_PAGES) {
 		fseg_n_reserved_pages(*root, PAGE_HEADER + PAGE_BTR_SEG_LEAF
 				      + root->frame, &n, mtr);
@@ -652,7 +637,7 @@ btr_get_size_and_reserved(
 		return ULINT_UNDEFINED;
 	}
 
-	mtr_x_lock_space(index->table->space, mtr);
+	mtr->x_lock_space(index->table->space);
 
 	ulint n = fseg_n_reserved_pages(*root, PAGE_HEADER + PAGE_BTR_SEG_LEAF
 					+ root->frame, used, mtr);
@@ -691,9 +676,10 @@ btr_page_free_for_ibuf(
 @param[in,out]	index	index tree
 @param[in,out]	block	block to be freed
 @param[in,out]	mtr	mini-transaction
-@param[in]	blob	whether this is freeing a BLOB page */
+@param[in]	blob	whether this is freeing a BLOB page
+@param[in]	latched	whether index->table->space->x_lock() was called */
 void btr_page_free(dict_index_t* index, buf_block_t* block, mtr_t* mtr,
-		   bool blob)
+		   bool blob, bool space_latched)
 {
 	ut_ad(mtr->memo_contains_flagged(block, MTR_MEMO_PAGE_X_FIX));
 #ifdef BTR_CUR_HASH_ADAPT
@@ -725,9 +711,11 @@ void btr_page_free(dict_index_t* index, buf_block_t* block, mtr_t* mtr,
 	fseg_header_t* seg_header = &root[blob || page_is_leaf(block->frame)
 					  ? PAGE_HEADER + PAGE_BTR_SEG_LEAF
 					  : PAGE_HEADER + PAGE_BTR_SEG_TOP];
-	fseg_free_page(seg_header,
-		       index->table->space, id.page_no(), mtr);
-	buf_page_free(id, mtr, __FILE__, __LINE__);
+	fil_space_t* space= index->table->space;
+	const uint32_t page= id.page_no();
+
+	fseg_free_page(seg_header, space, page, mtr, space_latched);
+	buf_page_free(space, page, mtr);
 
 	/* The page was marked free in the allocation bitmap, but it
 	should remain exclusively latched until mtr_t::commit() or until it
@@ -797,8 +785,6 @@ btr_page_get_father_node_ptr_func(
 				its page x-latched */
 	ulint		latch_mode,/*!< in: BTR_CONT_MODIFY_TREE
 				or BTR_CONT_SEARCH_TREE */
-	const char*	file,	/*!< in: file name */
-	unsigned	line,	/*!< in: line where called */
 	mtr_t*		mtr)	/*!< in: mtr */
 {
 	dtuple_t*	tuple;
@@ -831,15 +817,12 @@ btr_page_get_father_node_ptr_func(
 
 	err = btr_cur_search_to_nth_level(
 		index, level + 1, tuple,
-		PAGE_CUR_LE, latch_mode, cursor, 0,
-		file, line, mtr);
+		PAGE_CUR_LE, latch_mode, cursor, 0, mtr);
 
 	if (err != DB_SUCCESS) {
 		ib::warn() << " Error code: " << err
 			<< " btr_page_get_father_node_ptr_func "
 			<< " level: " << level + 1
-			<< " called from file: "
-			<< file << " line: " << line
 			<< " table: " << index->table->name
 			<< " index: " << index->name();
 	}
@@ -882,11 +865,11 @@ btr_page_get_father_node_ptr_func(
 
 #define btr_page_get_father_node_ptr(of,heap,cur,mtr)			\
 	btr_page_get_father_node_ptr_func(				\
-		of,heap,cur,BTR_CONT_MODIFY_TREE,__FILE__,__LINE__,mtr)
+		of,heap,cur,BTR_CONT_MODIFY_TREE,mtr)
 
 #define btr_page_get_father_node_ptr_for_validate(of,heap,cur,mtr)	\
 	btr_page_get_father_node_ptr_func(				\
-		of,heap,cur,BTR_CONT_SEARCH_TREE,__FILE__,__LINE__,mtr)
+		of,heap,cur,BTR_CONT_SEARCH_TREE,mtr)
 
 /************************************************************//**
 Returns the upper level node pointer to a page. It is assumed that mtr holds
@@ -980,8 +963,6 @@ btr_free_root_check(
 		page_id, zip_size, RW_X_LATCH, mtr);
 
 	if (block) {
-		buf_block_dbg_add_level(block, SYNC_TREE_NODE);
-
 		if (fil_page_index_page_check(block->frame)
 		    && index_id == btr_page_get_index_id(block->frame)) {
 			/* This should be a root page.
@@ -994,6 +975,43 @@ btr_free_root_check(
 	}
 
 	return(block);
+}
+
+/** Initialize the root page of the b-tree
+@param[in,out]  block           root block
+@param[in]      index_id        index id
+@param[in]      index           index of root page
+@param[in,out]  mtr             mini-transaction */
+static void btr_root_page_init(buf_block_t *block, index_id_t index_id,
+                               dict_index_t *index, mtr_t *mtr)
+{
+  constexpr uint16_t field= PAGE_HEADER + PAGE_INDEX_ID;
+  byte *page_index_id= my_assume_aligned<2>(field + block->frame);
+
+  /* Create a new index page on the allocated segment page */
+  if (UNIV_LIKELY_NULL(block->page.zip.data))
+  {
+    mach_write_to_8(page_index_id, index_id);
+    ut_ad(!page_has_siblings(block->page.zip.data));
+    page_create_zip(block, index, 0, 0, mtr);
+  }
+  else
+  {
+    page_create(block, mtr, index && index->table->not_redundant());
+    if (index && index->is_spatial())
+    {
+      static_assert(((FIL_PAGE_INDEX & 0xff00) | byte(FIL_PAGE_RTREE)) ==
+                    FIL_PAGE_RTREE, "compatibility");
+      mtr->write<1>(*block, FIL_PAGE_TYPE + 1 + block->frame,
+                    byte(FIL_PAGE_RTREE));
+      if (mach_read_from_8(block->frame + FIL_RTREE_SPLIT_SEQ_NUM))
+        mtr->memset(block, FIL_RTREE_SPLIT_SEQ_NUM, 8, 0);
+    }
+    /* Set the level of the new index page */
+    mtr->write<2,mtr_t::MAYBE_NOP>(
+        *block, PAGE_HEADER + PAGE_LEVEL + block->frame, 0U);
+    mtr->write<8,mtr_t::MAYBE_NOP>(*block, page_index_id, index_id);
+  }
 }
 
 /** Create the root node for a new index tree.
@@ -1031,9 +1049,6 @@ btr_create(
 			return(FIL_NULL);
 		}
 
-		buf_block_dbg_add_level(
-			ibuf_hdr_block, SYNC_IBUF_TREE_NODE_NEW);
-
 		ut_ad(ibuf_hdr_block->page.id().page_no()
 		      == IBUF_HEADER_PAGE_NO);
 		/* Allocate then the next page to the segment: it will be the
@@ -1049,9 +1064,7 @@ btr_create(
 			return(FIL_NULL);
 		}
 
-		ut_ad(block->page.id().page_no() == IBUF_TREE_ROOT_PAGE_NO);
-
-		buf_block_dbg_add_level(block, SYNC_IBUF_TREE_NODE_NEW);
+		ut_ad(block->page.id() == page_id_t(0,IBUF_TREE_ROOT_PAGE_NO));
 
 		flst_init(block, PAGE_HEADER + PAGE_BTR_IBUF_FREE_LIST, mtr);
 	} else {
@@ -1062,8 +1075,6 @@ btr_create(
 			return(FIL_NULL);
 		}
 
-		buf_block_dbg_add_level(block, SYNC_TREE_NODE_NEW);
-
 		if (!fseg_create(space, PAGE_HEADER + PAGE_BTR_SEG_LEAF, mtr,
 				 false, block)) {
 			/* Not enough space for new segment, free root
@@ -1071,44 +1082,11 @@ btr_create(
 			btr_free_root(block, mtr);
 			return(FIL_NULL);
 		}
-
-		/* The fseg create acquires a second latch on the page,
-		therefore we must declare it: */
-		buf_block_dbg_add_level(block, SYNC_TREE_NODE_NEW);
 	}
 
 	ut_ad(!page_has_siblings(block->frame));
 
-	constexpr uint16_t field = PAGE_HEADER + PAGE_INDEX_ID;
-
-	byte* page_index_id = my_assume_aligned<2>(field + block->frame);
-
-	/* Create a new index page on the allocated segment page */
-	if (UNIV_LIKELY_NULL(block->page.zip.data)) {
-		mach_write_to_8(page_index_id, index_id);
-		ut_ad(!page_has_siblings(block->page.zip.data));
-		page_create_zip(block, index, 0, 0, mtr);
-	} else {
-		page_create(block, mtr,
-			    index && index->table->not_redundant());
-		if (index && index->is_spatial()) {
-			static_assert(((FIL_PAGE_INDEX & 0xff00)
-				       | byte(FIL_PAGE_RTREE))
-				      == FIL_PAGE_RTREE, "compatibility");
-			mtr->write<1>(*block, FIL_PAGE_TYPE + 1 + block->frame,
-				      byte(FIL_PAGE_RTREE));
-			if (mach_read_from_8(block->frame
-					     + FIL_RTREE_SPLIT_SEQ_NUM)) {
-				mtr->memset(block, FIL_RTREE_SPLIT_SEQ_NUM,
-					    8, 0);
-			}
-		}
-		/* Set the level of the new index page */
-		mtr->write<2,mtr_t::MAYBE_NOP>(*block, PAGE_HEADER + PAGE_LEVEL
-					       + block->frame, 0U);
-		mtr->write<8,mtr_t::MAYBE_NOP>(*block, page_index_id,
-					       index_id);
-	}
+	btr_root_page_init(block, index_id, index, mtr);
 
 	/* We reset the free bits for the page in a separate
 	mini-transaction to allow creation of several trees in the
@@ -1195,6 +1173,33 @@ top_loop:
 	if (!finished) {
 		goto top_loop;
 	}
+}
+
+/** Clear the index tree and reinitialize the root page, in the
+rollback of TRX_UNDO_EMPTY. The BTR_SEG_LEAF is freed and reinitialized.
+@param thr query thread */
+void dict_index_t::clear(que_thr_t *thr)
+{
+  mtr_t mtr;
+  mtr.start();
+  if (table->is_temporary())
+    mtr.set_log_mode(MTR_LOG_NO_REDO);
+  else
+    set_modified(mtr);
+
+  if (buf_block_t *root_block= buf_page_get(page_id_t(table->space->id, page),
+                                            table->space->zip_size(),
+                                            RW_X_LATCH, &mtr))
+  {
+    btr_free_but_not_root(root_block, mtr.get_log_mode());
+    mtr.memset(root_block, PAGE_HEADER + PAGE_BTR_SEG_LEAF,
+               FSEG_HEADER_SIZE, 0);
+    if (fseg_create(table->space, PAGE_HEADER + PAGE_BTR_SEG_LEAF, &mtr, false,
+                    root_block))
+      btr_root_page_init(root_block, id, this, &mtr);
+  }
+
+  mtr.commit();
 }
 
 /** Free a persistent index tree if it exists.
@@ -2346,14 +2351,11 @@ btr_page_insert_fits(
 Inserts a data tuple to a tree on a non-leaf level. It is assumed
 that mtr holds an x-latch on the tree. */
 void
-btr_insert_on_non_leaf_level_func(
-/*==============================*/
+btr_insert_on_non_leaf_level(
 	ulint		flags,	/*!< in: undo logging and locking flags */
 	dict_index_t*	index,	/*!< in: index */
 	ulint		level,	/*!< in: level, must be > 0 */
 	dtuple_t*	tuple,	/*!< in: the record to be inserted */
-	const char*	file,	/*!< in: file name */
-	unsigned	line,	/*!< in: line where called */
 	mtr_t*		mtr)	/*!< in: mtr */
 {
 	big_rec_t*	dummy_big_rec;
@@ -2372,14 +2374,12 @@ btr_insert_on_non_leaf_level_func(
 		dberr_t err = btr_cur_search_to_nth_level(
 			index, level, tuple, PAGE_CUR_LE,
 			BTR_CONT_MODIFY_TREE,
-			&cursor, 0, file, line, mtr);
+			&cursor, 0, mtr);
 
 		if (err != DB_SUCCESS) {
 			ib::warn() << " Error code: " << err
 				   << " btr_page_get_father_node_ptr_func "
 				   << " level: " << level
-				   << " called from file: "
-				   << file << " line: " << line
 				   << " table: " << index->table->name
 				   << " index: " << index->name;
 		}
@@ -2393,7 +2393,7 @@ btr_insert_on_non_leaf_level_func(
 		btr_cur_search_to_nth_level(index, level, tuple,
 					    PAGE_CUR_RTREE_INSERT,
 					    BTR_CONT_MODIFY_TREE,
-					    &cursor, 0, file, line, mtr);
+					    &cursor, 0, mtr);
 	}
 
 	ut_ad(cursor.flag == BTR_CUR_BINARY);
@@ -2781,8 +2781,7 @@ func_start:
 	ut_ad(!dict_index_is_online_ddl(cursor->index)
 	      || (flags & BTR_CREATE_FLAG)
 	      || dict_index_is_clust(cursor->index));
-	ut_ad(rw_lock_own_flagged(dict_index_get_lock(cursor->index),
-				  RW_LOCK_FLAG_X | RW_LOCK_FLAG_SX));
+	ut_ad(cursor->index->lock.have_u_or_x());
 
 	block = btr_cur_get_block(cursor);
 	page = buf_block_get_frame(block);
@@ -2801,7 +2800,7 @@ func_start:
 	tuple to be inserted should be the first record on the upper
 	half-page */
 	bool insert_left = false;
-	ulint hint_page_no = block->page.id().page_no() + 1;
+	uint32_t hint_page_no = block->page.id().page_no() + 1;
 	byte direction = FSP_UP;
 
 	if (tuple && n_iterations > 0) {
@@ -2932,9 +2931,8 @@ insert_empty:
 	    && page_is_leaf(page)
 	    && !dict_index_is_online_ddl(cursor->index)) {
 
-		mtr->memo_release(
-			dict_index_get_lock(cursor->index),
-			MTR_MEMO_X_LOCK | MTR_MEMO_SX_LOCK);
+		mtr->memo_release(&cursor->index->lock,
+				  MTR_MEMO_X_LOCK | MTR_MEMO_SX_LOCK);
 
 		/* NOTE: We cannot release root block latch here, because it
 		has segment header and already modified in most of cases.*/
@@ -3332,10 +3330,10 @@ btr_lift_page_up(
 	if (!dict_table_is_locking_disabled(index->table)) {
 		/* Free predicate page locks on the block */
 		if (dict_index_is_spatial(index)) {
-			lock_mutex_enter();
+			lock_sys.mutex_lock();
 			lock_prdt_page_free_from_discard(
 				block, &lock_sys.prdt_page_hash);
-			lock_mutex_exit();
+			lock_sys.mutex_unlock();
 		}
 		lock_update_copy_and_discard(father_block, block);
 	}
@@ -3386,8 +3384,6 @@ btr_compress(
 	mtr_t*		mtr)	/*!< in/out: mini-transaction */
 {
 	dict_index_t*	index;
-	ulint		left_page_no;
-	ulint		right_page_no;
 	buf_block_t*	merge_block;
 	page_t*		merge_page = NULL;
 	page_zip_des_t*	merge_page_zip;
@@ -3416,8 +3412,8 @@ btr_compress(
 
 	MONITOR_INC(MONITOR_INDEX_MERGE_ATTEMPTS);
 
-	left_page_no = btr_page_get_prev(page);
-	right_page_no = btr_page_get_next(page);
+	const uint32_t left_page_no = btr_page_get_prev(page);
+	const uint32_t right_page_no = btr_page_get_next(page);
 
 #ifdef UNIV_DEBUG
 	if (!page_is_leaf(page) && left_page_no == FIL_NULL) {
@@ -3587,11 +3583,11 @@ retry:
 			}
 
 			/* No GAP lock needs to be worrying about */
-			lock_mutex_enter();
+			lock_sys.mutex_lock();
 			lock_prdt_page_free_from_discard(
 				block, &lock_sys.prdt_page_hash);
 			lock_rec_free_all_from_discard_page(block);
-			lock_mutex_exit();
+			lock_sys.mutex_unlock();
 		} else {
 			btr_cur_node_ptr_delete(&father_cursor, mtr);
 			if (!dict_table_is_locking_disabled(index->table)) {
@@ -3740,11 +3736,11 @@ retry:
 							 offsets2, offsets,
 							 merge_page, mtr);
 			}
-			lock_mutex_enter();
+			lock_sys.mutex_lock();
 			lock_prdt_page_free_from_discard(
 				block, &lock_sys.prdt_page_hash);
 			lock_rec_free_all_from_discard_page(block);
-			lock_mutex_exit();
+			lock_sys.mutex_unlock();
 		} else {
 
 			compressed = btr_cur_pessimistic_delete(&err, TRUE,
@@ -3870,12 +3866,13 @@ btr_discard_only_page_on_level(
 	mtr_t*		mtr)	/*!< in: mtr */
 {
 	ulint		page_level = 0;
-	trx_id_t	max_trx_id;
 
 	ut_ad(!index->is_dummy);
 
 	/* Save the PAGE_MAX_TRX_ID from the leaf page. */
-	max_trx_id = page_get_max_trx_id(buf_block_get_frame(block));
+	const trx_id_t max_trx_id = page_get_max_trx_id(block->frame);
+	const rec_t* r = page_rec_get_next(page_get_infimum_rec(block->frame));
+	ut_ad(rec_is_metadata(r, *index) == index->is_instant());
 
 	while (block->page.id().page_no() != dict_index_get_page(index)) {
 		btr_cur_t	cursor;
@@ -3931,9 +3928,6 @@ btr_discard_only_page_on_level(
 	rec_offs* offsets = NULL;
 
 	if (index->table->instant || index->must_avoid_clear_instant_add()) {
-		const rec_t* r = page_rec_get_next(page_get_infimum_rec(
-							   block->frame));
-		ut_ad(rec_is_metadata(r, *index) == index->is_instant());
 		if (!rec_is_metadata(r, *index)) {
 		} else if (!index->table->instant
 			   || rec_is_alter_metadata(r, *index)) {
@@ -3989,8 +3983,6 @@ btr_discard_page(
 	mtr_t*		mtr)	/*!< in: mtr */
 {
 	dict_index_t*	index;
-	ulint		left_page_no;
-	ulint		right_page_no;
 	buf_block_t*	merge_block;
 	buf_block_t*	block;
 	btr_cur_t	parent_cursor;
@@ -4014,8 +4006,8 @@ btr_discard_page(
 
 	/* Decide the page which will inherit the locks */
 
-	left_page_no = btr_page_get_prev(block->frame);
-	right_page_no = btr_page_get_next(block->frame);
+	const uint32_t left_page_no = btr_page_get_prev(block->frame);
+	const uint32_t right_page_no = btr_page_get_next(block->frame);
 
 	ut_d(bool parent_is_different = false);
 	if (left_page_no != FIL_NULL) {
@@ -4598,8 +4590,6 @@ btr_validate_level(
 	btr_cur_t	node_cur;
 	btr_cur_t	right_node_cur;
 	rec_t*		rec;
-	ulint		right_page_no;
-	ulint		left_page_no;
 	page_cur_t	cursor;
 	dtuple_t*	node_ptr_tuple;
 	bool		ret	= true;
@@ -4612,8 +4602,8 @@ btr_validate_level(
 #endif /* UNIV_ZIP_DEBUG */
 	ulint		savepoint = 0;
 	ulint		savepoint2 = 0;
-	ulint		parent_page_no = FIL_NULL;
-	ulint		parent_right_page_no = FIL_NULL;
+	uint32_t	parent_page_no = FIL_NULL;
+	uint32_t	parent_right_page_no = FIL_NULL;
 	bool		rightmost_child = false;
 
 	mtr.start();
@@ -4669,7 +4659,7 @@ btr_validate_level(
 		does not use such scan for any of its DML or query
 		operations  */
 		if (dict_index_is_spatial(index)) {
-			left_page_no = btr_page_get_prev(page);
+			uint32_t left_page_no = btr_page_get_prev(page);
 
 			while (left_page_no != FIL_NULL) {
 				/* To obey latch order of tree blocks,
@@ -4738,8 +4728,8 @@ loop:
 
 	ut_a(btr_page_get_level(page) == level);
 
-	right_page_no = btr_page_get_next(page);
-	left_page_no = btr_page_get_prev(page);
+	uint32_t right_page_no = btr_page_get_next(page);
+	uint32_t left_page_no = btr_page_get_prev(page);
 
 	ut_a(!page_is_empty(page)
 	     || (level == 0
@@ -4860,8 +4850,7 @@ loop:
 
 			rec = btr_cur_get_rec(&node_cur);
 			fprintf(stderr, "\n"
-				"InnoDB: node ptr child page n:o "
-				ULINTPF "\n",
+				"InnoDB: node ptr child page n:o %u\n",
 				btr_node_ptr_get_child_page_no(rec, offsets));
 
 			fputs("InnoDB: record on page ", stderr);
@@ -5096,7 +5085,7 @@ bool
 btr_can_merge_with_page(
 /*====================*/
 	btr_cur_t*	cursor,		/*!< in: cursor on the page to merge */
-	ulint		page_no,	/*!< in: a sibling page */
+	uint32_t	page_no,	/*!< in: a sibling page */
 	buf_block_t**	merge_block,	/*!< out: the merge block */
 	mtr_t*		mtr)		/*!< in: mini-transaction */
 {

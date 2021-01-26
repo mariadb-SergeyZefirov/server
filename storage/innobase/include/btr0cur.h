@@ -33,6 +33,9 @@ Created 10/16/1994 Heikki Tuuri
 #include "rem0types.h"
 #include "gis0type.h"
 #include "my_base.h"
+#ifdef BTR_CUR_HASH_ADAPT
+# include "srw_lock.h"
+#endif
 
 /** Mode flags for btr_cur operations; these can be ORed */
 enum {
@@ -155,8 +158,6 @@ btr_cur_instant_root_init(dict_index_t* index, const page_t* page)
 @param[in]	modify_clock	modify clock value
 @param[in,out]	latch_mode	BTR_SEARCH_LEAF, ...
 @param[in,out]	cursor		cursor
-@param[in]	file		file name
-@param[in]	line		line where called
 @param[in]	mtr		mini-transaction
 @return true if success */
 bool
@@ -165,8 +166,6 @@ btr_cur_optimistic_latch_leaves(
 	ib_uint64_t	modify_clock,
 	ulint*		latch_mode,
 	btr_cur_t*	cursor,
-	const char*	file,
-	unsigned	line,
 	mtr_t*		mtr);
 
 /********************************************************************//**
@@ -202,30 +201,26 @@ btr_cur_search_to_nth_level_func(
 	btr_cur_t*	cursor, /*!< in/out: tree cursor; the cursor page is
 				s- or x-latched, but see also above! */
 #ifdef BTR_CUR_HASH_ADAPT
-	rw_lock_t*	ahi_latch,
-				/*!< in: currently held btr_search_latch
-				(in RW_S_LATCH mode), or NULL */
+	srw_lock*	ahi_latch,
+				/*!< in: currently held AHI rdlock, or NULL */
 #endif /* BTR_CUR_HASH_ADAPT */
-	const char*	file,	/*!< in: file name */
-	unsigned	line,	/*!< in: line where called */
 	mtr_t*		mtr,	/*!< in/out: mini-transaction */
 	ib_uint64_t	autoinc = 0);
 				/*!< in: PAGE_ROOT_AUTO_INC to be written
 				(0 if none) */
 #ifdef BTR_CUR_HASH_ADAPT
-# define btr_cur_search_to_nth_level(i,l,t,m,lm,c,a,fi,li,mtr) \
-	btr_cur_search_to_nth_level_func(i,l,t,m,lm,c,a,fi,li,mtr)
+# define btr_cur_search_to_nth_level(i,l,t,m,lm,c,a,mtr) \
+	btr_cur_search_to_nth_level_func(i,l,t,m,lm,c,a,mtr)
 #else /* BTR_CUR_HASH_ADAPT */
-# define btr_cur_search_to_nth_level(i,l,t,m,lm,c,a,fi,li,mtr) \
-	btr_cur_search_to_nth_level_func(i,l,t,m,lm,c,fi,li,mtr)
+# define btr_cur_search_to_nth_level(i,l,t,m,lm,c,a,mtr) \
+	btr_cur_search_to_nth_level_func(i,l,t,m,lm,c,mtr)
 #endif /* BTR_CUR_HASH_ADAPT */
 
 /*****************************************************************//**
 Opens a cursor at either end of an index.
 @return DB_SUCCESS or error code */
 dberr_t
-btr_cur_open_at_index_side_func(
-/*============================*/
+btr_cur_open_at_index_side(
 	bool		from_left,	/*!< in: true if open to the low end,
 					false if to the high end */
 	dict_index_t*	index,		/*!< in: index */
@@ -233,29 +228,19 @@ btr_cur_open_at_index_side_func(
 	btr_cur_t*	cursor,		/*!< in/out: cursor */
 	ulint		level,		/*!< in: level to search for
 					(0=leaf) */
-	const char*	file,		/*!< in: file name */
-	unsigned	line,		/*!< in: line where called */
 	mtr_t*		mtr)		/*!< in/out: mini-transaction */
 	MY_ATTRIBUTE((nonnull));
-
-#define btr_cur_open_at_index_side(f,i,l,c,lv,m)			\
-	btr_cur_open_at_index_side_func(f,i,l,c,lv,__FILE__,__LINE__,m)
 
 /**********************************************************************//**
 Positions a cursor at a randomly chosen position within a B-tree.
 @return true if the index is available and we have put the cursor, false
 if the index is unavailable */
 bool
-btr_cur_open_at_rnd_pos_func(
-/*=========================*/
+btr_cur_open_at_rnd_pos(
 	dict_index_t*	index,		/*!< in: index */
 	ulint		latch_mode,	/*!< in: BTR_SEARCH_LEAF, ... */
 	btr_cur_t*	cursor,		/*!< in/out: B-tree cursor */
-	const char*	file,		/*!< in: file name */
-	unsigned	line,		/*!< in: line where called */
 	mtr_t*		mtr);		/*!< in: mtr */
-#define btr_cur_open_at_rnd_pos(i,l,c,m)				\
-	btr_cur_open_at_rnd_pos_func(i,l,c,__FILE__,__LINE__,m)
 /*************************************************************//**
 Tries to perform an insert to a page in an index tree, next to cursor.
 It is assumed that mtr holds an x-latch on the page. The operation does
@@ -590,8 +575,24 @@ btr_estimate_n_rows_in_range(
         btr_pos_t*      range_start,
         btr_pos_t*      range_end);
 
-/*******************************************************************//**
-Estimates the number of different key values in a given index, for
+
+/** Statistics for one field of an index. */
+struct index_field_stats_t
+{
+  ib_uint64_t n_diff_key_vals;
+  ib_uint64_t n_sample_sizes;
+  ib_uint64_t n_non_null_key_vals;
+
+  index_field_stats_t(ib_uint64_t n_diff_key_vals= 0,
+                      ib_uint64_t n_sample_sizes= 0,
+                      ib_uint64_t n_non_null_key_vals= 0)
+      : n_diff_key_vals(n_diff_key_vals), n_sample_sizes(n_sample_sizes),
+        n_non_null_key_vals(n_non_null_key_vals)
+  {
+  }
+};
+
+/** Estimates the number of different key values in a given index, for
 each n-column prefix of the index where 1 <= n <= dict_index_get_n_unique(index).
 The estimates are stored in the array index->stat_n_diff_key_vals[] (indexed
 0..n_uniq-1) and the number of pages that were sampled is saved in
@@ -599,12 +600,11 @@ index->stat_n_sample_sizes[].
 If innodb_stats_method is nulls_ignored, we also record the number of
 non-null values for each prefix and stored the estimates in
 array index->stat_n_non_null_key_vals.
-@return true if the index is available and we get the estimated numbers,
-false if the index is unavailable. */
-bool
-btr_estimate_number_of_different_key_vals(
-/*======================================*/
-	dict_index_t*	index);	/*!< in: index */
+@param[in]	index	index
+@return stat vector if the index is available and we get the estimated numbers,
+empty vector if the index is unavailable. */
+std::vector<index_field_stats_t>
+btr_estimate_number_of_different_key_vals(dict_index_t* index);
 
 /** Gets the externally stored size of a record, in units of a database page.
 @param[in]	rec	record
@@ -799,7 +799,7 @@ struct btr_path_t {
 	ulint	n_recs;
 
 	/** Number of the page containing the record. */
-	ulint	page_no;
+	uint32_t page_no;
 
 	/** Level of the page. If later we fetch the page under page_no
 	and it is no different level then we know that the tree has been

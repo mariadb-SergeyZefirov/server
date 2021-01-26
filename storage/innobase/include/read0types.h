@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1997, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2018, 2020, MariaDB Corporation.
+Copyright (c) 2018, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -24,13 +24,15 @@ Cursor read
 Created 2/16/1997 Heikki Tuuri
 *******************************************************/
 
-#ifndef read0types_h
-#define read0types_h
+#pragma once
 
 #include "dict0mem.h"
 #include "trx0types.h"
 #include <algorithm>
 
+#ifdef UNIV_PFS_MUTEX
+extern mysql_pfs_key_t read_view_mutex_key;
+#endif
 
 /**
   Read view lists the trx ids of those transactions for which a consistent read
@@ -138,6 +140,20 @@ loop:
   */
   static void check_trx_id_sanity(trx_id_t id, const table_name_t &name);
 
+  /**
+    Check whether the changes by id are visible.
+    @param[in] id transaction id to check against the view
+    @return whether the view sees the modifications of id.
+  */
+  bool changes_visible(trx_id_t id) const
+  MY_ATTRIBUTE((warn_unused_result))
+  {
+    if (id >= m_low_limit_id)
+      return false;
+    return id < m_up_limit_id ||
+           m_ids.empty() ||
+           !std::binary_search(m_ids.begin(), m_ids.end(), id);
+  }
 
   /**
     Check whether the changes by id are visible.
@@ -190,7 +206,7 @@ class ReadView: public ReadViewBase
   std::atomic<bool> m_open;
 
   /** For synchronisation with purge coordinator. */
-  mutable ib_mutex_t m_mutex;
+  mutable mysql_mutex_t m_mutex;
 
   /**
     trx id of creating transaction.
@@ -199,8 +215,9 @@ class ReadView: public ReadViewBase
   trx_id_t m_creator_trx_id;
 
 public:
-  ReadView(): m_open(false) { mutex_create(LATCH_ID_READ_VIEW, &m_mutex); }
-  ~ReadView() { mutex_free(&m_mutex); }
+  ReadView(): m_open(false)
+  { mysql_mutex_init(read_view_mutex_key, &m_mutex, nullptr); }
+  ~ReadView() { mysql_mutex_destroy(&m_mutex); }
 
 
   /**
@@ -248,12 +265,12 @@ public:
   */
   void print_limits(FILE *file) const
   {
-    mutex_enter(&m_mutex);
+    mysql_mutex_lock(&m_mutex);
     if (is_open())
       fprintf(file, "Trx read view will not see trx with"
                     " id >= " TRX_ID_FMT ", sees < " TRX_ID_FMT "\n",
                     low_limit_id(), up_limit_id());
-    mutex_exit(&m_mutex);
+    mysql_mutex_unlock(&m_mutex);
   }
 
 
@@ -263,7 +280,8 @@ public:
   */
   bool changes_visible(trx_id_t id, const table_name_t &name) const
   { return id == m_creator_trx_id || ReadViewBase::changes_visible(id, name); }
-
+  bool changes_visible(trx_id_t id) const
+  { return id == m_creator_trx_id || ReadViewBase::changes_visible(id); }
 
   /**
     A wrapper around ReadViewBase::append().
@@ -271,23 +289,19 @@ public:
   */
   void append_to(ReadViewBase *to) const
   {
-    mutex_enter(&m_mutex);
+    mysql_mutex_lock(&m_mutex);
     if (is_open())
       to->append(*this);
-    mutex_exit(&m_mutex);
+    mysql_mutex_unlock(&m_mutex);
   }
-
 
   /**
     Declare the object mostly unaccessible.
-    innodb_monitor_set_option is operating also on freed transaction objects.
   */
   void mem_noaccess() const
   {
     MEM_NOACCESS(&m_open, sizeof m_open);
-    /* m_mutex is accessed by innodb_show_mutex_status()
-    and innodb_monitor_update() even after trx_t::free() */
+    /* m_mutex is accessed via trx_sys.rw_trx_hash */
     MEM_NOACCESS(&m_creator_trx_id, sizeof m_creator_trx_id);
   }
 };
-#endif

@@ -182,14 +182,6 @@ innobase_basename(
 	const char*	path_name);
 
 /******************************************************************//**
-Returns true if the thread is executing a SELECT statement.
-@return true if thd is executing SELECT */
-ibool
-thd_is_select(
-/*==========*/
-	const THD*	thd);	/*!< in: thread handle */
-
-/******************************************************************//**
 Converts an identifier to a table name. */
 void
 innobase_convert_from_table_id(
@@ -217,9 +209,7 @@ innobase_casedn_str(
 	char*	a);	/*!< in/out: string to put in lower case */
 
 #ifdef WITH_WSREP
-int
-wsrep_innobase_kill_one_trx(THD *bf_thd, trx_t *victim_trx,
-			    bool signal);
+int wsrep_innobase_kill_one_trx(THD *bf_thd, trx_t *victim_trx, bool signal);
 ulint wsrep_innobase_mysql_sort(int mysql_type, uint charset_number,
                              unsigned char* str, ulint str_length,
                              unsigned int buf_length);

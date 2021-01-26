@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2015, 2020, MariaDB Corporation.
+Copyright (c) 2015, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -245,7 +245,7 @@ trx_print_low(
 			/*!< in: max query length to print,
 			or 0 to use the default max length */
 	ulint		n_rec_locks,
-			/*!< in: lock_number_of_rows_locked(&trx->lock) */
+			/*!< in: trx->lock.n_rec_locks */
 	ulint		n_trx_locks,
 			/*!< in: length of trx->lock.trx_locks */
 	ulint		heap_size);
@@ -328,16 +328,6 @@ is estimated as the number of altered rows + the number of locked rows.
 @return transaction weight */
 #define TRX_WEIGHT(t)	((t)->undo_no + UT_LIST_GET_LEN((t)->lock.trx_locks))
 
-/*******************************************************************//**
-Compares the "weight" (or size) of two transactions. Transactions that
-have edited non-transactional tables are considered heavier than ones
-that have not.
-@return true if weight(a) >= weight(b) */
-bool
-trx_weight_ge(
-/*==========*/
-	const trx_t*	a,	/*!< in: the transaction to be compared */
-	const trx_t*	b);	/*!< in: the transaction to be compared */
 /* Maximum length of a string that can be returned by
 trx_get_que_state_str(). */
 #define TRX_QUE_STATE_STR_MAX_LEN	12 /* "ROLLING BACK" */
@@ -560,64 +550,80 @@ struct trx_lock_t {
 					mutex to prevent recursive deadlocks.
 					Protected by both the lock sys mutex
 					and the trx_t::mutex. */
-	ulint		n_rec_locks;	/*!< number of rec locks in this trx */
+  /** number of record locks; writes are protected by lock_sys.mutex */
+  ulint n_rec_locks;
 };
 
 /** Logical first modification time of a table in a transaction */
 class trx_mod_table_time_t
 {
-	/** First modification of the table */
-	undo_no_t	first;
-	/** First modification of a system versioned column */
-	undo_no_t	first_versioned;
+  /** Impossible value for trx_t::undo_no */
+  static constexpr undo_no_t NONE= ~undo_no_t{0};
+  /** Theoretical maximum value for trx_t::undo_no.
+  DB_ROLL_PTR is only 7 bytes, so it cannot point to more than
+  this many undo log records. */
+  static constexpr undo_no_t LIMIT= (undo_no_t{1} << (7 * 8)) - 1;
 
-	/** Magic value signifying that a system versioned column of a
-	table was never modified in a transaction. */
-	static const undo_no_t UNVERSIONED = IB_ID_MAX;
+  /** Flag in 'first' to indicate that subsequent operations are
+  covered by a TRX_UNDO_EMPTY record (for the first statement to
+  insert into an empty table) */
+  static constexpr undo_no_t BULK= 1ULL << 63;
+  /** Flag in 'first' to indicate that some operations were
+  covered by a TRX_UNDO_EMPTY record (for the first statement to
+  insert into an empty table) */
+  static constexpr undo_no_t WAS_BULK= 1ULL << 63;
 
+  /** First modification of the table, possibly ORed with BULK */
+  undo_no_t first;
+  /** First modification of a system versioned column (or NONE) */
+  undo_no_t first_versioned= NONE;
 public:
-	/** Constructor
-	@param[in]	rows	number of modified rows so far */
-	trx_mod_table_time_t(undo_no_t rows)
-		: first(rows), first_versioned(UNVERSIONED) {}
+  /** Constructor
+  @param rows   number of modified rows so far */
+  trx_mod_table_time_t(undo_no_t rows) : first(rows) { ut_ad(rows < LIMIT); }
 
 #ifdef UNIV_DEBUG
-	/** Validation
-	@param[in]	rows	number of modified rows so far
-	@return	whether the object is valid */
-	bool valid(undo_no_t rows = UNVERSIONED) const
-	{
-		return first <= first_versioned && first <= rows;
-	}
+  /** Validation
+  @param rows   number of modified rows so far
+  @return whether the object is valid */
+  bool valid(undo_no_t rows= NONE) const
+  { auto f= first & LIMIT; return f <= first_versioned && f <= rows; }
 #endif /* UNIV_DEBUG */
-	/** @return if versioned columns were modified */
-	bool is_versioned() const { return first_versioned != UNVERSIONED; }
+  /** @return if versioned columns were modified */
+  bool is_versioned() const { return first_versioned != NONE; }
 
-	/** After writing an undo log record, set is_versioned() if needed
-	@param[in]	rows	number of modified rows so far */
-	void set_versioned(undo_no_t rows)
-	{
-		ut_ad(!is_versioned());
-		first_versioned = rows;
-		ut_ad(valid());
-	}
+  /** After writing an undo log record, set is_versioned() if needed
+  @param rows   number of modified rows so far */
+  void set_versioned(undo_no_t rows)
+  {
+    ut_ad(!is_versioned());
+    first_versioned= rows;
+    ut_ad(valid(rows));
+  }
 
-	/** Invoked after partial rollback
-	@param[in]	limit	number of surviving modified rows
-	@return	whether this should be erased from trx_t::mod_tables */
-	bool rollback(undo_no_t limit)
-	{
-		ut_ad(valid());
-		if (first >= limit) {
-			return true;
-		}
+  /** Notify the start of a bulk insert operation */
+  void start_bulk_insert() { first|= BULK | WAS_BULK; }
 
-		if (first_versioned < limit && is_versioned()) {
-			first_versioned = UNVERSIONED;
-		}
+  /** Notify the end of a bulk insert operation */
+  void end_bulk_insert() { first&= ~BULK; }
 
-		return false;
-	}
+  /** @return whether an insert is covered by TRX_UNDO_EMPTY record */
+  bool is_bulk_insert() const { return first & BULK; }
+  /** @return whether an insert was covered by TRX_UNDO_EMPTY record */
+  bool was_bulk_insert() const { return first & WAS_BULK; }
+
+  /** Invoked after partial rollback
+  @param limit	number of surviving modified rows (trx_t::undo_no)
+  @return	whether this should be erased from trx_t::mod_tables */
+  bool rollback(undo_no_t limit)
+  {
+    ut_ad(valid());
+    if ((LIMIT & first) >= limit)
+      return true;
+    if (first_versioned < limit)
+      first_versioned= NONE;
+    return false;
+  }
 };
 
 /** Collection of persistent tables and their first modification
@@ -719,10 +725,9 @@ private:
 
 
 public:
-	TrxMutex	mutex;		/*!< Mutex protecting the fields
-					state and lock (except some fields
-					of lock, which are protected by
-					lock_sys.mutex) */
+  /** mutex protecting state and some of lock
+  (some are protected by lock_sys.mutex) */
+  srw_mutex mutex;
 
 	trx_id_t	id;		/*!< transaction id */
 
@@ -787,7 +792,7 @@ public:
 	rw_trx_hash.
 
 	Transitions to COMMITTED are protected by trx_t::mutex. */
-	trx_state_t	state;
+  Atomic_relaxed<trx_state_t> state;
 #ifdef WITH_WSREP
 	/** whether wsrep_on(mysql_thd) held at the start of transaction */
 	bool		wsrep;
@@ -985,20 +990,6 @@ public:
 	/*------------------------------*/
 	char*		detailed_error;	/*!< detailed error message for last
 					error, or empty. */
-	/* Lock wait statistics */
-	ulint		n_rec_lock_waits;
-					/*!< Number of record lock waits,
-					might not be exactly correct. */
-	ulint		n_table_lock_waits;
-					/*!< Number of table lock waits,
-					might not be exactly correct. */
-	ulint		total_rec_lock_wait_time;
-					/*!< Total rec lock wait time up
-					to this moment. */
-	ulint		total_table_lock_wait_time;
-					/*!< Total table lock wait time
-					up to this moment. */
-
 	rw_trx_hash_element_t *rw_trx_hash_element;
 	LF_PINS *rw_trx_hash_pins;
 	ulint		magic_n;
@@ -1110,11 +1101,34 @@ public:
     ut_ad(dict_operation == TRX_DICT_OP_NONE);
   }
 
+  /** This has to be invoked on SAVEPOINT or at the end of a statement.
+  Even if a TRX_UNDO_EMPTY record was written for this table to cover an
+  insert into an empty table, subsequent operations will have to be covered
+  by row-level undo log records, so that ROLLBACK TO SAVEPOINT or a
+  rollback to the start of a statement will work.
+  @param table   table on which any preceding bulk insert ended */
+  void end_bulk_insert(const dict_table_t &table)
+  {
+    auto it= mod_tables.find(const_cast<dict_table_t*>(&table));
+    if (it != mod_tables.end())
+      it->second.end_bulk_insert();
+  }
+
+  /** This has to be invoked on SAVEPOINT or at the start of a statement.
+  Even if TRX_UNDO_EMPTY records were written for any table to cover an
+  insert into an empty table, subsequent operations will have to be covered
+  by row-level undo log records, so that ROLLBACK TO SAVEPOINT or a
+  rollback to the start of a statement will work. */
+  void end_bulk_insert()
+  {
+    for (auto& t : mod_tables)
+      t.second.end_bulk_insert();
+  }
 
 private:
-	/** Assign a rollback segment for modifying temporary tables.
-	@return the assigned rollback segment */
-	trx_rseg_t* assign_temp_rseg();
+  /** Assign a rollback segment for modifying temporary tables.
+  @return the assigned rollback segment */
+  trx_rseg_t *assign_temp_rseg();
 };
 
 /**
@@ -1182,19 +1196,6 @@ struct commit_node_t{
 			state;	/*!< node execution state */
 };
 
-
-/** Test if trx->mutex is owned. */
-#define trx_mutex_own(t) mutex_own(&t->mutex)
-
-/** Acquire the trx->mutex. */
-#define trx_mutex_enter(t) do {			\
-	mutex_enter(&t->mutex);			\
-} while (0)
-
-/** Release the trx->mutex. */
-#define trx_mutex_exit(t) do {			\
-	mutex_exit(&t->mutex);			\
-} while (0)
 
 #include "trx0trx.ic"
 

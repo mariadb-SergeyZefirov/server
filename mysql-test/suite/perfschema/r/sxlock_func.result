@@ -1,49 +1,28 @@
 UPDATE performance_schema.setup_instruments SET enabled = 'NO', timed = 'YES';
 UPDATE performance_schema.setup_instruments SET enabled = 'YES'
 WHERE name like 'wait/synch/sxlock/%';
+UPDATE performance_schema.setup_instruments SET enabled = 'YES'
+WHERE name like 'wait/synch/rwlock/innodb/%';
+SELECT DISTINCT name FROM performance_schema.setup_instruments
+WHERE name LIKE 'wait/synch/rwlock/innodb/%'
+AND name!='wait/synch/rwlock/innodb/btr_search_latch' ORDER BY name;
+name
+wait/synch/rwlock/innodb/dict_operation_lock
+wait/synch/rwlock/innodb/fil_space_latch
+wait/synch/rwlock/innodb/trx_i_s_cache_lock
+wait/synch/rwlock/innodb/trx_purge_latch
 TRUNCATE TABLE performance_schema.events_waits_history_long;
 TRUNCATE TABLE performance_schema.events_waits_history;
 TRUNCATE TABLE performance_schema.events_waits_current;
 select name from performance_schema.setup_instruments
-where name like "wait/synch/sxlock/%"
-  and name not in
-("wait/synch/sxlock/innodb/buf_block_lock",
-"wait/synch/sxlock/innodb/buf_block_debug_latch")
-order by name;
+where name like "wait/synch/sxlock/%" order by name;
 name
-wait/synch/sxlock/innodb/btr_search_latch
-wait/synch/sxlock/innodb/dict_operation_lock
-wait/synch/sxlock/innodb/dict_table_stats
-wait/synch/sxlock/innodb/fil_space_latch
-wait/synch/sxlock/innodb/fts_cache_init_rw_lock
-wait/synch/sxlock/innodb/fts_cache_rw_lock
-wait/synch/sxlock/innodb/index_online_log
 wait/synch/sxlock/innodb/index_tree_rw_lock
-wait/synch/sxlock/innodb/trx_i_s_cache_lock
-wait/synch/sxlock/innodb/trx_purge_latch
-select name from performance_schema.rwlock_instances
-where name in
-(
-'wait/synch/sxlock/innodb/btr_search_latch',
-'wait/synch/sxlock/innodb/checkpoint_lock',
-'wait/synch/sxlock/innodb/dict_operation_lock',
-'wait/synch/sxlock/innodb/trx_i_s_cache_lock',
-'wait/synch/sxlock/innodb/trx_purge_latch'
-  )
-order by name;
+SELECT DISTINCT name FROM performance_schema.rwlock_instances
+WHERE name LIKE 'wait/synch/sxlock/innodb/%'
+ORDER BY name;
 name
-wait/synch/sxlock/innodb/btr_search_latch
-wait/synch/sxlock/innodb/btr_search_latch
-wait/synch/sxlock/innodb/btr_search_latch
-wait/synch/sxlock/innodb/btr_search_latch
-wait/synch/sxlock/innodb/btr_search_latch
-wait/synch/sxlock/innodb/btr_search_latch
-wait/synch/sxlock/innodb/btr_search_latch
-wait/synch/sxlock/innodb/btr_search_latch
-wait/synch/sxlock/innodb/dict_operation_lock
-wait/synch/sxlock/innodb/trx_i_s_cache_lock
-wait/synch/sxlock/innodb/trx_purge_latch
-drop table if exists t1;
+wait/synch/sxlock/innodb/index_tree_rw_lock
 create table t1(a int) engine=innodb;
 begin;
 insert into t1 values (1), (2), (3);
@@ -51,14 +30,23 @@ insert into t1 values (1), (2), (3);
 insert into t1 values (1), (2), (3);
 commit;
 drop table t1;
-select operation from performance_schema.events_waits_history_long
-where event_name like "wait/synch/sxlock/%"
-  and operation = "shared_lock" limit 1;
-operation
-shared_lock
-select operation from performance_schema.events_waits_history_long
-where event_name like "wait/synch/sxlock/%"
-  and operation = "exclusive_lock" limit 1;
-operation
-exclusive_lock
+SELECT DISTINCT event_name FROM performance_schema.events_waits_history_long
+WHERE event_name LIKE 'wait/synch/rwlock/innodb/%'
+AND event_name NOT IN
+('wait/synch/rwlock/innodb/btr_search_latch',
+'wait/synch/rwlock/innodb/trx_purge_latch')
+ORDER BY event_name;
+event_name
+wait/synch/rwlock/innodb/dict_operation_lock
+wait/synch/rwlock/innodb/fil_space_latch
+SELECT event_name FROM performance_schema.events_waits_history_long
+WHERE event_name = 'wait/synch/sxlock/innodb/index_tree_rw_lock'
+AND operation IN ('try_shared_lock','shared_lock') LIMIT 1;
+event_name
+wait/synch/sxlock/innodb/index_tree_rw_lock
+SELECT event_name from performance_schema.events_waits_history_long
+WHERE event_name = 'wait/synch/sxlock/innodb/index_tree_rw_lock'
+AND operation IN ('try_exclusive_lock','exclusive_lock') LIMIT 1;
+event_name
+wait/synch/sxlock/innodb/index_tree_rw_lock
 UPDATE performance_schema.setup_instruments SET enabled = 'YES', timed = 'YES';

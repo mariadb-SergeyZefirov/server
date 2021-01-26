@@ -1,7 +1,7 @@
 #ifndef FIELD_INCLUDED
 #define FIELD_INCLUDED
 /* Copyright (c) 2000, 2015, Oracle and/or its affiliates.
-   Copyright (c) 2008, 2020, MariaDB Corporation.
+   Copyright (c) 2008, 2021, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -1151,8 +1151,9 @@ public:
   virtual void reset_fields() {}
   const uchar *ptr_in_record(const uchar *record) const
   {
-    my_ptrdiff_t l_offset= (my_ptrdiff_t) (record -  table->record[0]);
-    return ptr + l_offset;
+    my_ptrdiff_t l_offset= (my_ptrdiff_t) (ptr -  table->record[0]);
+    DBUG_ASSERT(l_offset >= 0 && table->s->rec_buff_length - l_offset > 0);
+    return record + l_offset;
   }
   virtual int set_default();
 
@@ -2087,7 +2088,7 @@ public:
 	    uchar null_bit_arg, utype unireg_check_arg,
 	    const LEX_CSTRING *field_name_arg,
 	    const DTCollation &collation);
-  uint decimals() const override { return NOT_FIXED_DEC; }
+  uint decimals() const override { return is_created_from_null_item ? 0 : NOT_FIXED_DEC; }
   int  save_in_field(Field *to) override { return save_in_field_str(to); }
   bool memcpy_field_possible(const Field *from) const override
   {

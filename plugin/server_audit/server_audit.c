@@ -16,7 +16,7 @@
 
 
 #define PLUGIN_VERSION 0x104
-#define PLUGIN_STR_VERSION "1.4.8"
+#define PLUGIN_STR_VERSION "1.4.10"
 
 #define _my_thread_var loc_thread_var
 
@@ -327,6 +327,10 @@ struct connection_info
   char query_buffer[1024];
   time_t query_time;
   int log_always;
+  char proxy[64];
+  int proxy_length;
+  char proxy_host[64];
+  int proxy_host_length;
 };
 
 #define DEFAULT_FILENAME_LEN 16
@@ -705,6 +709,8 @@ static char *coll_search(struct user_coll *c, const char *n, size_t len)
 {
   struct user_name un;
   struct user_name *found;
+  if (!c->n_users)
+    return 0;
   un.name_len= len;
   un.name= (char *) n;
   found= (struct user_name*)  bsearch(&un, c->users, c->n_users,
@@ -735,7 +741,8 @@ static int coll_insert(struct user_coll *c, char *n, size_t len)
 
 static void coll_sort(struct user_coll *c)
 {
-  qsort(c->users, c->n_users, sizeof(c->users[0]), cmp_users);
+  if (c->n_users)
+    qsort(c->users, c->n_users, sizeof(c->users[0]), cmp_users);
 }
 
 
@@ -966,7 +973,8 @@ static void get_str_n(char *dest, int *dest_len, size_t dest_size,
   if (src_len >= dest_size)
     src_len= dest_size - 1;
 
-  memcpy(dest, src, src_len);
+  if (src_len)
+    memcpy(dest, src, src_len);
   dest[src_len]= 0;
   *dest_len= (int)src_len;
 }
@@ -1131,8 +1139,12 @@ static void setup_connection_simple(struct connection_info *ci)
   ci->ip_length= 0;
   ci->query_length= 0;
   ci->header= 0;
+  ci->proxy_length= 0;
 }
 
+
+#define MAX_HOSTNAME 61
+#define USERNAME_LENGTH 384
 
 static void setup_connection_connect(struct connection_info *cn,
     const struct mysql_event_connection *event)
@@ -1150,6 +1162,29 @@ static void setup_connection_connect(struct connection_info *cn,
   get_str_n(cn->ip, &cn->ip_length, sizeof(cn->ip),
             event->ip, event->ip_length);
   cn->header= 0;
+  if (event->proxy_user && event->proxy_user[0])
+  {
+    const char *priv_host= event->proxy_user +
+            sizeof(char[MAX_HOSTNAME+USERNAME_LENGTH+5]);
+    size_t priv_host_length;
+
+    if (mysql_57_started)
+    {
+      priv_host+= sizeof(size_t);
+      priv_host_length= *(size_t *) (priv_host + MAX_HOSTNAME);
+    }
+    else
+      priv_host_length= strlen(priv_host);
+
+
+    get_str_n(cn->proxy, &cn->proxy_length, sizeof(cn->proxy),
+              event->priv_user, event->priv_user_length);
+    get_str_n(cn->proxy_host, &cn->proxy_host_length,
+              sizeof(cn->proxy_host),
+              priv_host, priv_host_length);
+  }
+  else
+    cn->proxy_length= 0;
 }
 
 
@@ -1349,6 +1384,31 @@ static size_t log_header(char *message, size_t message_len,
 }
 
 
+static int log_proxy(const struct connection_info *cn,
+                     const struct mysql_event_connection *event)
+                   
+{
+  time_t ctime;
+  size_t csize;
+  char message[1024];
+
+  (void) time(&ctime);
+  csize= log_header(message, sizeof(message)-1, &ctime,
+                    servhost, servhost_len,
+                    cn->user, cn->user_length,
+                    cn->host, cn->host_length,
+                    cn->ip, cn->ip_length,
+                    event->thread_id, 0, "PROXY_CONNECT");
+  csize+= my_snprintf(message+csize, sizeof(message) - 1 - csize,
+    ",%.*s,`%.*s`@`%.*s`,%d", cn->db_length, cn->db,
+                     cn->proxy_length, cn->proxy,
+                     cn->proxy_host_length, cn->proxy_host,
+                     event->status);
+  message[csize]= '\n';
+  return write_log(message, csize + 1, 1);
+}
+
+
 static int log_connection(const struct connection_info *cn,
                           const struct mysql_event_connection *event,
                           const char *type)
@@ -1521,22 +1581,27 @@ no_password:
 
 
 
-static int do_log_user(const char *name, int take_lock)
+static int do_log_user(const char *name, int len,
+                       const char *proxy, int proxy_len, int take_lock)
 {
-  size_t len;
   int result;
 
   if (!name)
     return 0;
-  len= strlen(name);
 
   if (take_lock)
     flogger_mutex_lock(&lock_operations);
 
   if (incl_user_coll.n_users)
-    result= coll_search(&incl_user_coll, name, len) != 0;
+  {
+    result= coll_search(&incl_user_coll, name, len) != 0 ||
+            (proxy && coll_search(&incl_user_coll, proxy, proxy_len) != 0);
+  }
   else if (excl_user_coll.n_users)
-    result=  coll_search(&excl_user_coll, name, len) == 0;
+  {
+    result= coll_search(&excl_user_coll, name, len) == 0 &&
+            (proxy && coll_search(&excl_user_coll, proxy, proxy_len) == 0);
+  }
   else
     result= 1;
 
@@ -2077,7 +2142,9 @@ void auditing(MYSQL_THD thd, unsigned int event_class, const void *ev)
   }
 
   if (event_class == MYSQL_AUDIT_GENERAL_CLASS && FILTER(EVENT_QUERY) &&
-      cn && (cn->log_always || do_log_user(cn->user, 1)))
+      cn && (cn->log_always || do_log_user(cn->user, cn->user_length,
+                                           cn->proxy, cn->proxy_length,
+                                           1)))
   {
     const struct mysql_event_general *event =
       (const struct mysql_event_general *) ev;
@@ -2097,7 +2164,8 @@ void auditing(MYSQL_THD thd, unsigned int event_class, const void *ev)
   {
     const struct mysql_event_table *event =
       (const struct mysql_event_table *) ev;
-    if (do_log_user(event->user, 1))
+    if (do_log_user(event->user, (int) SAFE_STRLEN(event->user),
+                    cn->proxy, cn->proxy_length, 1))
     {
       switch (event->event_subclass)
       {
@@ -2130,6 +2198,8 @@ void auditing(MYSQL_THD thd, unsigned int event_class, const void *ev)
     {
       case MYSQL_AUDIT_CONNECTION_CONNECT:
         log_connection(cn, event, event->status ? "FAILED_CONNECT": "CONNECT");
+        if (event->status == 0 && event->proxy_user && event->proxy_user[0])
+          log_proxy(cn, event);
         break;
       case MYSQL_AUDIT_CONNECTION_DISCONNECT:
         if (use_event_data_for_disconnect)
@@ -2139,6 +2209,8 @@ void auditing(MYSQL_THD thd, unsigned int event_class, const void *ev)
         break;
       case MYSQL_AUDIT_CONNECTION_CHANGE_USER:
         log_connection(cn, event, "CHANGEUSER");
+        if (event->proxy_user && event->proxy_user[0])
+          log_proxy(cn, event);
         break;
       default:;
     }

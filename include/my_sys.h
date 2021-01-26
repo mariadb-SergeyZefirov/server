@@ -463,18 +463,19 @@ typedef struct st_io_cache		/* Used when caching files */
     partial.
   */
   int	seek_not_done,error;
-  /* buffer_length is memory size allocated for buffer or write_buffer */
+  /* length of the buffer used for storing un-encrypted data */
   size_t	buffer_length;
   /* read_length is the same as buffer_length except when we use async io */
   size_t  read_length;
   myf	myflags;			/* Flags used to my_read/my_write */
   /*
-    alloced_buffer is 1 if the buffer was allocated by init_io_cache() and
-    0 if it was supplied by the user.
+    alloced_buffer is set to the size of the buffer allocated for the IO_CACHE.
+    Includes the overhead(storing key to ecnrypt and decrypt) for encryption.
+    Set to 0 if nothing is allocated.
     Currently READ_NET is the only one that will use a buffer allocated
     somewhere else
   */
-  my_bool alloced_buffer;
+  size_t alloced_buffer;
 } IO_CACHE;
 
 typedef int (*qsort2_cmp)(const void *, const void *, const void *);
@@ -514,8 +515,11 @@ static inline int my_b_write(IO_CACHE *info, const uchar *Buffer, size_t Count)
   MEM_CHECK_DEFINED(Buffer, Count);
   if (info->write_pos + Count <= info->write_end)
   {
-    memcpy(info->write_pos, Buffer, Count);
-    info->write_pos+= Count;
+    if (Count)
+    {
+      memcpy(info->write_pos, Buffer, Count);
+      info->write_pos+= Count;
+    }
     return 0;
   }
   return _my_b_write(info, Buffer, Count);
@@ -873,7 +877,6 @@ extern void my_free_lock(void *ptr);
 #define my_malloc_lock(A,B) my_malloc(PSI_INSTRUMENT_ME, (A),(B))
 #define my_free_lock(A) my_free((A))
 #endif
-#define root_name(A) ""
 #define alloc_root_inited(A) ((A)->min_malloc != 0)
 #define ALLOC_ROOT_MIN_BLOCK_SIZE (MALLOC_OVERHEAD + sizeof(USED_MEM) + 8)
 #define clear_alloc_root(A) do { (A)->free= (A)->used= (A)->pre_alloc= 0; (A)->min_malloc=0;} while(0)
@@ -963,12 +966,6 @@ extern ulonglong my_getcputime(void);
 #endif
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0         /* For irix and AIX */
-#endif
-
-/* Compatibility with pre linux 3.8 distributions */
-#ifdef __linux__
-#define MAP_HUGE_SHIFT 26
-#define MAP_HUGETLB 0x40000
 #endif
 
 #ifdef HAVE_MMAP64

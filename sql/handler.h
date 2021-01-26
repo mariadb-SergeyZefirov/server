@@ -866,8 +866,10 @@ struct xid_t {
   void set(long f, const char *g, long gl, const char *b, long bl)
   {
     formatID= f;
-    memcpy(data, g, gtrid_length= gl);
-    memcpy(data+gl, b, bqual_length= bl);
+    if ((gtrid_length= gl))
+      memcpy(data, g, gl);
+    if ((bqual_length= bl))
+      memcpy(data+gl, b, bl);
   }
   void set(ulonglong xid)
   {
@@ -3276,9 +3278,6 @@ private:
   */
   Handler_share **ha_share;
 
-  /** Stores next_insert_id for handling duplicate key errors. */
-  ulonglong m_prev_insert_id;
-
 public:
   handler(handlerton *ht_arg, TABLE_SHARE *share_arg)
     :table_share(share_arg), table(0),
@@ -3306,7 +3305,7 @@ public:
     m_psi_numrows(0),
     m_psi_locker(NULL),
     row_logging(0), row_logging_init(0),
-    m_lock_type(F_UNLCK), ha_share(NULL), m_prev_insert_id(0)
+    m_lock_type(F_UNLCK), ha_share(NULL)
   {
     DBUG_PRINT("info",
                ("handler created F_UNLCK %d F_RDLCK %d F_WRLCK %d",
@@ -4024,16 +4023,6 @@ public:
     */
     next_insert_id= (prev_insert_id > 0) ? prev_insert_id :
       insert_id_for_cur_row;
-  }
-
-  /** Store and restore next_insert_id over duplicate key errors. */
-  virtual void store_auto_increment()
-  {
-    m_prev_insert_id= next_insert_id;
-  }
-  virtual void restore_auto_increment()
-  {
-    restore_auto_increment(m_prev_insert_id);
   }
 
   virtual void update_create_info(HA_CREATE_INFO *create_info) {}
@@ -5179,7 +5168,7 @@ int ha_change_key_cache(KEY_CACHE *old_key_cache, KEY_CACHE *new_key_cache);
 /* transactions: interface to handlerton functions */
 int ha_start_consistent_snapshot(THD *thd);
 int ha_commit_or_rollback_by_xid(XID *xid, bool commit);
-int ha_commit_one_phase(THD *thd, bool all, bool rw_trans);
+int ha_commit_one_phase(THD *thd, bool all);
 int ha_commit_trans(THD *thd, bool all);
 int ha_rollback_trans(THD *thd, bool all);
 int ha_prepare(THD *thd);

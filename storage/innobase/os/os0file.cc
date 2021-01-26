@@ -42,6 +42,7 @@ Created 10/21/1995 Heikki Tuuri
 # include <sys/stat.h>
 #endif
 
+#include "srv0mon.h"
 #include "srv0srv.h"
 #include "srv0start.h"
 #include "fil0fil.h"
@@ -49,10 +50,9 @@ Created 10/21/1995 Heikki Tuuri
 #ifdef HAVE_LINUX_UNISTD_H
 #include "unistd.h"
 #endif
-#include "os0event.h"
 #include "os0thread.h"
+#include "buf0dblwr.h"
 
-#include <vector>
 #include <tpool_structs.h>
 
 #ifdef LINUX_NATIVE_AIO
@@ -135,7 +135,6 @@ public:
 
 static io_slots *read_slots;
 static io_slots *write_slots;
-static io_slots *ibuf_slots;
 
 /** Number of retries for partial I/O's */
 constexpr ulint NUM_RETRIES_ON_PARTIAL_IO = 10;
@@ -153,17 +152,9 @@ static ulint	os_innodb_umask	= 0;
 #endif /* _WIN32 */
 
 
-/** Flag indicating if the page_cleaner is in active state. */
-extern bool buf_page_cleaner_is_active;
+#define WAIT_ALLOW_WRITES() innodb_wait_allow_writes()
 
-#ifdef WITH_INNODB_DISALLOW_WRITES
-#define WAIT_ALLOW_WRITES() os_event_wait(srv_allow_writes_event)
-#else
-#define WAIT_ALLOW_WRITES() do { } while (0)
-#endif /* WITH_INNODB_DISALLOW_WRITES */
-
-
-ulint	os_n_file_reads;
+Atomic_counter<ulint> os_n_file_reads;
 static ulint	os_bytes_read_since_printout;
 ulint	os_n_file_writes;
 ulint	os_n_fsyncs;
@@ -1387,7 +1378,8 @@ os_file_create_func(
 
 	ut_a(type == OS_LOG_FILE
 	     || type == OS_DATA_FILE
-	     || type == OS_DATA_TEMP_FILE);
+	     || type == OS_DATA_TEMP_FILE
+	     || type == OS_DATA_FILE_NO_O_DIRECT);
 
 	ut_a(purpose == OS_FILE_AIO || purpose == OS_FILE_NORMAL);
 
@@ -1433,7 +1425,8 @@ os_file_create_func(
 	/* We disable OS caching (O_DIRECT) only on data files */
 	if (!read_only
 	    && *success
-	    && (type != OS_LOG_FILE && type != OS_DATA_TEMP_FILE)
+	    && type != OS_LOG_FILE && type != OS_DATA_TEMP_FILE
+	    && type != OS_DATA_FILE_NO_O_DIRECT
 	    && (srv_file_flush_method == SRV_O_DIRECT
 		|| srv_file_flush_method == SRV_O_DIRECT_NO_FSYNC)) {
 
@@ -1891,39 +1884,56 @@ os_file_status_win32(
 	return(true);
 }
 
+/* Dynamically load NtFlushBuffersFileEx, used in os_file_flush_func */
+#include <winternl.h>
+typedef NTSTATUS(WINAPI* pNtFlushBuffersFileEx)(
+  HANDLE FileHandle, ULONG Flags, PVOID Parameters, ULONG ParametersSize,
+  PIO_STATUS_BLOCK IoStatusBlock);
+
+static pNtFlushBuffersFileEx my_NtFlushBuffersFileEx
+  = (pNtFlushBuffersFileEx)GetProcAddress(GetModuleHandle("ntdll"),
+    "NtFlushBuffersFileEx");
+
 /** NOTE! Use the corresponding macro os_file_flush(), not directly this
 function!
 Flushes the write buffers of a given file to the disk.
 @param[in]	file		handle to a file
 @return true if success */
-bool
-os_file_flush_func(
-	os_file_t	file)
+bool os_file_flush_func(os_file_t file)
 {
-	++os_n_fsyncs;
+  ++os_n_fsyncs;
+  static bool disable_datasync;
 
-	BOOL	ret = FlushFileBuffers(file);
+  if (my_NtFlushBuffersFileEx && !disable_datasync)
+  {
+    IO_STATUS_BLOCK iosb{};
+    NTSTATUS status= my_NtFlushBuffersFileEx(
+        file, FLUSH_FLAGS_FILE_DATA_SYNC_ONLY, nullptr, 0, &iosb);
+    if (!status)
+      return true;
+    /*
+      NtFlushBuffersFileEx(FLUSH_FLAGS_FILE_DATA_SYNC_ONLY) might fail
+      unless on Win10+, and maybe non-NTFS. Switch to using FlushFileBuffers().
+    */
+    disable_datasync= true;
+  }
 
-	if (ret) {
-		return(true);
-	}
+  if (FlushFileBuffers(file))
+    return true;
 
-	/* Since Windows returns ERROR_INVALID_FUNCTION if the 'file' is
-	actually a raw device, we choose to ignore that error if we are using
-	raw disks */
+  /* Since Windows returns ERROR_INVALID_FUNCTION if the 'file' is
+  actually a raw device, we choose to ignore that error if we are using
+  raw disks */
+  if (srv_start_raw_disk_in_use && GetLastError() == ERROR_INVALID_FUNCTION)
+    return true;
 
-	if (srv_start_raw_disk_in_use && GetLastError()
-	    == ERROR_INVALID_FUNCTION) {
-		return(true);
-	}
+  os_file_handle_error(nullptr, "flush");
 
-	os_file_handle_error(NULL, "flush");
+  /* It is a fatal error if a file flush does not succeed, because then
+  the database can get corrupt on disk */
+  ut_error;
 
-	/* It is a fatal error if a file flush does not succeed, because then
-	the database can get corrupt on disk */
-	ut_error;
-
-	return(false);
+  return false;
 }
 
 /** Retrieves the last error number if an error occurs in a file io function.
@@ -3149,14 +3159,7 @@ os_file_io(
 
 			bytes_returned += n_bytes;
 
-			if (offset > 0
-			    && type.is_write()
-			    && type.punch_hole()) {
-				*err = type.punch_hole(file, offset, n);
-
-			} else {
-				*err = DB_SUCCESS;
-			}
+			*err = type.maybe_punch_hole(offset, n);
 
 			return(original_n);
 		}
@@ -3167,8 +3170,7 @@ os_file_io(
 
 		bytes_returned += n_bytes;
 
-		if (!type.is_partial_io_warning_disabled()) {
-
+		if (type.type != IORequest::READ_MAYBE_PARTIAL) {
 			const char*	op = type.is_read()
 				? "read" : "written";
 
@@ -3186,7 +3188,7 @@ os_file_io(
 
 	*err = DB_IO_ERROR;
 
-	if (!type.is_partial_io_warning_disabled()) {
+	if (type.type != IORequest::READ_MAYBE_PARTIAL) {
 		ib::warn()
 			<< "Retry attempts for "
 			<< (type.is_read() ? "reading" : "writing")
@@ -3214,7 +3216,6 @@ os_file_pwrite(
 	os_offset_t		offset,
 	dberr_t*		err)
 {
-	ut_ad(type.validate());
 	ut_ad(type.is_write());
 
 	++os_n_file_writes;
@@ -3248,7 +3249,6 @@ os_file_write_func(
 {
 	dberr_t		err;
 
-	ut_ad(type.validate());
 	ut_ad(n > 0);
 
 	WAIT_ALLOW_WRITES();
@@ -3338,7 +3338,6 @@ os_file_read_page(
 
 	os_bytes_read_since_printout += n;
 
-	ut_ad(type.validate());
 	ut_ad(n > 0);
 
 	ssize_t	n_bytes = os_file_pread(type, file, buf, n, offset, &err);
@@ -3537,13 +3536,6 @@ short_warning:
 @return true if the file system supports sparse files */
 IF_WIN(static,) bool os_is_sparse_file_supported(os_file_t fh)
 {
-	/* In this debugging mode, we act as if punch hole is supported,
-	then we skip any calls to actually punch a hole.  In this way,
-	Transparent Page Compression is still being tested. */
-	DBUG_EXECUTE_IF("ignore_punch_hole",
-		return(true);
-	);
-
 #ifdef _WIN32
 	FILE_ATTRIBUTE_TAG_INFO info;
 	if (GetFileInformationByHandleEx(fh, FileAttributeTagInfo,
@@ -3663,13 +3655,9 @@ fallback:
 			n_bytes = buf_size;
 		}
 
-		dberr_t		err;
-		IORequest	request(IORequest::WRITE);
-
-		err = os_file_write(
-			request, name, file, buf, current_size, n_bytes);
-
-		if (err != DB_SUCCESS) {
+		if (os_file_write(IORequestWrite, name,
+				  file, buf, current_size, n_bytes) !=
+		    DB_SUCCESS) {
 			break;
 		}
 
@@ -3792,27 +3780,13 @@ os_file_punch_hole(
 #endif /* _WIN32 */
 }
 
-inline bool IORequest::should_punch_hole() const
-{
-	return m_fil_node && m_fil_node->space->punch_hole;
-}
-
 /** Free storage space associated with a section of the file.
-@param[in]	fh		Open file handle
-@param[in]	off		Starting offset (SEEK_SET)
-@param[in]	len		Size of the hole
+@param off   byte offset from the start (SEEK_SET)
+@param len   size of the hole in bytes
 @return DB_SUCCESS or error code */
-dberr_t
-IORequest::punch_hole(os_file_t fh, os_offset_t off, ulint len)
+dberr_t IORequest::punch_hole(os_offset_t off, ulint len) const
 {
-	/* In this debugging mode, we act as if punch hole is supported,
-	and then skip any calls to actually punch a hole here.
-	In this way, Transparent Page Compression is still being tested. */
-	DBUG_EXECUTE_IF("ignore_punch_hole",
-		return(DB_SUCCESS);
-	);
-
-	ulint trim_len = get_trim_length(len);
+	ulint trim_len = bpage ? bpage->physical_size() - len : 0;
 
 	if (trim_len == 0) {
 		return(DB_SUCCESS);
@@ -3822,11 +3796,11 @@ IORequest::punch_hole(os_file_t fh, os_offset_t off, ulint len)
 
 	/* Check does file system support punching holes for this
 	tablespace. */
-	if (!should_punch_hole()) {
+	if (!node->space->punch_hole) {
 		return DB_IO_NO_PUNCH_HOLE;
 	}
 
-	dberr_t err = os_file_punch_hole(fh, off, trim_len);
+	dberr_t err = os_file_punch_hole(node->handle, off, trim_len);
 
 	if (err == DB_SUCCESS) {
 		srv_stats.page_compressed_trim_op.inc();
@@ -3834,9 +3808,7 @@ IORequest::punch_hole(os_file_t fh, os_offset_t off, ulint len)
 		/* If punch hole is not supported,
 		set space so that it is not used. */
 		if (err == DB_IO_NO_PUNCH_HOLE) {
-			if (m_fil_node) {
-				m_fil_node->space->punch_hole = false;
-			}
+			node->space->punch_hole = false;
 			err = DB_SUCCESS;
 		}
 	}
@@ -3885,26 +3857,28 @@ os_file_get_status(
 }
 
 
-extern void fil_aio_callback(os_aio_userdata_t *data);
+extern void fil_aio_callback(const IORequest &request);
 
-static void io_callback(tpool::aiocb* cb)
+static void io_callback(tpool::aiocb *cb)
 {
-	ut_a(cb->m_err == DB_SUCCESS);
-	os_aio_userdata_t data(cb->m_userdata);
-	/* Return cb back to cache*/
-	if (cb->m_opcode == tpool::aio_opcode::AIO_PREAD) {
-		if (read_slots->contains(cb)) {
-			read_slots->release(cb);
-		}	else {
-			ut_ad(ibuf_slots->contains(cb));
-			ibuf_slots->release(cb);
-		}
-	} else	{
-		ut_ad(write_slots->contains(cb));
-		write_slots->release(cb);
-	}
+  ut_a(cb->m_err == DB_SUCCESS);
+  const IORequest &request= *static_cast<const IORequest*>
+    (static_cast<const void*>(cb->m_userdata));
 
-	fil_aio_callback(&data);
+  /* Return cb back to cache*/
+  if (cb->m_opcode == tpool::aio_opcode::AIO_PREAD)
+  {
+    ut_ad(read_slots->contains(cb));
+    fil_aio_callback(request);
+    read_slots->release(cb);
+  }
+  else
+  {
+    ut_ad(write_slots->contains(cb));
+    const IORequest req{request};
+    write_slots->release(cb);
+    fil_aio_callback(req);
+  }
 }
 
 #ifdef LINUX_NATIVE_AIO
@@ -3913,7 +3887,6 @@ versions where native aio is supported it won't work on tmpfs. In such
 cases we can't use native aio.
 
 @return: true if supported, false otherwise. */
-#include <libaio.h>
 static bool is_linux_native_aio_supported()
 {
 	File		fd;
@@ -4035,50 +4008,52 @@ static bool is_linux_native_aio_supported()
 }
 #endif
 
-
-
-bool os_aio_init(ulint n_reader_threads, ulint n_writer_threads, ulint)
+int os_aio_init()
 {
-  int max_write_events= int(n_writer_threads * OS_AIO_N_PENDING_IOS_PER_THREAD);
-  int max_read_events= int(n_reader_threads * OS_AIO_N_PENDING_IOS_PER_THREAD);
-	int max_ibuf_events = 1 * OS_AIO_N_PENDING_IOS_PER_THREAD;
-	int max_events = max_read_events + max_write_events + max_ibuf_events;
-	int ret;
-
+  int max_write_events= int(srv_n_write_io_threads *
+                            OS_AIO_N_PENDING_IOS_PER_THREAD);
+  int max_read_events= int(srv_n_read_io_threads *
+                           OS_AIO_N_PENDING_IOS_PER_THREAD);
+  int max_events= max_read_events + max_write_events;
+  int ret;
 #if LINUX_NATIVE_AIO
-	if (srv_use_native_aio && !is_linux_native_aio_supported())
-		srv_use_native_aio = false;
+  if (srv_use_native_aio && !is_linux_native_aio_supported())
+    goto disable;
 #endif
-	ret = srv_thread_pool->configure_aio(srv_use_native_aio, max_events);
-	if(ret) {
-		ut_a(srv_use_native_aio);
-		srv_use_native_aio = false;
+
+  ret= srv_thread_pool->configure_aio(srv_use_native_aio, max_events);
+
 #ifdef LINUX_NATIVE_AIO
-		ib::info() << "Linux native AIO disabled";
+  if (ret)
+  {
+    ut_ad(srv_use_native_aio);
+disable:
+    ib::warn() << "Linux Native AIO disabled.";
+    srv_use_native_aio= false;
+    ret= srv_thread_pool->configure_aio(false, max_events);
+  }
 #endif
-		ret = srv_thread_pool->configure_aio(srv_use_native_aio, max_events);
-		DBUG_ASSERT(!ret);
-	}
-	read_slots = new io_slots(max_read_events, (uint)n_reader_threads);
-	write_slots = new io_slots(max_write_events, (uint)n_writer_threads);
-	ibuf_slots = new io_slots(max_ibuf_events, 1);
-	return true;
+
+  if (!ret)
+  {
+    read_slots= new io_slots(max_read_events, srv_n_read_io_threads);
+    write_slots= new io_slots(max_write_events, srv_n_write_io_threads);
+  }
+  return ret;
 }
+
 
 void os_aio_free()
 {
   srv_thread_pool->disable_aio();
   delete read_slots;
   delete write_slots;
-  delete ibuf_slots;
   read_slots= nullptr;
   write_slots= nullptr;
-  ibuf_slots= nullptr;
 }
 
-/** Waits until there are no pending writes. There can
-be other, synchronous, pending writes. */
-void os_aio_wait_until_no_pending_writes()
+/** Wait until there are no pending asynchronous writes. */
+static void os_aio_wait_until_no_pending_writes_low()
 {
   bool notify_wait = write_slots->pending_io_count() > 0;
 
@@ -4091,102 +4066,96 @@ void os_aio_wait_until_no_pending_writes()
      tpool::tpool_wait_end();
 }
 
-
-/**
-NOTE! Use the corresponding macro os_aio(), not directly this function!
-Requests an asynchronous i/o operation.
-@param[in,out]	type		IO request context
-@param[in]	mode		IO mode
-@param[in]	name		Name of the file or path as NUL terminated
-				string
-@param[in]	file		Open file handle
-@param[out]	buf		buffer where to read
-@param[in]	offset		file offset where to read
-@param[in]	n		number of bytes to read
-@param[in]	read_only	if true read only mode checks are enforced
-@param[in,out]	m1		Message for the AIO handler, (can be used to
-				identify a completed AIO operation); ignored
-				if mode is OS_AIO_SYNC
-@param[in,out]	m2		message for the AIO handler (can be used to
-				identify a completed AIO operation); ignored
-				if mode is OS_AIO_SYNC
-
-@return DB_SUCCESS or error code */
-dberr_t
-os_aio_func(
-	IORequest&	type,
-	ulint		mode,
-	const char*	name,
-	pfs_os_file_t	file,
-	void*		buf,
-	os_offset_t	offset,
-	ulint		n,
-	bool		read_only,
-	fil_node_t*	m1,
-	void*		m2)
+/** Waits until there are no pending writes. There can
+be other, synchronous, pending writes. */
+void os_aio_wait_until_no_pending_writes()
 {
+  os_aio_wait_until_no_pending_writes_low();
+  buf_dblwr.wait_flush_buffered_writes();
+}
 
+/** Wait until all pending asynchronous reads have completed. */
+void os_aio_wait_until_no_pending_reads()
+{
+  read_slots->wait();
+}
+
+/** Request a read or write.
+@param type		I/O request
+@param buf		buffer
+@param offset		file offset
+@param n		number of bytes
+@retval DB_SUCCESS if request was queued successfully
+@retval DB_IO_ERROR on I/O error */
+dberr_t os_aio(const IORequest &type, void *buf, os_offset_t offset, size_t n)
+{
 	ut_ad(n > 0);
 	ut_ad((n % OS_FILE_LOG_BLOCK_SIZE) == 0);
 	ut_ad((offset % OS_FILE_LOG_BLOCK_SIZE) == 0);
+	ut_ad(type.is_read() || type.is_write());
+	ut_ad(type.node);
+	ut_ad(type.node->is_open());
 
 #ifdef WIN_ASYNC_IO
 	ut_ad((n & 0xFFFFFFFFUL) == n);
 #endif /* WIN_ASYNC_IO */
 
-	DBUG_EXECUTE_IF("ib_os_aio_func_io_failure_28",
-			mode = OS_AIO_SYNC; os_has_said_disk_full = FALSE;);
+#ifdef UNIV_PFS_IO
+	PSI_file_locker_state state;
+	PSI_file_locker* locker= nullptr;
+	register_pfs_file_io_begin(&state, locker, type.node->handle, n,
+				   type.is_write()
+				   ? PSI_FILE_WRITE : PSI_FILE_READ,
+				   __FILE__, __LINE__);
+#endif /* UNIV_PFS_IO */
+	dberr_t err = DB_SUCCESS;
 
-	if (mode == OS_AIO_SYNC) {
-		if (type.is_read()) {
-			return(os_file_read_func(type, file, buf, offset, n));
-		}
-
-		ut_ad(type.is_write());
-
-		return(os_file_write_func(type, name, file, buf, offset, n));
+	if (!type.is_async()) {
+		err = type.is_read()
+			? os_file_read_func(type, type.node->handle,
+					    buf, offset, n)
+			: os_file_write_func(type, type.node->name,
+					     type.node->handle,
+					     buf, offset, n);
+func_exit:
+#ifdef UNIV_PFS_IO
+		register_pfs_file_io_end(locker, n);
+#endif /* UNIV_PFS_IO */
+		return err;
 	}
 
 	if (type.is_read()) {
-			++os_n_file_reads;
-	} else if (type.is_write()) {
-			++os_n_file_writes;
+		++os_n_file_reads;
 	} else {
-		ut_error;
+		++os_n_file_writes;
 	}
 
-	compile_time_assert(sizeof(os_aio_userdata_t) <= tpool::MAX_AIO_USERDATA_LEN);
-	os_aio_userdata_t userdata{m1,type,m2};
-	io_slots* slots;
-	if (type.is_read()) {
-		slots = mode == OS_AIO_IBUF?ibuf_slots: read_slots;
-	} else {
-		slots = write_slots;
-	}
+	compile_time_assert(sizeof(IORequest) <= tpool::MAX_AIO_USERDATA_LEN);
+	io_slots* slots= type.is_read() ? read_slots : write_slots;
 	tpool::aiocb* cb = slots->acquire();
 
 	cb->m_buffer = buf;
 	cb->m_callback = (tpool::callback_func)io_callback;
 	cb->m_group = slots->get_task_group();
-	cb->m_fh = file.m_file;
+	cb->m_fh = type.node->handle.m_file;
 	cb->m_len = (int)n;
 	cb->m_offset = offset;
 	cb->m_opcode = type.is_read() ? tpool::aio_opcode::AIO_PREAD : tpool::aio_opcode::AIO_PWRITE;
-	memcpy(cb->m_userdata, &userdata, sizeof(userdata));
+	new (cb->m_userdata) IORequest{type};
 
 	ut_a(reinterpret_cast<size_t>(cb->m_buffer) % OS_FILE_LOG_BLOCK_SIZE
 	     == 0);
 	ut_a(cb->m_len % OS_FILE_LOG_BLOCK_SIZE == 0);
 	ut_a(cb->m_offset % OS_FILE_LOG_BLOCK_SIZE == 0);
 
-	if (!srv_thread_pool->submit_io(cb))
-		return DB_SUCCESS;
+	if (srv_thread_pool->submit_io(cb)) {
+		slots->release(cb);
+		os_file_handle_error(type.node->name, type.is_read()
+				     ? "aio read" : "aio write");
+		err = DB_IO_ERROR;
+	}
 
-	slots->release(cb);
-
-	os_file_handle_error(name, type.is_read() ? "aio read" : "aio write");
-
-	return(DB_IO_ERROR);
+	goto func_exit;
 }
 
 /** Prints info of the aio arrays.
@@ -4197,8 +4166,8 @@ os_aio_print(FILE*	file)
 	time_t		current_time;
 	double		time_elapsed;
 
-	for (ulint i = 0; i < srv_n_file_io_threads; ++i) {
-		fprintf(file, "I/O thread " ULINTPF " state: %s (%s)",
+	for (uint i = 0; i < srv_n_file_io_threads; ++i) {
+		fprintf(file, "I/O thread %u state: %s (%s)",
 			i,
 			srv_io_thread_op_info[i],
 			srv_io_thread_function[i]);
@@ -4220,8 +4189,8 @@ os_aio_print(FILE*	file)
 		ULINTPF " OS file writes, "
 		ULINTPF " OS fsyncs\n",
 		log_sys.get_pending_flushes(),
-		fil_n_pending_tablespace_flushes,
-		os_n_file_reads,
+		ulint{fil_n_pending_tablespace_flushes},
+		ulint{os_n_file_reads},
 		os_n_file_writes,
 		os_n_fsyncs);
 
@@ -4288,72 +4257,152 @@ os_file_set_umask(ulint umask)
 }
 
 #ifdef _WIN32
-static int win32_get_block_size(HANDLE volume_handle, const char *volume_name)
+
+/* Checks whether physical drive is on SSD.*/
+static bool is_drive_on_ssd(DWORD nr)
 {
-  STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR disk_alignment;
-  STORAGE_PROPERTY_QUERY storage_query;
-  DWORD tmp;
+  char physical_drive_path[32];
+  snprintf(physical_drive_path, sizeof(physical_drive_path),
+           "\\\\.\\PhysicalDrive%lu", nr);
 
-  memset(&storage_query, 0, sizeof(storage_query));
-  storage_query.PropertyId = StorageAccessAlignmentProperty;
-  storage_query.QueryType = PropertyStandardQuery;
+  HANDLE h= CreateFile(physical_drive_path, 0,
+                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                 nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (h == INVALID_HANDLE_VALUE)
+    return false;
 
-  if (os_win32_device_io_control(volume_handle,
-    IOCTL_STORAGE_QUERY_PROPERTY,
-    &storage_query,
-    sizeof storage_query,
-    &disk_alignment,
-    sizeof disk_alignment,
-    &tmp) &&  tmp == sizeof disk_alignment) {
-      return disk_alignment.BytesPerPhysicalSector;
-  }
-
-  switch (GetLastError()) {
-    case ERROR_INVALID_FUNCTION:
-    case ERROR_NOT_SUPPORTED:
-      break;
-    default:
-      os_file_handle_error_no_exit(
-        volume_name,
-        "DeviceIoControl(IOCTL_STORAGE_QUERY_PROPERTY / StorageAccessAlignmentProperty)",
-        FALSE);
-   }
-   return 512;
-}
-
-static bool win32_is_ssd(HANDLE volume_handle)
-{
-  DWORD tmp;
   DEVICE_SEEK_PENALTY_DESCRIPTOR seek_penalty;
-  STORAGE_PROPERTY_QUERY storage_query;
-  memset(&storage_query, 0, sizeof(storage_query));
+  STORAGE_PROPERTY_QUERY storage_query{};
+  storage_query.PropertyId= StorageDeviceSeekPenaltyProperty;
+  storage_query.QueryType= PropertyStandardQuery;
 
-  storage_query.PropertyId = StorageDeviceSeekPenaltyProperty;
-  storage_query.QueryType = PropertyStandardQuery;
-
-  if (os_win32_device_io_control(volume_handle,
-    IOCTL_STORAGE_QUERY_PROPERTY,
-    &storage_query,
-    sizeof storage_query,
-    &seek_penalty,
-    sizeof seek_penalty,
-    &tmp) && tmp == sizeof(seek_penalty)){
-      return !seek_penalty.IncursSeekPenalty;
+  bool on_ssd= false;
+  DWORD bytes_written;
+  if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &storage_query,
+                      sizeof storage_query, &seek_penalty, sizeof seek_penalty,
+                      &bytes_written, nullptr))
+  {
+    on_ssd= seek_penalty.IncursSeekPenalty;
   }
-
-  DEVICE_TRIM_DESCRIPTOR trim;
-  storage_query.PropertyId = StorageDeviceTrimProperty;
-  if (os_win32_device_io_control(volume_handle,
-    IOCTL_STORAGE_QUERY_PROPERTY,
-    &storage_query,
-    sizeof storage_query,
-    &trim,
-    sizeof trim,
-    &tmp) && tmp == sizeof trim) {
-      return trim.TrimEnabled;
+  else
+  {
+    on_ssd= false;
   }
-  return false;
+  CloseHandle(h);
+  return on_ssd;
 }
+
+/*
+  Checks whether volume is on SSD, by checking all physical drives
+  in that volume.
+*/
+static bool is_volume_on_ssd(const char *volume_mount_point)
+{
+  char volume_name[MAX_PATH];
+
+  if (!GetVolumeNameForVolumeMountPoint(volume_mount_point, volume_name,
+                                        array_elements(volume_name)))
+  {
+    /* This can fail, e.g if file is on network share */
+    return false;
+  }
+
+  /* Chomp last backslash, this is needed to open volume.*/
+  size_t length= strlen(volume_name);
+  if (length && volume_name[length - 1] == '\\')
+    volume_name[length - 1]= 0;
+
+  /* Open volume handle */
+  HANDLE volume_handle= CreateFile(
+      volume_name, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+
+  if (volume_handle == INVALID_HANDLE_VALUE)
+    return false;
+
+  /*
+   Enumerate all volume extends, check whether all of them are on SSD
+  */
+
+  /* Anticipate common case where there is only one extent.*/
+  VOLUME_DISK_EXTENTS single_extent;
+
+  /* But also have a place to manage allocated data.*/
+  std::unique_ptr<BYTE[]> lifetime;
+
+  DWORD bytes_written;
+  VOLUME_DISK_EXTENTS *extents= nullptr;
+  if (DeviceIoControl(volume_handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                      nullptr, 0, &single_extent, sizeof(single_extent),
+                      &bytes_written, nullptr))
+  {
+    /* Worked on the first try. Use the preallocated buffer.*/
+    extents= &single_extent;
+  }
+  else
+  {
+    VOLUME_DISK_EXTENTS *last_query= &single_extent;
+    while (GetLastError() == ERROR_MORE_DATA)
+    {
+      DWORD extentCount= last_query->NumberOfDiskExtents;
+      DWORD allocatedSize=
+          FIELD_OFFSET(VOLUME_DISK_EXTENTS, Extents[extentCount]);
+      lifetime.reset(new BYTE[allocatedSize]);
+      last_query= (VOLUME_DISK_EXTENTS *) lifetime.get();
+      if (DeviceIoControl(volume_handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                          nullptr, 0, last_query, allocatedSize,
+                          &bytes_written, nullptr))
+      {
+        extents= last_query;
+        break;
+      }
+    }
+  }
+  CloseHandle(volume_handle);
+  if (!extents)
+    return false;
+
+  for (DWORD i= 0; i < extents->NumberOfDiskExtents; i++)
+    if (!is_drive_on_ssd(extents->Extents[i].DiskNumber))
+      return false;
+
+  return true;
+}
+
+#include <unordered_map>
+static bool is_file_on_ssd(char *file_path)
+{
+  /* Cache of volume_path => volume_info, protected by rwlock.*/
+  static std::unordered_map<std::string, bool> cache;
+  static SRWLOCK lock= SRWLOCK_INIT;
+
+  /* Preset result, in case something fails, e.g we're on network drive.*/
+  char volume_path[MAX_PATH];
+  if (!GetVolumePathName(file_path, volume_path, array_elements(volume_path)))
+    return false;
+
+  /* Try cached volume info first.*/
+  std::string volume_path_str(volume_path);
+  bool found;
+  bool result;
+  AcquireSRWLockShared(&lock);
+  auto e= cache.find(volume_path_str);
+  if ((found= e != cache.end()))
+    result= e->second;
+  ReleaseSRWLockShared(&lock);
+
+  if (found)
+    return result;
+
+  result= is_volume_on_ssd(volume_path);
+
+  /* Update cache */
+  AcquireSRWLockExclusive(&lock);
+  cache[volume_path_str]= result;
+  ReleaseSRWLockExclusive(&lock);
+  return result;
+}
+
 #endif
 
 /** Determine some file metadata when creating or reading the file.
@@ -4390,48 +4439,12 @@ void fil_node_t::find_metadata(os_file_t file
 	space->atomic_write_supported = space->purpose == FIL_TYPE_TEMPORARY
 		|| space->purpose == FIL_TYPE_IMPORT;
 #ifdef _WIN32
-	block_size = 512;
-	on_ssd = false;
-	// Open volume for this file, find out it "physical bytes per sector"
-	char volume[MAX_PATH + 4];
-	if (!GetVolumePathName(name, volume + 4, MAX_PATH)) {
-		os_file_handle_error_no_exit(name,
-			"GetVolumePathName()", FALSE);
-		return;
-	}
-	// Special prefix required for volume names.
-	memcpy(volume, "\\\\.\\", 4);
-
-	size_t len = strlen(volume);
-	if (volume[len - 1] == '\\') {
-		// Trim trailing backslash from volume name.
-		volume[len - 1] = 0;
-	}
-
-	HANDLE volume_handle = CreateFile(volume, FILE_READ_ATTRIBUTES,
-		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-		0, OPEN_EXISTING, 0, 0);
-
-	if (volume_handle != INVALID_HANDLE_VALUE) {
-		block_size = win32_get_block_size(volume_handle, volume);
-		on_ssd = win32_is_ssd(volume_handle);
-		CloseHandle(volume_handle);
+	on_ssd = is_file_on_ssd(name);
+	FILE_STORAGE_INFO info;
+	if (GetFileInformationByHandleEx(
+		file, FileStorageInfo, &info, sizeof(info))) {
+		block_size = info.PhysicalBytesPerSectorForAtomicity;
 	} else {
-		/*
-		Report error, unless it is expected, e.g
-		missing permissions, or error when trying to
-		open volume for UNC share.
-		*/
-		if (GetLastError() != ERROR_ACCESS_DENIED
-		    && GetDriveType(volume) == DRIVE_FIXED) {
-			    os_file_handle_error_no_exit(volume, "CreateFile()", FALSE);
-		}
-	}
-
-	/* Currently we support file block size up to 4KiB */
-	if (block_size > 4096) {
-		block_size = 4096;
-	} else if (block_size < 512) {
 		block_size = 512;
 	}
 #else
@@ -4470,12 +4483,11 @@ void fil_node_t::find_metadata(os_file_t file
 }
 
 /** Read the first page of a data file.
-@param[in]	first	whether this is the very first read
 @return	whether the page was found valid */
-bool fil_node_t::read_page0(bool first)
+bool fil_node_t::read_page0()
 {
-	ut_ad(mutex_own(&fil_system.mutex));
-	const ulint psize = space->physical_size();
+	mysql_mutex_assert_owner(&fil_system.mutex);
+	const unsigned psize = space->physical_size();
 #ifndef _WIN32
 	struct stat statbuf;
 	if (fstat(handle, &statbuf)) {
@@ -4487,7 +4499,7 @@ bool fil_node_t::read_page0(bool first)
 	os_offset_t size_bytes = os_file_get_size(handle);
 	ut_a(size_bytes != (os_offset_t) -1);
 #endif
-	const ulint min_size = FIL_IBD_FILE_INITIAL_SIZE * psize;
+	const uint32_t min_size = FIL_IBD_FILE_INITIAL_SIZE * psize;
 
 	if (size_bytes < min_size) {
 		ib::error() << "The size of the file " << name
@@ -4511,10 +4523,10 @@ corrupted:
 		? ULINT_UNDEFINED
 		: mach_read_from_4(FIL_PAGE_SPACE_ID + page);
 	ulint flags = fsp_header_get_flags(page);
-	const ulint size = fsp_header_get_field(page, FSP_SIZE);
-	const ulint free_limit = fsp_header_get_field(page, FSP_FREE_LIMIT);
-	const ulint free_len = flst_get_len(FSP_HEADER_OFFSET + FSP_FREE
-					    + page);
+	const uint32_t size = fsp_header_get_field(page, FSP_SIZE);
+	const uint32_t free_limit = fsp_header_get_field(page, FSP_FREE_LIMIT);
+	const uint32_t free_len = flst_get_len(FSP_HEADER_OFFSET + FSP_FREE
+					       + page);
 	if (!fil_space_t::is_valid_flags(flags, space->id)) {
 		ulint cflags = fsp_flags_convert_from_101(flags);
 		if (cflags == ULINT_UNDEFINED) {
@@ -4554,41 +4566,26 @@ invalid:
 		return false;
 	}
 
-	if (first) {
-		ut_ad(space->id != TRX_SYS_SPACE);
 #ifdef UNIV_LINUX
-		find_metadata(handle, &statbuf);
+	find_metadata(handle, &statbuf);
 #else
-		find_metadata();
+	find_metadata();
 #endif
+	/* Truncate the size to a multiple of extent size. */
+	ulint	mask = psize * FSP_EXTENT_SIZE - 1;
 
-		/* Truncate the size to a multiple of extent size. */
-		ulint	mask = psize * FSP_EXTENT_SIZE - 1;
-
-		if (size_bytes <= mask) {
-			/* .ibd files start smaller than an
-			extent size. Do not truncate valid data. */
-		} else {
-			size_bytes &= ~os_offset_t(mask);
-		}
-
-		space->flags = (space->flags & FSP_FLAGS_MEM_MASK) | flags;
-
-		space->punch_hole = space->is_compressed();
-		this->size = ulint(size_bytes / psize);
-		space->committed_size = space->size += this->size;
-	} else if (space->id != TRX_SYS_SPACE || space->size_in_header) {
-		/* If this is not the first-time open, do nothing.
-		For the system tablespace, we always get invoked as
-		first=false, so we detect the true first-time-open based
-		on size_in_header and proceed to initialize the data. */
-		return true;
+	if (size_bytes <= mask) {
+		/* .ibd files start smaller than an
+		extent size. Do not truncate valid data. */
 	} else {
-		/* Initialize the size of predefined tablespaces
-		to FSP_SIZE. */
-		space->committed_size = size;
+		size_bytes &= ~os_offset_t(mask);
 	}
 
+	space->flags = (space->flags & FSP_FLAGS_MEM_MASK) | flags;
+
+	space->punch_hole = space->is_compressed();
+	this->size = uint32_t(size_bytes / psize);
+	space->set_sizes(this->size);
 	ut_ad(space->free_limit == 0 || space->free_limit == free_limit);
 	ut_ad(space->free_len == 0 || space->free_len == free_len);
 	space->size_in_header = size;

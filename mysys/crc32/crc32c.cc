@@ -26,11 +26,6 @@ static inline uint32_t DecodeFixed32(const char *ptr)
   return uint4korr(ptr);
 }
 
-static inline uint64_t DecodeFixed64(const char *ptr)
-{
-  return uint8korr(ptr);
-}
-
 #include <stdint.h>
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -343,6 +338,12 @@ static inline uint32_t LE_LOAD32(const uint8_t *p) {
 }
 
 #if defined(HAVE_SSE42) && (SIZEOF_SIZE_T == 8)
+
+static inline uint64_t DecodeFixed64(const char *ptr)
+{
+  return uint8korr(ptr);
+}
+
 static inline uint64_t LE_LOAD64(const uint8_t *p) {
   return DecodeFixed64(reinterpret_cast<const char*>(p));
 }
@@ -364,7 +365,7 @@ static inline void Slow_CRC32(uint64_t* l, uint8_t const **p) {
   table0_[c >> 24];
 }
 
-static inline void Fast_CRC32(uint64_t* l, uint8_t const **p) {
+__attribute__((unused)) static inline void Fast_CRC32(uint64_t* l, uint8_t const **p) {
 #ifndef HAVE_SSE42
   Slow_CRC32(l, p);
 #elif (SIZEOF_SIZE_T == 8)
@@ -472,6 +473,21 @@ static int arch_ppc_probe(void) {
 #if defined(__powerpc64__)
   if (getauxval(AT_HWCAP2) & PPC_FEATURE2_VEC_CRYPTO) arch_ppc_crc32 = 1;
 #endif /* __powerpc64__ */
+
+  return arch_ppc_crc32;
+}
+#elif __FreeBSD_version >= 1200000
+#include <machine/cpu.h>
+#include <sys/auxv.h>
+#include <sys/elf_common.h>
+static int arch_ppc_probe(void) {
+  unsigned long cpufeatures;
+  arch_ppc_crc32 = 0;
+
+#if defined(__powerpc64__)
+  elf_aux_info(AT_HWCAP2, &cpufeatures, sizeof(cpufeatures));
+  if (cpufeatures & PPC_FEATURE2_HAS_VEC_CRYPTO) arch_ppc_crc32 = 1;
+#endif  /* __powerpc64__ */
 
   return arch_ppc_crc32;
 }

@@ -29,6 +29,7 @@
 #include "wsrep_utils.h"
 #include "wsrep_xid.h"
 #include "wsrep_thd.h"
+#include "wsrep_mysqld.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -308,12 +309,40 @@ bool wsrep_before_SE()
 }
 
 // Signal end of SST
-static void wsrep_sst_complete (THD*                thd,
-                                int const           rcode)
+static bool wsrep_sst_complete (THD*                thd,
+                                int const           rcode,
+                                wsrep::gtid const   sst_gtid)
 {
   Wsrep_client_service client_service(thd, thd->wsrep_cs());
-  Wsrep_server_state::instance().sst_received(client_service, rcode);
+  Wsrep_server_state& server_state= Wsrep_server_state::instance();
+  enum wsrep::server_state::state state= server_state.state();
+  bool failed= false;
+  char start_pos_buf[FN_REFLEN];
+  ssize_t len= wsrep::print_to_c_str(sst_gtid, start_pos_buf, FN_REFLEN-1);
+  start_pos_buf[len]='\0';
+
+  // Do not call sst_received if we are not in joiner or
+  // initialized state on server. This is because it
+  // assumes we are on those states. Give error if we are
+  // in incorrect state.
+  if ((state == Wsrep_server_state::s_joiner ||
+       state == Wsrep_server_state::s_initialized))
+  {
+    Wsrep_server_state::instance().sst_received(client_service,
+       rcode);
+    WSREP_INFO("SST succeeded for position %s", start_pos_buf);
+  }
+  else
+  {
+    WSREP_ERROR("SST failed for position %s initialized %d server_state %s",
+                start_pos_buf,
+                server_state.is_initialized(),
+                wsrep::to_c_string(state));
+    failed= true;
+  }
+
   wsrep_joiner_monitor_end();
+  return failed;
 }
 
   /*
@@ -325,13 +354,15 @@ static void wsrep_sst_complete (THD*                thd,
   @param seqno     [IN]               Initial state sequence number
   @param state     [IN]               Always NULL, also ignored by wsrep provider (?)
   @param state_len [IN]               Always 0, also ignored by wsrep provider (?)
+  @return true when successful, false if error
 */
-void wsrep_sst_received (THD*                thd,
+bool wsrep_sst_received (THD*                thd,
                          const wsrep_uuid_t& uuid,
                          wsrep_seqno_t const seqno,
                          const void* const   state,
                          size_t const        state_len)
 {
+  bool error= false;
   /*
     To keep track of whether the local uuid:seqno should be updated. Also, note
     that local state (uuid:seqno) is updated/checkpointed only after we get an
@@ -371,8 +402,10 @@ void wsrep_sst_received (THD*                thd,
     if (WSREP_ON)
     {
       int const rcode(seqno < 0 ? seqno : 0);
-      wsrep_sst_complete(thd,rcode);
+      error= wsrep_sst_complete(thd,rcode, sst_gtid);
     }
+
+    return error;
 }
 
 static int sst_scan_uuid_seqno (const char* str,
@@ -596,6 +629,7 @@ static void* sst_joiner_thread (void* a)
             goto err;
           } else {
             wsrep_gtid_server.domain_id= (uint32) domain_id;
+            wsrep_gtid_domain_id= (uint32)domain_id;
           }
         }
       }
@@ -653,7 +687,7 @@ err:
     /* Read committed isolation to avoid gap locking */
     thd->variables.tx_isolation= ISO_READ_COMMITTED;
 
-    wsrep_sst_complete (thd, -err);
+    wsrep_sst_complete (thd, -err, ret_gtid);
 
     delete thd;
     my_thread_end();
@@ -1825,6 +1859,35 @@ static int sst_donate_other (const char*        method,
   return arg.err;
 }
 
+/* return true if character can be a part of a filename */
+static bool filename_char(int const c)
+{
+  return isalnum(c) || (c == '-') || (c == '_') || (c == '.');
+}
+
+/* return true if character can be a part of an address string */
+static bool address_char(int const c)
+{
+  return filename_char(c) ||
+         (c == ':') || (c == '[') || (c == ']') || (c == '/');
+}
+
+static bool check_request_str(const char* const str,
+                              bool (*check) (int c))
+{
+  for (size_t i(0); str[i] != '\0'; ++i)
+  {
+    if (!check(str[i]))
+    {
+      WSREP_WARN("Illegal character in state transfer request: %i (%c).",
+                 str[i], str[i]);
+      return true;
+    }
+  }
+
+  return false;
+}
+
 int wsrep_sst_donate(const std::string& msg,
                      const wsrep::gtid& current_gtid,
                      const bool         bypass)
@@ -1836,7 +1899,20 @@ int wsrep_sst_donate(const std::string& msg,
 
   const char* method= msg.data();
   size_t method_len= strlen (method);
+
+  if (check_request_str(method, filename_char))
+  {
+    WSREP_ERROR("Bad SST method name. SST canceled.");
+    return WSREP_CB_FAILURE;
+  }
+
   const char* data= method + method_len + 1;
+
+  if (check_request_str(data, address_char))
+  {
+    WSREP_ERROR("Bad SST address string. SST canceled.");
+    return WSREP_CB_FAILURE;
+  }
 
   wsp::env env(NULL);
   if (env.error())

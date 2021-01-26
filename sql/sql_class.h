@@ -284,8 +284,9 @@ class Key_part_spec :public Sql_alloc {
 public:
   LEX_CSTRING field_name;
   uint length;
-  Key_part_spec(const LEX_CSTRING *name, uint len)
-    : field_name(*name), length(len)
+  bool generated;
+  Key_part_spec(const LEX_CSTRING *name, uint len, bool gen= false)
+    : field_name(*name), length(len), generated(gen)
   {}
   bool operator==(const Key_part_spec& other) const;
   /**
@@ -640,7 +641,6 @@ typedef struct system_variables
   ulonglong bulk_insert_buff_size;
   ulonglong join_buff_size;
   ulonglong sortbuff_size;
-  ulonglong group_concat_max_len;
   ulonglong default_regex_flags;
   ulonglong max_mem_used;
 
@@ -732,6 +732,8 @@ typedef struct system_variables
   */
   uint32     gtid_domain_id;
   uint64     gtid_seq_no;
+
+  uint group_concat_max_len;
 
   /**
     Default transaction access mode. READ ONLY (true) or READ WRITE (false).
@@ -929,6 +931,12 @@ typedef struct system_status_var
   ulong lost_connections;
   ulong max_statement_time_exceeded;
   /*
+   Number of times where column info was not
+   sent with prepared statement metadata.
+  */
+  ulong skip_metadata_count;
+
+  /*
     Number of statements sent from the client
   */
   ulong questions;
@@ -947,6 +955,7 @@ typedef struct system_status_var
   ulonglong table_open_cache_hits;
   ulonglong table_open_cache_misses;
   ulonglong table_open_cache_overflows;
+  ulonglong send_metadata_skips;
   double last_query_cost;
   double cpu_time, busy_time;
   uint32 threads_running;
@@ -1192,6 +1201,38 @@ public:
 
 class Server_side_cursor;
 
+/*
+  Struct to catch changes in column metadata that is sent to client. 
+  in the "result set metadata". Used to support 
+  MARIADB_CLIENT_CACHE_METADATA.
+*/
+struct send_column_info_state
+{
+  /* Last client charset (affects metadata) */
+  CHARSET_INFO *last_charset= nullptr;
+
+  /* Checksum, only used to check changes if 'immutable' is false*/
+  uint32 checksum= 0;
+
+  /*
+    Column info can only be changed by PreparedStatement::reprepare()
+ 
+    There is a class of "weird" prepared statements like SELECT ? or SELECT @a
+    that are not immutable, and depend on input parameters or user variables
+  */
+  bool immutable= false;
+
+  bool initialized= false;
+
+  /*  Used by PreparedStatement::reprepare()*/
+  void reset()
+  {
+    initialized= false;
+    checksum= 0;
+  }
+};
+
+
 /**
   @class Statement
   @brief State of a single command executed against this connection.
@@ -1281,6 +1322,8 @@ public:
 
   LEX_CSTRING db;
 
+  send_column_info_state column_info_state;
+ 
   /* This is set to 1 of last call to send_result_to_client() was ok */
   my_bool query_cache_is_applicable;
 
@@ -2311,7 +2354,10 @@ public:
     rpl_io_thread_info *rpl_io_info;
     rpl_sql_thread_info *rpl_sql_info;
   } system_thread_info;
+  /* Used for BACKUP LOCK */
   MDL_ticket *mdl_backup_ticket, *mdl_backup_lock;
+  /* Used to register that thread has a MDL_BACKUP_WAIT_COMMIT lock */
+  MDL_request *backup_commit_lock;
 
   void reset_for_next_command(bool do_clear_errors= 1);
   /*
@@ -2381,6 +2427,8 @@ public:
 
   /* Last created prepared statement */
   Statement *last_stmt;
+  Statement *cur_stmt= 0;
+
   inline void set_last_stmt(Statement *stmt)
   { last_stmt= (is_error() ? NULL : stmt); }
   inline void clear_last_stmt() { last_stmt= NULL; }
@@ -2758,9 +2806,13 @@ public:
     {
       free_root(&mem_root,MYF(0));
     }
-    my_bool is_active()
+    bool is_active()
     {
       return (all.ha_list != NULL);
+    }
+    bool is_empty()
+    {
+      return all.is_empty() && stmt.is_empty();
     }
     st_transactions()
     {
@@ -3411,7 +3463,7 @@ public:
   void update_all_stats();
   void update_stats(void);
   void change_user(void);
-  void cleanup(void);
+  void cleanup(bool have_mutex=false);
   void cleanup_after_query();
   void free_connection();
   void reset_for_reuse();
@@ -3439,7 +3491,7 @@ public:
   void awake_no_mutex(killed_state state_to_set);
   void awake(killed_state state_to_set)
   {
-    bool wsrep_on_local= WSREP_NNULL(this);
+    bool wsrep_on_local= variables.wsrep_on;
     /*
       mutex locking order (LOCK_thd_data - LOCK_thd_kill)) requires
       to grab LOCK_thd_data here
@@ -3483,6 +3535,7 @@ public:
                    char const *query, ulong query_len, bool is_trans,
                    bool direct, bool suppress_use,
                    int errcode);
+  bool binlog_current_query_unfiltered();
 #endif
 
   inline void
@@ -3765,10 +3818,17 @@ public:
   /* Commit both statement and full transaction */
   int commit_whole_transaction_and_close_tables();
   void give_protection_error();
+  /*
+    Give an error if any of the following is true for this connection
+    - BACKUP STAGE is active
+    - FLUSH TABLE WITH READ LOCK is active
+    - BACKUP LOCK table_name is active
+  */
   inline bool has_read_only_protection()
   {
     if (current_backup_stage == BACKUP_FINISHED &&
-        !global_read_lock.is_acquired())
+        !global_read_lock.is_acquired() &&
+        !mdl_backup_lock)
       return FALSE;
     give_protection_error();
     return TRUE;
@@ -4713,6 +4773,13 @@ public:
     locked_tables_mode= mode_arg;
   }
   void leave_locked_tables_mode();
+  /* Relesae transactional locks if there are no active transactions */
+  void release_transactional_locks()
+  {
+    if (!(server_status &
+          (SERVER_STATUS_IN_TRANS | SERVER_STATUS_IN_TRANS_READONLY)))
+      mdl_context.release_transactional_locks(this);
+  }
   int decide_logging_format(TABLE_LIST *tables);
   /*
    In Some cases when decide_logging_format is called it does not have all
@@ -6116,10 +6183,15 @@ class select_union_recursive :public select_unit
  public:
   /* The temporary table with the new records generated by one iterative step */
   TABLE *incr_table;
+  /* The TMP_TABLE_PARAM structure used to create incr_table */
+  TMP_TABLE_PARAM incr_table_param;
   /* One of tables from the list rec_tables (determined dynamically) */
   TABLE *first_rec_table_to_update;
-  /* The temporary tables used for recursive table references */
-  List<TABLE> rec_tables;
+  /*
+    The list of all recursive table references to the CTE for whose
+    specification this select_union_recursive was created
+ */
+  List<TABLE_LIST> rec_table_refs;
   /*
     The count of how many times cleanup() was called with cleaned==false
     for the unit specifying the recursive CTE for which this object was created
@@ -6129,7 +6201,8 @@ class select_union_recursive :public select_unit
 
   select_union_recursive(THD *thd_arg):
     select_unit(thd_arg),
-    incr_table(0), first_rec_table_to_update(0), cleanup_count(0) {};
+    incr_table(0), first_rec_table_to_update(0), cleanup_count(0)
+  { incr_table_param.init(); };
 
   int send_data(List<Item> &items);
   bool create_result_table(THD *thd, List<Item> *column_types,
@@ -6873,11 +6946,11 @@ public:
 /**
   SP Bulk execution safe
 */
-#define CF_SP_BULK_SAFE (1U << 20)
+#define CF_PS_ARRAY_BINDING_SAFE (1U << 20)
 /**
   SP Bulk execution optimized
 */
-#define CF_SP_BULK_OPTIMIZED (1U << 21)
+#define CF_PS_ARRAY_BINDING_OPTIMIZED (1U << 21)
 /**
   If command creates or drops a table
 */

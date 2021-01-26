@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2019, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2020, MariaDB Corporation.
+Copyright (c) 2017, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -38,6 +38,7 @@ Created 3/26/1996 Heikki Tuuri
 #include "trx0rseg.h"
 #include "row0row.h"
 #include "row0mysql.h"
+#include "row0ins.h"
 
 /** The search tuple corresponding to TRX_UNDO_INSERT_METADATA. */
 const dtuple_t trx_undo_metadata = {
@@ -53,15 +54,18 @@ const dtuple_t trx_undo_metadata = {
 /*=========== UNDO LOG RECORD CREATION AND DECODING ====================*/
 
 /** Calculate the free space left for extending an undo log record.
-@param[in]	undo_block	undo log page
-@param[in]	ptr		current end of the undo page
+@param undo_block    undo log page
+@param ptr           current end of the undo page
 @return bytes left */
-static ulint trx_undo_left(const buf_block_t* undo_block, const byte* ptr)
+static ulint trx_undo_left(const buf_block_t *undo_block, const byte *ptr)
 {
-	/* The 10 is a safety margin, in case we have some small
-	calculation error below */
-	return srv_page_size - ulint(ptr - undo_block->frame)
-		- (10 + FIL_PAGE_DATA_END);
+  ut_ad(ptr >= &undo_block->frame[TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_HDR_SIZE]);
+  /* The 10 is supposed to be an extra safety margin (and needed for
+  compatibility with older versions) */
+  lint left= srv_page_size - (ptr - undo_block->frame) -
+    (10 + FIL_PAGE_DATA_END);
+  ut_ad(left >= 0);
+  return left < 0 ? 0 : static_cast<ulint>(left);
 }
 
 /**********************************************************************//**
@@ -129,19 +133,34 @@ trx_undo_log_v_idx(
 {
 	ut_ad(pos < table->n_v_def);
 	dict_v_col_t*	vcol = dict_table_get_nth_v_col(table, pos);
-	ulint		n_idx = vcol->n_v_indexes;
 	byte*		old_ptr;
 
-	ut_ad(n_idx > 0);
+	ut_ad(!vcol->v_indexes.empty());
 
-	/* Size to reserve, max 5 bytes for each index id and position, plus
-	5 bytes for num of indexes, 2 bytes for write total length.
-	1 byte for undo log record format version marker */
-	ulint		size = n_idx * (5 + 5) + 5 + 2 + (first_v_col ? 1 : 0);
+	ulint		size = first_v_col ? 1 + 2 : 2;
+	const ulint	avail = trx_undo_left(undo_block, ptr);
 
-	if (trx_undo_left(undo_block, ptr) < size) {
+	/* The mach_write_compressed(ptr, flen) in
+	trx_undo_page_report_modify() will consume additional 1 to 5 bytes. */
+	if (avail < size + 5) {
 		return(NULL);
 	}
+
+	ulint n_idx = 0;
+	for (const auto& v_index : vcol->v_indexes) {
+		n_idx++;
+		/* FIXME: index->id is 64 bits! */
+		size += mach_get_compressed_size(uint32_t(v_index.index->id));
+		size += mach_get_compressed_size(v_index.nth_field);
+	}
+
+	size += mach_get_compressed_size(n_idx);
+
+	if (avail < size + 5) {
+		return(NULL);
+	}
+
+	ut_d(const byte* orig_ptr = ptr);
 
 	if (first_v_col) {
 		/* write the version marker */
@@ -158,10 +177,13 @@ trx_undo_log_v_idx(
 
 	for (const auto& v_index : vcol->v_indexes) {
 		ptr += mach_write_compressed(
-			ptr, static_cast<ulint>(v_index.index->id));
+			/* FIXME: index->id is 64 bits! */
+			ptr, uint32_t(v_index.index->id));
 
 		ptr += mach_write_compressed(ptr, v_index.nth_field);
 	}
+
+	ut_ad(orig_ptr + size == ptr);
 
 	mach_write_to_2(old_ptr, ulint(ptr - old_ptr));
 
@@ -350,19 +372,24 @@ trx_undo_report_insert_virtual(
 	return(true);
 }
 
-/**********************************************************************//**
-Reports in the undo log of an insert of a clustered index record.
+/** Reports in the undo log of an insert of a clustered index record.
+@param	undo_block	undo log page
+@param	trx		transaction
+@param	index		clustered index
+@param	clust_entry	index entry which will be inserted to the
+			clustered index
+@param	mtr		mini-transaction
+@param	write_empty	write empty table undo log record
 @return offset of the inserted entry on the page if succeed, 0 if fail */
 static
 uint16_t
 trx_undo_page_report_insert(
-/*========================*/
-	buf_block_t*	undo_block,	/*!< in: undo log page */
-	trx_t*		trx,		/*!< in: transaction */
-	dict_index_t*	index,		/*!< in: clustered index */
-	const dtuple_t*	clust_entry,	/*!< in: index entry which will be
-					inserted to the clustered index */
-	mtr_t*		mtr)		/*!< in: mtr */
+	buf_block_t*	undo_block,
+	trx_t*		trx,
+	dict_index_t*	index,
+	const dtuple_t*	clust_entry,
+	mtr_t*		mtr,
+	bool		write_empty)
 {
 	ut_ad(index->is_primary());
 	/* MariaDB 10.3.1+ in trx_undo_page_init() always initializes
@@ -378,9 +405,6 @@ trx_undo_page_report_insert(
 						+ undo_block->frame));
 	byte* ptr = undo_block->frame + first_free;
 
-	ut_ad(first_free >= TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_HDR_SIZE);
-	ut_ad(first_free <= srv_page_size - FIL_PAGE_DATA_END);
-
 	if (trx_undo_left(undo_block, ptr) < 2 + 1 + 11 + 11) {
 		/* Not enough space for writing the general parameters */
 		return(0);
@@ -393,6 +417,13 @@ trx_undo_page_report_insert(
 	*ptr++ = TRX_UNDO_INSERT_REC;
 	ptr += mach_u64_write_much_compressed(ptr, trx->undo_no);
 	ptr += mach_u64_write_much_compressed(ptr, index->table->id);
+
+	if (write_empty) {
+		/* Table is in bulk operation */
+		undo_block->frame[first_free + 2] = TRX_UNDO_EMPTY;
+		goto done;
+	}
+
 	/*----------------------------------------*/
 	/* Store then the fields required to uniquely determine the record
 	to be inserted in the clustered index */
@@ -470,7 +501,7 @@ trx_undo_rec_get_pars(
 	type_cmpl &= ~TRX_UNDO_UPD_EXTERN;
 	*type = type_cmpl & (TRX_UNDO_CMPL_INFO_MULT - 1);
 	ut_ad(*type >= TRX_UNDO_RENAME_TABLE);
-	ut_ad(*type <= TRX_UNDO_DEL_MARK_REC);
+	ut_ad(*type <= TRX_UNDO_EMPTY);
 	*cmpl_info = type_cmpl / TRX_UNDO_CMPL_INFO_MULT;
 
 	*undo_no = mach_read_next_much_compressed(&ptr);
@@ -786,9 +817,6 @@ trx_undo_page_report_modify(
 
 	const uint16_t first_free = mach_read_from_2(ptr_to_first_free);
 	byte *ptr = undo_block->frame + first_free;
-
-	ut_ad(first_free >= TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_HDR_SIZE);
-	ut_ad(first_free <= srv_page_size - FIL_PAGE_DATA_END);
 
 	if (trx_undo_left(undo_block, ptr) < 50) {
 		/* NOTE: the value 50 must be big enough so that the general
@@ -1896,8 +1924,6 @@ dberr_t trx_undo_report_rename(trx_t* trx, const dict_table_t* table)
 
 			if (uint16_t offset = trx_undo_page_report_rename(
 				    trx, table, block, &mtr)) {
-				undo->withdraw_clock
-					= buf_pool.withdraw_clock();
 				undo->top_page_no = undo->last_page_no;
 				undo->top_offset  = offset;
 				undo->top_undo_no = trx->undo_no++;
@@ -1952,7 +1978,6 @@ trx_undo_report_row_operation(
 					undo log record */
 {
 	trx_t*		trx;
-	mtr_t		mtr;
 #ifdef UNIV_DEBUG
 	int		loop_count	= 0;
 #endif /* UNIV_DEBUG */
@@ -1968,6 +1993,34 @@ trx_undo_report_row_operation(
 	ut_ad(trx_state_eq(trx, TRX_STATE_ACTIVE));
 	ut_ad(!trx->in_rollback);
 
+	/* We must determine if this is the first time when this
+	transaction modifies this table. */
+	auto m = trx->mod_tables.emplace(index->table, trx->undo_no);
+	ut_ad(m.first->second.valid(trx->undo_no));
+
+	bool bulk = !rec;
+
+	if (!bulk) {
+		/* An UPDATE or DELETE must not be covered by an
+		earlier start_bulk_insert(). */
+		ut_ad(!m.first->second.is_bulk_insert());
+	} else if (m.first->second.is_bulk_insert()) {
+		/* Above, the emplace() tried to insert an object with
+		!is_bulk_insert(). Only an explicit start_bulk_insert()
+		(below) can set the flag. */
+		ut_ad(!m.second);
+		/* We already wrote a TRX_UNDO_EMPTY record. */
+		return DB_SUCCESS;
+	} else if (m.second
+		   && thr->run_node
+		   && que_node_get_type(thr->run_node) == QUE_NODE_INSERT
+		   && static_cast<ins_node_t*>(thr->run_node)->bulk_insert) {
+		m.first->second.start_bulk_insert();
+	} else {
+		bulk = false;
+	}
+
+	mtr_t		mtr;
 	mtr.start();
 	trx_undo_t**	pundo;
 	trx_rseg_t*	rseg;
@@ -1989,10 +2042,11 @@ trx_undo_report_row_operation(
 	buf_block_t*	undo_block = trx_undo_assign_low(trx, rseg, pundo,
 							 &err, &mtr);
 	trx_undo_t*	undo	= *pundo;
-
 	ut_ad((err == DB_SUCCESS) == (undo_block != NULL));
 	if (UNIV_UNLIKELY(undo_block == NULL)) {
-		goto err_exit;
+err_exit:
+		mtr.commit();
+		return err;
 	}
 
 	ut_ad(undo != NULL);
@@ -2000,7 +2054,8 @@ trx_undo_report_row_operation(
 	do {
 		uint16_t offset = !rec
 			? trx_undo_page_report_insert(
-				undo_block, trx, index, clust_entry, &mtr)
+				undo_block, trx, index, clust_entry, &mtr,
+				bulk)
 			: trx_undo_page_report_modify(
 				undo_block, trx, index, rec, offsets, update,
 				cmpl_info, clust_entry, &mtr);
@@ -2026,7 +2081,7 @@ trx_undo_report_row_operation(
 				tree latch, which is the rseg
 				mutex. We must commit the mini-transaction
 				first, because it may be holding lower-level
-				latches, such as SYNC_FSP and SYNC_FSP_PAGE. */
+				latches, such as SYNC_FSP_PAGE. */
 
 				mtr.commit();
 				mtr.start();
@@ -2034,9 +2089,15 @@ trx_undo_report_row_operation(
 					mtr.set_log_mode(MTR_LOG_NO_REDO);
 				}
 
-				mutex_enter(&rseg->mutex);
+				mysql_mutex_lock(&rseg->mutex);
 				trx_undo_free_last_page(undo, &mtr);
-				mutex_exit(&rseg->mutex);
+				mysql_mutex_unlock(&rseg->mutex);
+
+				if (m.second) {
+					/* We are not going to modify
+					this table after all. */
+					trx->mod_tables.erase(m.first);
+				}
 
 				err = DB_UNDO_RECORD_TOO_BIG;
 				goto err_exit;
@@ -2060,7 +2121,6 @@ trx_undo_report_row_operation(
 			mtr_commit(&mtr);
 		} else {
 			/* Success */
-			undo->withdraw_clock = buf_pool.withdraw_clock();
 			mtr_commit(&mtr);
 
 			undo->top_page_no = undo_block->page.id().page_no();
@@ -2070,28 +2130,24 @@ trx_undo_report_row_operation(
 			ut_ad(!undo->empty());
 
 			if (!is_temp) {
-				const undo_no_t limit = undo->top_undo_no;
-				/* Determine if this is the first time
-				when this transaction modifies a
-				system-versioned column in this table. */
-				trx_mod_table_time_t& time
-					= trx->mod_tables.insert(
-						trx_mod_tables_t::value_type(
-							index->table, limit))
-					.first->second;
-				ut_ad(time.valid(limit));
+				trx_mod_table_time_t& time = m.first->second;
+				ut_ad(time.valid(undo->top_undo_no));
 
 				if (!time.is_versioned()
 				    && index->table->versioned_by_id()
 				    && (!rec /* INSERT */
 					|| (update
 					    && update->affects_versioned()))) {
-					time.set_versioned(limit);
+					time.set_versioned(undo->top_undo_no);
 				}
 			}
 
-			*roll_ptr = trx_undo_build_roll_ptr(
-				!rec, rseg->id, undo->top_page_no, offset);
+			if (!bulk) {
+				*roll_ptr = trx_undo_build_roll_ptr(
+					!rec, rseg->id, undo->top_page_no,
+					offset);
+			}
+
 			return(DB_SUCCESS);
 		}
 
@@ -2124,10 +2180,7 @@ trx_undo_report_row_operation(
 
 	/* Did not succeed: out of space */
 	err = DB_OUT_OF_FILE_SPACE;
-
-err_exit:
-	mtr_commit(&mtr);
-	return(err);
+	goto err_exit;
 }
 
 /*============== BUILDING PREVIOUS VERSION OF A RECORD ===============*/
@@ -2189,14 +2242,14 @@ trx_undo_get_undo_rec(
 	const table_name_t&	name,
 	trx_undo_rec_t**	undo_rec)
 {
-	rw_lock_s_lock(&purge_sys.latch);
+	purge_sys.latch.rd_lock(SRW_LOCK_CALL);
 
 	bool missing_history = purge_sys.changes_visible(trx_id, name);
 	if (!missing_history) {
 		*undo_rec = trx_undo_get_undo_rec_low(roll_ptr, heap);
 	}
 
-	rw_lock_s_unlock(&purge_sys.latch);
+	purge_sys.latch.rd_unlock();
 
 	return(missing_history);
 }
@@ -2259,7 +2312,6 @@ trx_undo_prev_version_build(
 	byte*		buf;
 
 	ut_ad(!index->table->is_temporary());
-	ut_ad(!rw_lock_own(&purge_sys.latch, RW_LOCK_S));
 	ut_ad(index_mtr->memo_contains_page_flagged(index_rec,
 						    MTR_MEMO_PAGE_S_FIX
 						    | MTR_MEMO_PAGE_X_FIX));
@@ -2353,14 +2405,12 @@ trx_undo_prev_version_build(
 
 		if ((update->info_bits & REC_INFO_DELETED_FLAG)
 		    && row_upd_changes_disowned_external(update)) {
-			bool	missing_extern;
+			purge_sys.latch.rd_lock(SRW_LOCK_CALL);
 
-			rw_lock_s_lock(&purge_sys.latch);
-
-			missing_extern = purge_sys.changes_visible(
+			bool missing_extern = purge_sys.changes_visible(
 				trx_id,	index->table->name);
 
-			rw_lock_s_unlock(&purge_sys.latch);
+			purge_sys.latch.rd_unlock();
 
 			if (missing_extern) {
 				/* treat as a fresh insert, not to
@@ -2443,7 +2493,7 @@ trx_undo_prev_version_build(
 				      == rec_get_nth_field_size(rec, n));
 				ulint l = rec_get_1byte_offs_flag(*old_vers)
 					? (n + 1) : (n + 1) * 2;
-				(*old_vers)[-REC_N_OLD_EXTRA_BYTES - l]
+				*(*old_vers - REC_N_OLD_EXTRA_BYTES - l)
 					&= byte(~REC_1BYTE_SQL_NULL_MASK);
 			}
 		}

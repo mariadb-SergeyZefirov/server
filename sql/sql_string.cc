@@ -237,8 +237,8 @@ bool Binary_string::copy(const Binary_string &str)
 {
   if (alloc(str.str_length))
     return TRUE;
-  str_length=str.str_length;
-  bmove(Ptr,str.Ptr,str_length);		// May be overlapping
+  if ((str_length=str.str_length))
+    bmove(Ptr,str.Ptr,str_length);		// May be overlapping
   Ptr[str_length]=0;
   return FALSE;
 }
@@ -574,8 +574,11 @@ bool Binary_string::append_ulonglong(ulonglong val)
 
 bool String::append(const char *s, size_t arg_length, CHARSET_INFO *cs)
 {
+  if (!arg_length)
+    return false;
+
   uint32 offset;
-  
+
   if (needs_conversion((uint32)arg_length, cs, charset(), &offset))
   {
     size_t add_length;
@@ -767,10 +770,10 @@ void Static_binary_string::qs_append(double d)
                        NULL);
 }
 
-void Static_binary_string::qs_append(double *d)
+void Static_binary_string::qs_append(const double *d)
 {
   double ld;
-  float8get(ld, (char*) d);
+  float8get(ld, (const char*) d);
   qs_append(ld);
 }
 
@@ -858,7 +861,7 @@ int sortcmp(const String *s,const String *t, CHARSET_INFO *cs)
 int stringcmp(const String *s,const String *t)
 {
   uint32 s_len=s->length(),t_len=t->length(),len=MY_MIN(s_len,t_len);
-  int cmp= memcmp(s->ptr(), t->ptr(), len);
+  int cmp= len ? memcmp(s->ptr(), t->ptr(), len) : 0;
   return (cmp) ? cmp : (int) (s_len - t_len);
 }
 

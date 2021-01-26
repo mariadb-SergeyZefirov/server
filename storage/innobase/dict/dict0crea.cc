@@ -343,7 +343,7 @@ dict_build_table_def_step(
 	que_thr_t*	thr,	/*!< in: query thread */
 	tab_node_t*	node)	/*!< in: table create node */
 {
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 	dict_table_t*	table = node->table;
 	trx_t* trx = thr_get_trx(thr);
 	ut_ad(!table->is_temporary());
@@ -483,7 +483,7 @@ dict_create_sys_indexes_tuple(
 	dfield_t*	dfield;
 	byte*		ptr;
 
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 	ut_ad(index);
 	ut_ad(index->table->space || index->table->file_unreadable);
 	ut_ad(!index->table->space
@@ -712,7 +712,7 @@ dict_build_index_def_step(
 	dtuple_t*	row;
 	trx_t*		trx;
 
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 
 	trx = thr_get_trx(thr);
 
@@ -763,7 +763,7 @@ dict_build_index_def(
 	dict_index_t*		index,	/*!< in/out: index */
 	trx_t*			trx)	/*!< in/out: InnoDB transaction handle */
 {
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 
 	if (trx->table_id == 0) {
 		/* Record only the first table id. */
@@ -811,7 +811,7 @@ dict_create_index_tree_step(
 	dict_index_t*	index;
 	dtuple_t*	search_tuple;
 
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 
 	index = node->index;
 
@@ -880,7 +880,7 @@ dict_create_index_tree_in_mem(
 {
 	mtr_t		mtr;
 
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 	ut_ad(!(index->type & DICT_FTS));
 
 	mtr_start(&mtr);
@@ -910,7 +910,7 @@ void dict_drop_index_tree(btr_pcur_t* pcur, trx_t* trx, mtr_t* mtr)
 	byte*	ptr;
 	ulint	len;
 
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 	ut_a(!dict_table_is_comp(dict_sys.sys_indexes));
 
 	ptr = rec_get_nth_field_old(rec, DICT_FLD__SYS_INDEXES__PAGE_NO, &len);
@@ -948,10 +948,10 @@ void dict_drop_index_tree(btr_pcur_t* pcur, trx_t* trx, mtr_t* mtr)
 
 	ut_ad(len == 8);
 
-	if (fil_space_t* s = fil_space_acquire_silent(space_id)) {
+	if (fil_space_t* s = fil_space_t::get(space_id)) {
 		/* Ensure that the tablespace file exists
 		in order to avoid a crash in buf_page_get_gen(). */
-		if (s->size || fil_space_get_size(space_id)) {
+		if (root_page_no < s->get_size()) {
 			btr_free_if_exists(page_id_t(space_id, root_page_no),
 					   s->zip_size(),
 					   mach_read_from_8(ptr), mtr);
@@ -1056,7 +1056,7 @@ dict_create_table_step(
 	trx_t*		trx;
 
 	ut_ad(thr);
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 
 	trx = thr_get_trx(thr);
 
@@ -1199,7 +1199,7 @@ dict_create_index_step(
 	trx_t*		trx;
 
 	ut_ad(thr);
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 
 	trx = thr_get_trx(thr);
 
@@ -1281,7 +1281,7 @@ dict_create_index_step(
 			    && node->table->fts) {
 				fts_index_cache_t*	index_cache;
 
-				rw_lock_x_lock(
+				mysql_mutex_lock(
 					&node->table->fts->cache->init_lock);
 
 				index_cache = (fts_index_cache_t*)
@@ -1298,7 +1298,7 @@ dict_create_index_step(
 					node->table->fts->cache->indexes,
 					*reinterpret_cast<void**>(index_cache));
 
-				rw_lock_x_unlock(
+				mysql_mutex_unlock(
 					&node->table->fts->cache->init_lock);
 			}
 
@@ -1341,10 +1341,9 @@ function_exit:
 
 /****************************************************************//**
 Check whether a system table exists.  Additionally, if it exists,
-move it to the non-LRU end of the table LRU list.  This is oly used
+move it to the non-LRU end of the table LRU list.  This is only used
 for system tables that can be upgraded or added to an older database,
-which include SYS_FOREIGN, SYS_FOREIGN_COLS, SYS_TABLESPACES and
-SYS_DATAFILES.
+which include SYS_FOREIGN and SYS_FOREIGN_COLS.
 @return DB_SUCCESS if the sys table exists, DB_CORRUPTION if it exists
 but is not current, DB_TABLE_NOT_FOUND if it does not exist*/
 static
@@ -1360,7 +1359,7 @@ dict_check_if_system_table_exists(
 
 	ut_ad(!srv_any_background_activity());
 
-	mutex_enter(&dict_sys.mutex);
+	dict_sys.mutex_lock();
 
 	sys_table = dict_table_get_low(tablename);
 
@@ -1378,7 +1377,7 @@ dict_check_if_system_table_exists(
 		dict_table_prevent_eviction(sys_table);
 	}
 
-	mutex_exit(&dict_sys.mutex);
+	dict_sys.mutex_unlock();
 
 	return(error);
 }
@@ -1546,9 +1545,9 @@ dict_create_or_check_sys_virtual()
 		"SYS_VIRTUAL", DICT_NUM_FIELDS__SYS_VIRTUAL + 1, 1);
 
 	if (err == DB_SUCCESS) {
-		mutex_enter(&dict_sys.mutex);
+		dict_sys.mutex_lock();
 		dict_sys.sys_virtual = dict_table_get_low("SYS_VIRTUAL");
-		mutex_exit(&dict_sys.mutex);
+		dict_sys.mutex_unlock();
 		return(DB_SUCCESS);
 	}
 
@@ -1621,9 +1620,9 @@ dict_create_or_check_sys_virtual()
 	dberr_t sys_virtual_err = dict_check_if_system_table_exists(
 		"SYS_VIRTUAL", DICT_NUM_FIELDS__SYS_VIRTUAL + 1, 1);
 	ut_a(sys_virtual_err == DB_SUCCESS);
-	mutex_enter(&dict_sys.mutex);
+	dict_sys.mutex_lock();
 	dict_sys.sys_virtual = dict_table_get_low("SYS_VIRTUAL");
-	mutex_exit(&dict_sys.mutex);
+	dict_sys.mutex_unlock();
 
 	return(err);
 }
@@ -1647,7 +1646,7 @@ dict_foreign_eval_sql(
 	error = que_eval_sql(info, sql, FALSE, trx);
 
 	if (error == DB_DUPLICATE_KEY) {
-		mutex_enter(&dict_foreign_err_mutex);
+		mysql_mutex_lock(&dict_foreign_err_mutex);
 		rewind(ef);
 		ut_print_timestamp(ef);
 		fputs(" Error in foreign key constraint creation for table ",
@@ -1667,7 +1666,7 @@ dict_foreign_eval_sql(
 		      "explicitly with unique names.\n",
 		      ef);
 
-		mutex_exit(&dict_foreign_err_mutex);
+		mysql_mutex_unlock(&dict_foreign_err_mutex);
 
 		return(error);
 	}
@@ -1676,7 +1675,7 @@ dict_foreign_eval_sql(
 		ib::error() << "Foreign key constraint creation failed: "
 			<< error;
 
-		mutex_enter(&dict_foreign_err_mutex);
+		mysql_mutex_lock(&dict_foreign_err_mutex);
 		ut_print_timestamp(ef);
 		fputs(" Internal error in foreign key constraint creation"
 		      " for table ", ef);
@@ -1684,7 +1683,7 @@ dict_foreign_eval_sql(
 		fputs(".\n"
 		      "See the MySQL .err log in the datadir"
 		      " for more information.\n", ef);
-		mutex_exit(&dict_foreign_err_mutex);
+		mysql_mutex_unlock(&dict_foreign_err_mutex);
 
 		return(error);
 	}
@@ -2020,7 +2019,7 @@ dict_create_add_foreigns_to_dictionary(
 	dict_foreign_t*	foreign;
 	dberr_t		error;
 
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 
 	if (NULL == dict_table_get_low("SYS_FOREIGN")) {
 
@@ -2048,190 +2047,4 @@ dict_create_add_foreigns_to_dictionary(
 	}
 
 	return error;
-}
-
-/****************************************************************//**
-Creates the tablespaces and datafiles system tables inside InnoDB
-at server bootstrap or server start if they are not found or are
-not of the right form.
-@return DB_SUCCESS or error code */
-dberr_t
-dict_create_or_check_sys_tablespace(void)
-/*=====================================*/
-{
-	trx_t*		trx;
-	my_bool		srv_file_per_table_backup;
-	dberr_t		err;
-	dberr_t		sys_tablespaces_err;
-	dberr_t		sys_datafiles_err;
-
-	ut_ad(!srv_any_background_activity());
-
-	/* Note: The master thread has not been started at this point. */
-
-	sys_tablespaces_err = dict_check_if_system_table_exists(
-		"SYS_TABLESPACES", DICT_NUM_FIELDS__SYS_TABLESPACES + 1, 1);
-	sys_datafiles_err = dict_check_if_system_table_exists(
-		"SYS_DATAFILES", DICT_NUM_FIELDS__SYS_DATAFILES + 1, 1);
-
-	if (sys_tablespaces_err == DB_SUCCESS
-	    && sys_datafiles_err == DB_SUCCESS) {
-		srv_sys_tablespaces_open = true;
-		return(DB_SUCCESS);
-	}
-
-	if (srv_read_only_mode
-	    || srv_force_recovery >= SRV_FORCE_NO_TRX_UNDO) {
-		return(DB_READ_ONLY);
-	}
-
-	trx = trx_create();
-
-	trx_set_dict_operation(trx, TRX_DICT_OP_TABLE);
-
-	trx->op_info = "creating tablepace and datafile sys tables";
-
-	row_mysql_lock_data_dictionary(trx);
-
-	/* Check which incomplete table definition to drop. */
-
-	if (sys_tablespaces_err == DB_CORRUPTION) {
-		row_drop_table_after_create_fail("SYS_TABLESPACES", trx);
-	}
-
-	if (sys_datafiles_err == DB_CORRUPTION) {
-		row_drop_table_after_create_fail("SYS_DATAFILES", trx);
-	}
-
-	ib::info() << "Creating tablespace and datafile system tables.";
-
-	/* We always want SYSTEM tables to be created inside the system
-	tablespace. */
-	srv_file_per_table_backup = srv_file_per_table;
-	srv_file_per_table = 0;
-
-	err = que_eval_sql(
-		NULL,
-		"PROCEDURE CREATE_SYS_TABLESPACE_PROC () IS\n"
-		"BEGIN\n"
-		"CREATE TABLE SYS_TABLESPACES(\n"
-		" SPACE INT, NAME CHAR, FLAGS INT);\n"
-		"CREATE UNIQUE CLUSTERED INDEX SYS_TABLESPACES_SPACE"
-		" ON SYS_TABLESPACES (SPACE);\n"
-		"CREATE TABLE SYS_DATAFILES(\n"
-		" SPACE INT, PATH CHAR);\n"
-		"CREATE UNIQUE CLUSTERED INDEX SYS_DATAFILES_SPACE"
-		" ON SYS_DATAFILES (SPACE);\n"
-		"END;\n",
-		FALSE, trx);
-
-	if (UNIV_UNLIKELY(err != DB_SUCCESS)) {
-		ib::error() << "Creation of SYS_TABLESPACES and SYS_DATAFILES"
-			" has failed with error " << err
-			<< ". Dropping incompletely created tables.";
-
-		ut_a(err == DB_OUT_OF_FILE_SPACE
-		     || err == DB_DUPLICATE_KEY
-		     || err == DB_TOO_MANY_CONCURRENT_TRXS);
-
-		row_drop_table_after_create_fail("SYS_TABLESPACES", trx);
-		row_drop_table_after_create_fail("SYS_DATAFILES", trx);
-
-		if (err == DB_OUT_OF_FILE_SPACE) {
-			err = DB_MUST_GET_MORE_FILE_SPACE;
-		}
-	}
-
-	trx_commit_for_mysql(trx);
-
-	row_mysql_unlock_data_dictionary(trx);
-
-	trx->free();
-
-	srv_file_per_table = srv_file_per_table_backup;
-
-	if (err == DB_SUCCESS) {
-		srv_sys_tablespaces_open = true;
-	}
-
-	/* Note: The master thread has not been started at this point. */
-	/* Confirm and move to the non-LRU part of the table LRU list. */
-
-	sys_tablespaces_err = dict_check_if_system_table_exists(
-		"SYS_TABLESPACES", DICT_NUM_FIELDS__SYS_TABLESPACES + 1, 1);
-	ut_a(sys_tablespaces_err == DB_SUCCESS || err != DB_SUCCESS);
-
-	sys_datafiles_err = dict_check_if_system_table_exists(
-		"SYS_DATAFILES", DICT_NUM_FIELDS__SYS_DATAFILES + 1, 1);
-	ut_a(sys_datafiles_err == DB_SUCCESS || err != DB_SUCCESS);
-
-	return(err);
-}
-
-/** Put a tablespace definition into the data dictionary,
-replacing what was there previously.
-@param[in]	space	Tablespace id
-@param[in]	name	Tablespace name
-@param[in]	flags	Tablespace flags
-@param[in]	path	Tablespace path
-@param[in]	trx	Transaction
-@return error code or DB_SUCCESS */
-dberr_t
-dict_replace_tablespace_in_dictionary(
-	ulint		space_id,
-	const char*	name,
-	ulint		flags,
-	const char*	path,
-	trx_t*		trx)
-{
-	if (!srv_sys_tablespaces_open) {
-		/* Startup procedure is not yet ready for updates. */
-		return(DB_SUCCESS);
-	}
-
-	dberr_t		error;
-
-	pars_info_t*	info = pars_info_create();
-
-	pars_info_add_int4_literal(info, "space", space_id);
-
-	pars_info_add_str_literal(info, "name", name);
-
-	pars_info_add_int4_literal(info, "flags", flags);
-
-	pars_info_add_str_literal(info, "path", path);
-
-	error = que_eval_sql(info,
-			     "PROCEDURE P () IS\n"
-			     "p CHAR;\n"
-
-			     "DECLARE CURSOR c IS\n"
-			     " SELECT PATH FROM SYS_DATAFILES\n"
-			     " WHERE SPACE=:space FOR UPDATE;\n"
-
-			     "BEGIN\n"
-			     "OPEN c;\n"
-			     "FETCH c INTO p;\n"
-
-			     "IF (SQL % NOTFOUND) THEN"
-			     "  DELETE FROM SYS_TABLESPACES "
-			     "WHERE SPACE=:space;\n"
-			     "  INSERT INTO SYS_TABLESPACES VALUES"
-			     "(:space, :name, :flags);\n"
-			     "  INSERT INTO SYS_DATAFILES VALUES"
-			     "(:space, :path);\n"
-			     "ELSIF p <> :path THEN\n"
-			     "  UPDATE SYS_DATAFILES SET PATH=:path"
-			     " WHERE CURRENT OF c;\n"
-			     "END IF;\n"
-			     "END;\n",
-			     FALSE, trx);
-
-	if (error != DB_SUCCESS) {
-		return(error);
-	}
-
-	trx->op_info = "";
-
-	return(error);
 }

@@ -528,7 +528,7 @@ protected:
 	/** Check if the page is marked as free in the extent descriptor.
 	@param page_no page number to check in the extent descriptor.
 	@return true if the page is marked as free */
-	bool is_free(ulint page_no) const UNIV_NOTHROW
+	bool is_free(uint32_t page_no) const UNIV_NOTHROW
 	{
 		ut_a(xdes_calc_descriptor_page(get_zip_size(), page_no)
 		     == m_xdes_page_no);
@@ -1411,7 +1411,7 @@ row_import::set_root_by_heuristic() UNIV_NOTHROW
 			" the tablespace has " << m_n_indexes << " indexes";
 	}
 
-	dict_mutex_enter_for_mysql();
+	dict_sys.mutex_lock();
 
 	ulint	i = 0;
 	dberr_t	err = DB_SUCCESS;
@@ -1452,7 +1452,7 @@ row_import::set_root_by_heuristic() UNIV_NOTHROW
 		}
 	}
 
-	dict_mutex_exit_for_mysql();
+	dict_sys.mutex_unlock();
 
 	return(err);
 }
@@ -2126,8 +2126,7 @@ dberr_t PageConverter::operator()(buf_block_t* block) UNIV_NOTHROW
 	in the buffer pool, evict it now, because
 	we no longer evict the pages on DISCARD TABLESPACE. */
 	buf_page_get_gen(block->page.id(), get_zip_size(),
-			 RW_NO_LATCH, NULL, BUF_EVICT_IF_IN_POOL,
-			 __FILE__, __LINE__, NULL, NULL);
+			 RW_NO_LATCH, NULL, BUF_EVICT_IF_IN_POOL, NULL);
 
 	uint16_t page_type;
 
@@ -2396,15 +2395,7 @@ row_import_set_sys_max_row_id(
 	if (row_id) {
 		/* Update the system row id if the imported index row id is
 		greater than the max system row id. */
-
-		mutex_enter(&dict_sys.mutex);
-
-		if (row_id >= dict_sys.row_id) {
-			dict_sys.row_id = row_id + 1;
-			dict_hdr_flush_row_id();
-		}
-
-		mutex_exit(&dict_sys.mutex);
+		dict_sys.update_row_id(row_id);
 	}
 }
 
@@ -3423,11 +3414,9 @@ fil_iterate(
 			? iter.crypt_io_buffer : io_buffer;
 		byte* const writeptr = readptr;
 
-		IORequest	read_request(IORequest::READ);
-		read_request.disable_partial_io_warnings();
-
 		err = os_file_read_no_error_handling(
-			read_request, iter.file, readptr, offset, n_bytes, 0);
+			IORequestReadPartial,
+			iter.file, readptr, offset, n_bytes, 0);
 		if (err != DB_SUCCESS) {
 			ib::error() << iter.filepath
 				    << ": os_file_read() failed";
@@ -3438,7 +3427,7 @@ fil_iterate(
 		os_offset_t	page_off = offset;
 		ulint		n_pages_read = n_bytes / size;
 		/* This block is not attached to buf_pool */
-		block->page.id_.set_page_no(ulint(page_off / size));
+		block->page.id_.set_page_no(uint32_t(page_off / size));
 
 		for (ulint i = 0; i < n_pages_read;
 		     ++block->page.id_,
@@ -3665,9 +3654,7 @@ not_encrypted:
 
 		/* A page was updated in the set, write back to disk. */
 		if (updated) {
-			IORequest       write_request(IORequest::WRITE);
-
-			err = os_file_write(write_request,
+			err = os_file_write(IORequestWrite,
 					    iter.filepath, iter.file,
 					    writeptr, offset, n_bytes);
 
@@ -3760,11 +3747,8 @@ fil_tablespace_iterate(
 
 	/* Read the first page and determine the page and zip size. */
 
-	IORequest       request(IORequest::READ);
-	request.disable_partial_io_warnings();
-
-	err = os_file_read_no_error_handling(request, file, page, 0,
-					     srv_page_size, 0);
+	err = os_file_read_no_error_handling(IORequestReadPartial,
+					     file, page, 0, srv_page_size, 0);
 
 	if (err == DB_SUCCESS) {
 		err = callback.init(file_size, block);
@@ -3861,7 +3845,6 @@ row_import_for_mysql(
 	trx_t*		trx;
 	ib_uint64_t	autoinc = 0;
 	char*		filepath = NULL;
-	ulint		space_flags MY_ATTRIBUTE((unused));
 
 	/* The caller assured that this is not read_only_mode and that no
 	temorary tablespace is being imported. */
@@ -3920,7 +3903,7 @@ row_import_for_mysql(
 
 	/* Prevent DDL operations while we are checking. */
 
-	rw_lock_s_lock(&dict_sys.latch);
+	dict_sys.freeze();
 
 	row_import	cfg;
 
@@ -3945,14 +3928,14 @@ row_import_for_mysql(
 			autoinc = cfg.m_autoinc;
 		}
 
-		rw_lock_s_unlock(&dict_sys.latch);
+		dict_sys.unfreeze();
 
 		DBUG_EXECUTE_IF("ib_import_set_index_root_failure",
 				err = DB_TOO_MANY_CONCURRENT_TRXS;);
 
 	} else if (cfg.m_missing) {
 
-		rw_lock_s_unlock(&dict_sys.latch);
+		dict_sys.unfreeze();
 
 		/* We don't have a schema file, we will have to discover
 		the index root pages from the .ibd file and skip the schema
@@ -3980,11 +3963,8 @@ row_import_for_mysql(
 				err = cfg.set_root_by_heuristic();
 			}
 		}
-
-		space_flags = fetchIndexRootPages.get_space_flags();
-
 	} else {
-		rw_lock_s_unlock(&dict_sys.latch);
+		dict_sys.unfreeze();
 	}
 
 	if (err != DB_SUCCESS) {
@@ -4049,6 +4029,8 @@ row_import_for_mysql(
 	Find the space ID in SYS_TABLES since this is an ALTER TABLE. */
 	dict_get_and_save_data_dir_path(table, true);
 
+	ut_ad(!DICT_TF_HAS_DATA_DIR(table->flags) || table->data_dir_path);
+
 	if (DICT_TF_HAS_DATA_DIR(table->flags)) {
 		ut_a(table->data_dir_path);
 
@@ -4072,7 +4054,7 @@ row_import_for_mysql(
 
 	/* Open the tablespace so that we can access via the buffer pool.
 	We set the 2nd param (fix_dict = true) here because we already
-	have an x-lock on dict_sys.latch and dict_sys.mutex.
+	have locked dict_sys.latch and dict_sys.mutex.
 	The tablespace is initially opened as a temporary one, because
 	we will not be writing any redo log for it before we have invoked
 	fil_space_t::set_imported() to declare it a persistent tablespace. */
@@ -4080,7 +4062,7 @@ row_import_for_mysql(
 	ulint	fsp_flags = dict_tf_to_fsp_flags(table->flags);
 
 	table->space = fil_ibd_open(
-		true, true, FIL_TYPE_IMPORT, table->space_id,
+		true, FIL_TYPE_IMPORT, table->space_id,
 		fsp_flags, table->name, filepath, &err);
 
 	ut_ad((table->space == NULL) == (err != DB_SUCCESS));
@@ -4175,7 +4157,7 @@ row_import_for_mysql(
 	/* Ensure that all pages dirtied during the IMPORT make it to disk.
 	The only dirty pages generated should be from the pessimistic purge
 	of delete marked records that couldn't be purged in Phase I. */
-	buf_LRU_flush_or_remove_pages(prebuilt->table->space_id, true);
+	while (buf_flush_dirty_pages(prebuilt->table->space_id));
 
 	ib::info() << "Phase IV - Flush complete";
 	prebuilt->table->space->set_imported();

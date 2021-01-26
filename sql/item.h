@@ -120,20 +120,19 @@ enum precedence {
   XOR_PRECEDENCE,       // XOR
   AND_PRECEDENCE,       // AND, &&
   NOT_PRECEDENCE,       // NOT (unless HIGH_NOT_PRECEDENCE)
-  BETWEEN_PRECEDENCE,   // BETWEEN, CASE, WHEN, THEN, ELSE
-  CMP_PRECEDENCE,       // =, <=>, >=, >, <=, <, <>, !=, IS, LIKE, REGEXP, IN
+  CMP_PRECEDENCE,       // =, <=>, >=, >, <=, <, <>, !=, IS
+  BETWEEN_PRECEDENCE,   // BETWEEN
+  IN_PRECEDENCE,        // IN, LIKE, REGEXP
   BITOR_PRECEDENCE,     // |
   BITAND_PRECEDENCE,    // &
   SHIFT_PRECEDENCE,     // <<, >>
-  ADDINTERVAL_PRECEDENCE, // first argument in +INTERVAL
+  INTERVAL_PRECEDENCE,  // first argument in +INTERVAL
   ADD_PRECEDENCE,       // +, -
   MUL_PRECEDENCE,       // *, /, DIV, %, MOD
   BITXOR_PRECEDENCE,    // ^
   PIPES_PRECEDENCE,     // || (if PIPES_AS_CONCAT)
-  NEG_PRECEDENCE,       // unary -, ~
-  BANG_PRECEDENCE,      // !, NOT (if HIGH_NOT_PRECEDENCE)
+  NEG_PRECEDENCE,       // unary -, ~, !, NOT (if HIGH_NOT_PRECEDENCE)
   COLLATE_PRECEDENCE,   // BINARY, COLLATE
-  INTERVAL_PRECEDENCE,  // INTERVAL
   DEFAULT_PRECEDENCE,
   HIGHEST_PRECEDENCE
 };
@@ -974,6 +973,13 @@ public:
   void set_name_no_truncate(THD *thd, const char *str, uint length,
                             CHARSET_INFO *cs);
   void init_make_send_field(Send_field *tmp_field, const Type_handler *h);
+  void share_name_with(const Item *item)
+  {
+    name= item->name;
+    common_flags= static_cast<uint8>
+     ((common_flags & ~IS_AUTO_GENERATED_NAME) |
+      (item->common_flags & IS_AUTO_GENERATED_NAME));
+  }
   virtual void cleanup();
   virtual void make_send_field(THD *thd, Send_field *field);
 
@@ -1716,6 +1722,8 @@ public:
     mysql_register_view().
   */
   virtual enum precedence precedence() const { return DEFAULT_PRECEDENCE; }
+  enum precedence higher_precedence() const
+  { return (enum precedence)(precedence() + 1); }
   void print_parenthesised(String *str, enum_query_type query_type,
                            enum precedence parent_prec);
   /**
@@ -5439,7 +5447,11 @@ public:
   {
     (*ref)->restore_to_before_no_rows_in_result();
   }
-  virtual void print(String *str, enum_query_type query_type);
+  void print(String *str, enum_query_type query_type);
+  enum precedence precedence() const
+  {
+    return ref ? (*ref)->precedence() : DEFAULT_PRECEDENCE;
+  }
   void cleanup();
   Item_field *field_for_view_update()
     { return (*ref)->field_for_view_update(); }

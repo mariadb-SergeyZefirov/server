@@ -1,5 +1,5 @@
 /* Copyright (c) 2000, 2015, Oracle and/or its affiliates.
-   Copyright (c) 2008, 2020, MariaDB
+   Copyright (c) 2008, 2021, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -1884,13 +1884,10 @@ extern "C" void unireg_abort(int exit_code)
     WSREP_INFO("Some threads may fail to exit.");
   }
 
-  if (WSREP_ON)
+  if (WSREP_ON && wsrep_inited)
   {
-    /* In bootstrap mode we deinitialize wsrep here. */
-    if (opt_bootstrap || wsrep_recovery)
-    {
-      if (wsrep_inited) wsrep_deinit(true);
-    }
+    wsrep_deinit(true);
+    wsrep_deinit_server();
   }
 #endif // WITH_WSREP
 
@@ -5019,6 +5016,7 @@ static int init_server_components()
 #if defined(__linux__)
       MARIADB_REMOVED_OPTION("super-large-pages"),
 #endif
+      MARIADB_REMOVED_OPTION("innodb-idle-flush-pct"),
       MARIADB_REMOVED_OPTION("innodb-locks-unsafe-for-binlog"),
       MARIADB_REMOVED_OPTION("innodb-rollback-segments"),
       MARIADB_REMOVED_OPTION("innodb-stats-sample-pages"),
@@ -5052,6 +5050,7 @@ static int init_server_components()
       MARIADB_REMOVED_OPTION("innodb-replication-delay"),
       MARIADB_REMOVED_OPTION("innodb-scrub-log"),
       MARIADB_REMOVED_OPTION("innodb-scrub-log-speed"),
+      MARIADB_REMOVED_OPTION("innodb-sync-array-size"),
       MARIADB_REMOVED_OPTION("innodb-thread-concurrency"),
       MARIADB_REMOVED_OPTION("innodb-thread-sleep-delay"),
       MARIADB_REMOVED_OPTION("innodb-undo-logs"),
@@ -6950,8 +6949,8 @@ show_ssl_get_server_not_after(THD *thd, SHOW_VAR *var, char *buff,
 
 #endif /* HAVE_OPENSSL && !EMBEDDED_LIBRARY */
 
-static int show_default_keycache(THD *thd, SHOW_VAR *var, char *buff,
-                                 enum enum_var_type scope)
+static int show_default_keycache(THD *thd, SHOW_VAR *var, void *buff,
+                                 system_status_var *, enum_var_type)
 {
   struct st_data {
     KEY_CACHE_STATISTICS stats;
@@ -6984,7 +6983,7 @@ static int show_default_keycache(THD *thd, SHOW_VAR *var, char *buff,
 
   v->name= 0;
 
-  DBUG_ASSERT((char*)(v+1) <= buff + SHOW_VAR_FUNC_BUFF_SIZE);
+  DBUG_ASSERT((char*)(v+1) <= static_cast<char*>(buff) + SHOW_VAR_FUNC_BUFF_SIZE);
 
 #undef set_one_keycache_var
 
@@ -7008,8 +7007,8 @@ static int show_memory_used(THD *thd, SHOW_VAR *var, char *buff,
 
 
 #ifndef DBUG_OFF
-static int debug_status_func(THD *thd, SHOW_VAR *var, char *buff,
-                             enum enum_var_type scope)
+static int debug_status_func(THD *thd, SHOW_VAR *var, void *buff,
+                             system_status_var *, enum_var_type)
 {
 #define add_var(X,Y,Z)                  \
   v->name= X;                           \
@@ -7172,6 +7171,7 @@ SHOW_VAR status_vars[]= {
   {"Max_used_connections",     (char*) &max_used_connections,  SHOW_LONG},
   {"Memory_used",              (char*) &show_memory_used, SHOW_SIMPLE_FUNC},
   {"Memory_used_initial",      (char*) &start_memory_used, SHOW_LONGLONG},
+  {"Resultset_metadata_skipped", (char *) offsetof(STATUS_VAR, skip_metadata_count),SHOW_LONG_STATUS},
   {"Not_flushed_delayed_rows", (char*) &delayed_rows_in_use,    SHOW_LONG_NOFLUSH},
   {"Open_files",               (char*) &my_file_opened,         SHOW_SINT},
   {"Open_streams",             (char*) &my_stream_opened,       SHOW_LONG_NOFLUSH},

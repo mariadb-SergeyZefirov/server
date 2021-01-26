@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1997, 2017, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2020, MariaDB Corporation.
+Copyright (c) 2017, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -88,7 +88,8 @@ row_undo_ins_remove_clust_rec(
 		online = dict_index_is_online_ddl(index);
 		if (online) {
 			ut_ad(node->rec_type == TRX_UNDO_INSERT_REC);
-			ut_ad(!node->trx->dict_operation_lock_mode);
+			ut_ad(node->trx->dict_operation_lock_mode
+			      != RW_X_LATCH);
 			ut_ad(node->table->id != DICT_INDEXES_ID);
 			ut_ad(node->table->id != DICT_COLUMNS_ID);
 			mtr_s_lock_index(index, &mtr);
@@ -366,9 +367,9 @@ static bool row_undo_ins_parse_undo_rec(undo_node_t* node, bool dict_locked)
 		node->table = dict_table_open_on_id(table_id, dict_locked,
 						    DICT_TABLE_OP_NORMAL);
 	} else if (!dict_locked) {
-		mutex_enter(&dict_sys.mutex);
+		dict_sys.mutex_lock();
 		node->table = dict_sys.get_temporary_table(table_id);
-		mutex_exit(&dict_sys.mutex);
+		dict_sys.mutex_unlock();
 	} else {
 		node->table = dict_sys.get_temporary_table(table_id);
 	}
@@ -383,6 +384,7 @@ static bool row_undo_ins_parse_undo_rec(undo_node_t* node, bool dict_locked)
 		goto close_table;
 	case TRX_UNDO_INSERT_METADATA:
 	case TRX_UNDO_INSERT_REC:
+	case TRX_UNDO_EMPTY:
 		break;
 	case TRX_UNDO_RENAME_TABLE:
 		dict_table_t* table = node->table;
@@ -400,7 +402,7 @@ static bool row_undo_ins_parse_undo_rec(undo_node_t* node, bool dict_locked)
 		goto close_table;
 	}
 
-	if (UNIV_UNLIKELY(!fil_table_accessible(node->table))) {
+	if (UNIV_UNLIKELY(!node->table->is_accessible())) {
 close_table:
 		/* Normally, tables should not disappear or become
 		unaccessible during ROLLBACK, because they should be
@@ -419,12 +421,24 @@ close_table:
 		clust_index = dict_table_get_first_index(node->table);
 
 		if (clust_index != NULL) {
-			if (node->rec_type == TRX_UNDO_INSERT_REC) {
+			switch (node->rec_type) {
+			case TRX_UNDO_INSERT_REC:
 				ptr = trx_undo_rec_get_row_ref(
 					ptr, clust_index, &node->ref,
 					node->heap);
-			} else {
+				break;
+			case TRX_UNDO_EMPTY:
+				node->ref = nullptr;
+				return true;
+			default:
 				node->ref = &trx_undo_metadata;
+				if (!row_undo_search_clust_to_pcur(node)) {
+					/* An error probably occurred during
+					an insert into the clustered index,
+					after we wrote the undo log record. */
+					goto close_table;
+				}
+				return true;
 			}
 
 			if (!row_undo_search_clust_to_pcur(node)) {
@@ -529,9 +543,6 @@ row_undo_ins(
 		return DB_SUCCESS;
 	}
 
-	ut_ad(node->table->is_temporary()
-	      || lock_table_has_locks(node->table));
-
 	/* Iterate over all the indexes and undo the insert.*/
 
 	node->index = dict_table_get_first_index(node->table);
@@ -558,18 +569,18 @@ row_undo_ins(
 		if (node->table->id == DICT_INDEXES_ID) {
 			ut_ad(!node->table->is_temporary());
 			if (!dict_locked) {
-				mutex_enter(&dict_sys.mutex);
+				dict_sys.mutex_lock();
 			}
 			err = row_undo_ins_remove_clust_rec(node);
 			if (!dict_locked) {
-				mutex_exit(&dict_sys.mutex);
+				dict_sys.mutex_unlock();
 			}
 		} else {
 			err = row_undo_ins_remove_clust_rec(node);
 		}
 
 		if (err == DB_SUCCESS && node->table->stat_initialized) {
-			/* Not protected by dict_table_stats_lock() for
+			/* Not protected by dict_sys.mutex for
 			performance reasons, we would rather get garbage
 			in stat_n_rows (which is just an estimate anyway)
 			than protecting the following code with a latch. */
@@ -591,6 +602,11 @@ row_undo_ins(
 		log_free_check();
 		ut_ad(!node->table->is_temporary());
 		err = row_undo_ins_remove_clust_rec(node);
+		break;
+	case TRX_UNDO_EMPTY:
+		node->table->clear(thr);
+		err = DB_SUCCESS;
+		break;
 	}
 
 	dict_table_close(node->table, dict_locked, FALSE);

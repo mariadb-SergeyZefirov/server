@@ -248,6 +248,7 @@ int update_portion_of_time(THD *thd, TABLE *table,
   uint dst_fieldno= lcond ? table->s->period.end_fieldno
                           : table->s->period.start_fieldno;
 
+  ulonglong prev_insert_id= table->file->next_insert_id;
   store_record(table, record[1]);
   if (likely(!res))
     res= src->save_in_field(table->field[dst_fieldno], true);
@@ -262,6 +263,8 @@ int update_portion_of_time(THD *thd, TABLE *table,
     res= table->triggers->process_triggers(thd, TRG_EVENT_INSERT,
                                            TRG_ACTION_AFTER, true);
   restore_record(table, record[1]);
+  if (res)
+    table->file->restore_auto_increment(prev_insert_id);
 
   if (likely(!res) && lcond && rcond)
     res= table->period_make_insert(period_conds.end.item,
@@ -278,7 +281,15 @@ int TABLE::delete_row()
 
   store_record(this, record[1]);
   vers_update_end();
-  return file->ha_update_row(record[1], record[0]);
+  int err= file->ha_update_row(record[1], record[0]);
+  /*
+     MDEV-23644: we get HA_ERR_FOREIGN_DUPLICATE_KEY iff we already got history
+     row with same trx_id which is the result of foreign key action, so we
+     don't need one more history row.
+  */
+  if (err == HA_ERR_FOREIGN_DUPLICATE_KEY)
+    return file->ha_delete_row(record[0]);
+  return err;
 }
 
 

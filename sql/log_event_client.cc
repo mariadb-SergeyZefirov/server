@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2000, 2018, Oracle and/or its affiliates.
-   Copyright (c) 2009, 2020, MariaDB
+   Copyright (c) 2009, 2021, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -899,6 +899,16 @@ log_event_print_value(IO_CACHE *file, PRINT_EVENT_INFO *print_event_info,
     fprintf(stderr, "\nError: Found Old DECIMAL (mysql-4.1 or earlier). "
             "Not enough metadata to display the value.\n");
     break;
+
+  case MYSQL_TYPE_GEOMETRY:
+    strmake(typestr, "GEOMETRY", typestr_length);
+    if (!ptr)
+      goto return_null;
+
+    length= uint4korr(ptr);
+    my_b_write_quoted(file, ptr + meta, length);
+    return length + meta;
+
   default:
     print_event_info->flush_for_error();
     fprintf(stderr,

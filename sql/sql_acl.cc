@@ -304,8 +304,9 @@ ulong role_global_merges= 0, role_db_merges= 0, role_table_merges= 0,
 static void update_hostname(acl_host_and_ip *host, const char *hostname);
 static bool show_proxy_grants (THD *, const char *, const char *,
                                char *, size_t);
-static bool show_role_grants(THD *, const char *, const char *,
+static bool show_role_grants(THD *, const char *,
                              ACL_USER_BASE *, char *, size_t);
+static bool show_default_role(THD *, ACL_USER *, char *, size_t);
 static bool show_global_privileges(THD *, ACL_USER_BASE *,
                                    bool, char *, size_t);
 static bool show_database_privileges(THD *, const char *, const char *,
@@ -1056,6 +1057,9 @@ class User_table_tabular: public User_table
     if (access & REPL_SLAVE_ACL)
       access|= REPL_MASTER_ADMIN_ACL;
 
+    if (access & REPL_SLAVE_ACL)
+      access|= SLAVE_MONITOR_ACL;
+
     return access & GLOBAL_ACLS;
   }
 
@@ -1527,7 +1531,11 @@ class User_table_json: public User_table
   {
     privilege_t mask= ALL_KNOWN_ACL_100304;
     ulonglong orig_access= access;
-    if (version_id >= 100502)
+    if (version_id >= 100508)
+    {
+      mask= ALL_KNOWN_ACL_100508;
+    }
+    else if (version_id >= 100502 && version_id < 100508)
     {
       mask= ALL_KNOWN_ACL_100502;
     }
@@ -1553,6 +1561,12 @@ class User_table_json: public User_table
         }
         access|= GLOBAL_SUPER_ADDED_SINCE_USER_TABLE_ACLS;
       }
+      /*
+        REPLICATION_CLIENT(BINLOG_MONITOR_ACL) should allow SHOW SLAVE STATUS
+        REPLICATION SLAVE should allow SHOW RELAYLOG EVENTS
+      */
+      if (access & BINLOG_MONITOR_ACL || access & REPL_SLAVE_ACL)
+        access|= SLAVE_MONITOR_ACL;
     }
 
     if (orig_access & ~mask)
@@ -8973,7 +8987,7 @@ static const char *command_array[]=
   "CREATE USER", "EVENT", "TRIGGER", "CREATE TABLESPACE", "DELETE HISTORY",
   "SET USER", "FEDERATED ADMIN", "CONNECTION ADMIN", "READ_ONLY ADMIN",
   "REPLICATION SLAVE ADMIN", "REPLICATION MASTER ADMIN", "BINLOG ADMIN",
-  "BINLOG REPLAY"
+  "BINLOG REPLAY", "SLAVE MONITOR"
 };
 
 static uint command_lengths[]=
@@ -8986,7 +9000,7 @@ static uint command_lengths[]=
   11, 5, 7, 17, 14,
   8, 15, 16, 15,
   23, 24, 12,
-  13
+  13, 13
 };
 
 
@@ -9000,7 +9014,7 @@ static bool print_grants_for_role(THD *thd, ACL_ROLE * role)
 {
   char buff[1024];
 
-  if (show_role_grants(thd, role->user.str, "", role, buff, sizeof(buff)))
+  if (show_role_grants(thd, "", role, buff, sizeof(buff)))
     return TRUE;
 
   if (show_global_privileges(thd, role, TRUE, buff, sizeof(buff)))
@@ -9086,6 +9100,9 @@ bool mysql_show_create_user(THD *thd, LEX_USER *lex_user)
   append_identifier(thd, &result, username, strlen(username));
   add_user_parameters(thd, &result, acl_user, false);
 
+  if (acl_user->account_locked)
+    result.append(STRING_WITH_LEN(" ACCOUNT LOCK"));
+
   if (acl_user->password_expired)
     result.append(STRING_WITH_LEN(" PASSWORD EXPIRE"));
   else if (!acl_user->password_lifetime)
@@ -9096,9 +9113,6 @@ bool mysql_show_create_user(THD *thd, LEX_USER *lex_user)
     result.append_longlong(acl_user->password_lifetime);
     result.append(STRING_WITH_LEN(" DAY"));
   }
-
-  if (acl_user->account_locked)
-    result.append(STRING_WITH_LEN(" ACCOUNT LOCK"));
 
   protocol->prepare_for_resend();
   protocol->store(result.ptr(), result.length(), result.charset());
@@ -9245,7 +9259,7 @@ bool mysql_show_grants(THD *thd, LEX_USER *lex_user)
     }
 
     /* Show granted roles to acl_user */
-    if (show_role_grants(thd, username, hostname, acl_user, buff, sizeof(buff)))
+    if (show_role_grants(thd, hostname, acl_user, buff, sizeof(buff)))
       goto end;
 
     /* Add first global access grants */
@@ -9302,6 +9316,14 @@ bool mysql_show_grants(THD *thd, LEX_USER *lex_user)
     }
   }
 
+  if (username)
+  {
+    /* Show default role to acl_user */
+    if (show_default_role(thd, acl_user, buff, sizeof(buff)))
+      goto end;
+  }
+
+
   error= 0;
 end:
   mysql_mutex_unlock(&acl_cache->lock);
@@ -9328,15 +9350,44 @@ static ROLE_GRANT_PAIR *find_role_grant_pair(const LEX_CSTRING *u,
     my_hash_search(&acl_roles_mappings, (uchar*)pair_key.ptr(), key_length);
 }
 
-static bool show_role_grants(THD *thd, const char *username,
-                             const char *hostname, ACL_USER_BASE *acl_entry,
+static bool show_default_role(THD *thd, ACL_USER *acl_entry,
+                              char *buff, size_t buffsize)
+{
+  Protocol *protocol= thd->protocol;
+  LEX_CSTRING def_rolename= acl_entry->default_rolename;
+
+  if (def_rolename.length)
+  {
+    String def_str(buff, buffsize, system_charset_info);
+    def_str.length(0);
+    def_str.append(STRING_WITH_LEN("SET DEFAULT ROLE "));
+    def_str.append(&def_rolename);
+    def_str.append(" FOR '");
+    def_str.append(&acl_entry->user);
+    DBUG_ASSERT(!(acl_entry->flags & IS_ROLE));
+    def_str.append(STRING_WITH_LEN("'@'"));
+    def_str.append(acl_entry->host.hostname, acl_entry->hostname_length,
+                   system_charset_info);
+    def_str.append('\'');
+    protocol->prepare_for_resend();
+    protocol->store(def_str.ptr(),def_str.length(),def_str.charset());
+    if (protocol->write())
+    {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+static bool show_role_grants(THD *thd, const char *hostname,
+                             ACL_USER_BASE *acl_entry,
                              char *buff, size_t buffsize)
 {
   uint counter;
   Protocol *protocol= thd->protocol;
   LEX_CSTRING host= {const_cast<char*>(hostname), strlen(hostname)};
 
-  String grant(buff,sizeof(buff),system_charset_info);
+  String grant(buff, buffsize, system_charset_info);
   for (counter= 0; counter < acl_entry->role_grants.elements; counter++)
   {
     grant.length(0);
@@ -9377,7 +9428,7 @@ static bool show_global_privileges(THD *thd, ACL_USER_BASE *acl_entry,
   privilege_t want_access(NO_ACL);
   Protocol *protocol= thd->protocol;
 
-  String global(buff,sizeof(buff),system_charset_info);
+  String global(buff, buffsize, system_charset_info);
   global.length(0);
   global.append(STRING_WITH_LEN("GRANT "));
 
@@ -9412,6 +9463,8 @@ static bool show_global_privileges(THD *thd, ACL_USER_BASE *acl_entry,
     add_user_parameters(thd, &global, (ACL_USER *)acl_entry,
                         (want_access & GRANT_ACL));
 
+  else if (want_access & GRANT_ACL)
+    global.append(STRING_WITH_LEN(" WITH GRANT OPTION"));
   protocol->prepare_for_resend();
   protocol->store(global.ptr(),global.length(),global.charset());
   if (protocol->write())
@@ -9471,7 +9524,7 @@ static bool show_database_privileges(THD *thd, const char *username,
         want_access=acl_db->initial_access;
       if (want_access)
       {
-        String db(buff,sizeof(buff),system_charset_info);
+        String db(buff, buffsize, system_charset_info);
         db.length(0);
         db.append(STRING_WITH_LEN("GRANT "));
 
@@ -13148,15 +13201,6 @@ static bool find_mpvio_user(MPVIO_EXT *mpvio)
 
   ACL_USER *user= find_user_or_anon(sctx->host, sctx->user, sctx->ip);
 
-  if (user && user->password_errors >= max_password_errors && !ignore_max_password_errors(user))
-  {
-    mysql_mutex_unlock(&acl_cache->lock);
-    my_error(ER_USER_IS_BLOCKED, MYF(0));
-    general_log_print(mpvio->auth_info.thd, COM_CONNECT,
-      ER_THD(mpvio->auth_info.thd, ER_USER_IS_BLOCKED));
-    DBUG_RETURN(1);
-  }
-
   if (user)
     mpvio->acl_user= user->copy(mpvio->auth_info.thd->mem_root);
 
@@ -13191,6 +13235,15 @@ static bool find_mpvio_user(MPVIO_EXT *mpvio)
     mysql_mutex_unlock(&acl_cache->lock);
 
     mpvio->make_it_fail= true;
+  }
+
+  if (mpvio->acl_user->password_errors >= max_password_errors &&
+      !ignore_max_password_errors(mpvio->acl_user))
+  {
+    my_error(ER_USER_IS_BLOCKED, MYF(0));
+    general_log_print(mpvio->auth_info.thd, COM_CONNECT,
+      ER_THD(mpvio->auth_info.thd, ER_USER_IS_BLOCKED));
+    DBUG_RETURN(1);
   }
 
   /* user account requires non-default plugin and the client is too old */
@@ -14498,7 +14551,7 @@ static int native_password_authenticate(MYSQL_PLUGIN_VIO *vio,
   info->password_used= PASSWORD_USED_YES;
   if (pkt_len == SCRAMBLE_LENGTH)
   {
-    if (!info->auth_string_length)
+    if (info->auth_string_length != SCRAMBLE_LENGTH)
       DBUG_RETURN(CR_AUTH_USER_CREDENTIALS);
 
     if (check_scramble(pkt, thd->scramble, (uchar*)info->auth_string))
@@ -14525,10 +14578,15 @@ static int native_password_make_scramble(const char *password,
   return 0;
 }
 
+/* As this contains is a string of not a valid SCRAMBLE_LENGTH */
+static const char invalid_password[] = "*THISISNOTAVALIDPASSWORDTHATCANBEUSEDHERE";
+
 static int native_password_get_salt(const char *hash, size_t hash_length,
                                     unsigned char *out, size_t *out_length)
 {
+  DBUG_ASSERT(sizeof(invalid_password) > SCRAMBLE_LENGTH);
   DBUG_ASSERT(*out_length >= SCRAMBLE_LENGTH);
+  DBUG_ASSERT(*out_length >= sizeof(invalid_password));
   if (hash_length == 0)
   {
     *out_length= 0;
@@ -14537,8 +14595,27 @@ static int native_password_get_salt(const char *hash, size_t hash_length,
 
   if (hash_length != SCRAMBLED_PASSWORD_CHAR_LENGTH)
   {
+    if (hash_length == 7 && strcmp(hash, "invalid") == 0)
+    {
+      memcpy(out, invalid_password, sizeof(invalid_password));
+      *out_length= sizeof(invalid_password);
+      return 0;
+    }
     my_error(ER_PASSWD_LENGTH, MYF(0), SCRAMBLED_PASSWORD_CHAR_LENGTH);
     return 1;
+  }
+
+  for (const char *c= hash + 1; c < (hash + hash_length); c++)
+  {
+    /* If any non-hex characters are found, mark the password as invalid. */
+    if (!(*c >= '0' && *c <= '9') &&
+        !(*c >= 'A' && *c <= 'F') &&
+        !(*c >= 'a' && *c <= 'f'))
+    {
+      memcpy(out, invalid_password, sizeof(invalid_password));
+      *out_length= sizeof(invalid_password);
+      return 0;
+    }
   }
 
   *out_length= SCRAMBLE_LENGTH;
@@ -14679,3 +14756,40 @@ maria_declare_plugin(mysql_password)
   MariaDB_PLUGIN_MATURITY_STABLE                /* Maturity         */
 }
 maria_declare_plugin_end;
+
+
+/*
+  Exporting functions that allow plugins to do server-style
+  host/user matching. Used in server_audit2 plugin.
+*/
+extern "C" int maria_compare_hostname(
+                  const char *wild_host, long wild_ip, long ip_mask,
+                  const char *host, const char *ip)
+{
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+  acl_host_and_ip h;
+  h.hostname= (char *) wild_host;
+  h.ip= wild_ip;
+  h.ip_mask= ip_mask;
+
+  return compare_hostname(&h, host, ip);
+#else
+  return 0;
+#endif
+}
+
+
+extern "C" void maria_update_hostname(
+                  const char **wild_host, long *wild_ip, long *ip_mask,
+                  const char *host)
+{
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+  acl_host_and_ip h;
+  update_hostname(&h, host);
+  *wild_host= h.hostname;
+  *wild_ip= h.ip;
+  *ip_mask= h.ip_mask;
+#endif
+}
+
+

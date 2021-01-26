@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2020, MariaDB Corporation.
+Copyright (c) 2017, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -323,8 +323,6 @@ trx_rseg_header_create(
 		return block;
 	}
 
-	buf_block_dbg_add_level(block, SYNC_RSEG_HEADER_NEW);
-
 	ut_ad(0 == mach_read_from_4(TRX_RSEG_FORMAT + TRX_RSEG
 				    + block->frame));
 	ut_ad(0 == mach_read_from_4(TRX_RSEG_HISTORY_SIZE + TRX_RSEG
@@ -363,7 +361,7 @@ trx_rseg_mem_free(trx_rseg_t* rseg)
 	trx_undo_t*	undo;
 	trx_undo_t*	next_undo;
 
-	mutex_free(&rseg->mutex);
+	mysql_mutex_destroy(&rseg->mutex);
 
 	/* There can't be any active transactions. */
 	ut_a(UT_LIST_GET_LEN(rseg->undo_list) == 0);
@@ -391,7 +389,7 @@ trx_rseg_mem_free(trx_rseg_t* rseg)
 @param[in]	page_no		page number of the segment header */
 static
 trx_rseg_t*
-trx_rseg_mem_create(ulint id, fil_space_t* space, ulint page_no)
+trx_rseg_mem_create(ulint id, fil_space_t* space, uint32_t page_no)
 {
 	trx_rseg_t* rseg = static_cast<trx_rseg_t*>(
 		ut_zalloc_nokey(sizeof *rseg));
@@ -402,10 +400,10 @@ trx_rseg_mem_create(ulint id, fil_space_t* space, ulint page_no)
 	rseg->last_page_no = FIL_NULL;
 	rseg->curr_size = 1;
 
-	mutex_create(rseg->is_persistent()
-		     ? LATCH_ID_REDO_RSEG : LATCH_ID_NOREDO_RSEG,
-		     &rseg->mutex);
-
+	mysql_mutex_init(rseg->is_persistent()
+			 ? redo_rseg_mutex_key
+			 : noredo_rseg_mutex_key,
+			 &rseg->mutex, nullptr);
 	UT_LIST_INIT(rseg->undo_list, &trx_undo_t::undo_list);
 	UT_LIST_INIT(rseg->old_insert_list, &trx_undo_t::undo_list);
 	UT_LIST_INIT(rseg->undo_cached, &trx_undo_t::undo_list);
@@ -418,12 +416,12 @@ trx_rseg_mem_create(ulint id, fil_space_t* space, ulint page_no)
 @param[in,out]  max_trx_id      maximum observed transaction identifier
 @param[in]      rseg_header     rollback segment header
 @return the combined size of undo log segments in pages */
-static ulint trx_undo_lists_init(trx_rseg_t *rseg, trx_id_t &max_trx_id,
-                                 const buf_block_t *rseg_header)
+static uint32_t trx_undo_lists_init(trx_rseg_t *rseg, trx_id_t &max_trx_id,
+				    const buf_block_t *rseg_header)
 {
   ut_ad(srv_force_recovery < SRV_FORCE_NO_UNDO_LOG_SCAN);
 
-  ulint size= 0;
+  uint32_t size= 0;
 
   for (ulint i= 0; i < TRX_RSEG_N_SLOTS; i++)
   {
@@ -457,34 +455,25 @@ trx_rseg_mem_restore(trx_rseg_t* rseg, trx_id_t& max_trx_id, mtr_t* mtr)
 			max_trx_id = id;
 		}
 
-		const char* binlog_name = TRX_RSEG + TRX_RSEG_BINLOG_NAME
-			+ reinterpret_cast<const char*>(rseg_hdr->frame);
+		const byte* binlog_name = TRX_RSEG + TRX_RSEG_BINLOG_NAME
+			+ rseg_hdr->frame;
 		if (*binlog_name) {
+			lsn_t lsn = mach_read_from_8(my_assume_aligned<8>(
+							     FIL_PAGE_LSN
+							     + rseg_hdr
+							     ->frame));
 			compile_time_assert(TRX_RSEG_BINLOG_NAME_LEN == sizeof
 					    trx_sys.recovered_binlog_filename);
-
-			int cmp = *trx_sys.recovered_binlog_filename
-				? strncmp(binlog_name,
-					  trx_sys.recovered_binlog_filename,
-					  TRX_RSEG_BINLOG_NAME_LEN)
-				: 1;
-
-			if (cmp >= 0) {
-				uint64_t binlog_offset = mach_read_from_8(
-					TRX_RSEG + TRX_RSEG_BINLOG_OFFSET
-					+ rseg_hdr->frame);
-				if (cmp) {
-					memcpy(trx_sys.
-					       recovered_binlog_filename,
-					       binlog_name,
-					       TRX_RSEG_BINLOG_NAME_LEN);
-					trx_sys.recovered_binlog_offset
-						= binlog_offset;
-				} else if (binlog_offset >
-					   trx_sys.recovered_binlog_offset) {
-					trx_sys.recovered_binlog_offset
-						= binlog_offset;
-				}
+			if (lsn > trx_sys.recovered_binlog_lsn) {
+				trx_sys.recovered_binlog_lsn = lsn;
+				trx_sys.recovered_binlog_offset
+					= mach_read_from_8(
+						TRX_RSEG
+						+ TRX_RSEG_BINLOG_OFFSET
+						+ rseg_hdr->frame);
+				memcpy(trx_sys.recovered_binlog_filename,
+				       binlog_name,
+				       TRX_RSEG_BINLOG_NAME_LEN);
 			}
 
 #ifdef WITH_WSREP
@@ -671,7 +660,7 @@ trx_rseg_create(ulint space_id)
 
 	mtr.start();
 
-	fil_space_t*	space = mtr_x_lock_space(space_id, &mtr);
+	fil_space_t*	space = mtr.x_lock_space(space_id);
 	ut_ad(space->purpose == FIL_TYPE_TABLESPACE);
 
 	if (buf_block_t* sys_header = trx_sysf_get(&mtr)) {
@@ -706,7 +695,7 @@ trx_temp_rseg_create()
 	for (ulong i = 0; i < TRX_SYS_N_RSEGS; i++) {
 		mtr.start();
 		mtr.set_log_mode(MTR_LOG_NO_REDO);
-		mtr_x_lock_space(fil_system.temp_space, &mtr);
+		mtr.x_lock_space(fil_system.temp_space);
 
 		buf_block_t* rblock = trx_rseg_header_create(
 			fil_system.temp_space, i, NULL, &mtr);

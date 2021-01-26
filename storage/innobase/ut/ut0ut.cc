@@ -38,6 +38,9 @@ Created 5/11/1994 Heikki Tuuri
 #include <string>
 #include "log.h"
 #include "my_cpu.h"
+#ifndef DBUG_OFF
+#include "rem0rec.h"
+#endif
 
 /**********************************************************//**
 Returns the number of milliseconds since some epoch.  The
@@ -59,42 +62,39 @@ ut_print_timestamp(
 /*===============*/
 	FILE*  file) /*!< in: file where to print */
 {
-	ulint thread_id = 0;
-
-#ifndef UNIV_INNOCHECKSUM
-	thread_id = os_thread_pf(os_thread_get_curr_id());
-#endif /* !UNIV_INNOCHECKSUM */
-
 #ifdef _WIN32
 	SYSTEMTIME cal_tm;
-
 	GetLocalTime(&cal_tm);
-
-	fprintf(file, "%d-%02d-%02d %02d:%02d:%02d %#zx",
-		(int) cal_tm.wYear,
-		(int) cal_tm.wMonth,
-		(int) cal_tm.wDay,
-		(int) cal_tm.wHour,
-		(int) cal_tm.wMinute,
-		(int) cal_tm.wSecond,
-		thread_id);
 #else
-	struct tm* cal_tm_ptr;
 	time_t	   tm;
-
 	struct tm  cal_tm;
 	time(&tm);
 	localtime_r(&tm, &cal_tm);
-	cal_tm_ptr = &cal_tm;
-	fprintf(file, "%d-%02d-%02d %02d:%02d:%02d %#zx",
-		cal_tm_ptr->tm_year + 1900,
-		cal_tm_ptr->tm_mon + 1,
-		cal_tm_ptr->tm_mday,
-		cal_tm_ptr->tm_hour,
-		cal_tm_ptr->tm_min,
-		cal_tm_ptr->tm_sec,
-		thread_id);
 #endif
+	fprintf(file,
+		IF_WIN("%u-%02u-%02u %02u:%02u:%02u %#zx",
+		       "%d-%02d-%02d %02d:%02d:%02d %#zx"),
+#ifdef _WIN32
+		cal_tm.wYear,
+		cal_tm.wMonth,
+		cal_tm.wDay,
+		cal_tm.wHour,
+		cal_tm.wMinute,
+		cal_tm.wSecond,
+#else
+		cal_tm.tm_year + 1900,
+		cal_tm.tm_mon + 1,
+		cal_tm.tm_mday,
+		cal_tm.tm_hour,
+		cal_tm.tm_min,
+		cal_tm.tm_sec,
+#endif
+#ifdef UNIV_INNOCHECKSUM
+		ulint{0}
+#else
+		ulint(os_thread_get_curr_id())
+#endif
+		);
 }
 
 #ifndef UNIV_INNOCHECKSUM
@@ -108,31 +108,27 @@ ut_sprintf_timestamp(
 {
 #ifdef _WIN32
 	SYSTEMTIME cal_tm;
-
 	GetLocalTime(&cal_tm);
 
-	sprintf(buf, "%02d%02d%02d %2d:%02d:%02d",
-		(int) cal_tm.wYear % 100,
-		(int) cal_tm.wMonth,
-		(int) cal_tm.wDay,
-		(int) cal_tm.wHour,
-		(int) cal_tm.wMinute,
-		(int) cal_tm.wSecond);
+	sprintf(buf, "%02u%02u%02u %2u:%02u:%02u",
+		cal_tm.wYear % 100,
+		cal_tm.wMonth,
+		cal_tm.wDay,
+		cal_tm.wHour,
+		cal_tm.wMinute,
+		cal_tm.wSecond);
 #else
-	struct tm* cal_tm_ptr;
 	time_t	   tm;
-
 	struct tm  cal_tm;
 	time(&tm);
 	localtime_r(&tm, &cal_tm);
-	cal_tm_ptr = &cal_tm;
 	sprintf(buf, "%02d%02d%02d %2d:%02d:%02d",
-		cal_tm_ptr->tm_year % 100,
-		cal_tm_ptr->tm_mon + 1,
-		cal_tm_ptr->tm_mday,
-		cal_tm_ptr->tm_hour,
-		cal_tm_ptr->tm_min,
-		cal_tm_ptr->tm_sec);
+		cal_tm.tm_year % 100,
+		cal_tm.tm_mon + 1,
+		cal_tm.tm_mday,
+		cal_tm.tm_hour,
+		cal_tm.tm_min,
+		cal_tm.tm_sec);
 #endif
 }
 
@@ -603,5 +599,50 @@ fatal_or_error::~fatal_or_error()
 }
 
 } // namespace ib
+
+#ifndef DBUG_OFF
+static char dbug_print_buf[1024];
+
+const char * dbug_print_rec(const rec_t* rec, const rec_offs* offsets)
+{
+	rec_printer r(rec, offsets);
+	strmake(dbug_print_buf, r.str().c_str(), sizeof(dbug_print_buf) - 1);
+	return dbug_print_buf;
+}
+
+const char * dbug_print_rec(const rec_t* rec, ulint info, const rec_offs* offsets)
+{
+	rec_printer r(rec, info, offsets);
+	strmake(dbug_print_buf, r.str().c_str(), sizeof(dbug_print_buf) - 1);
+	return dbug_print_buf;
+}
+
+const char * dbug_print_rec(const dtuple_t* tuple)
+{
+	rec_printer r(tuple);
+	strmake(dbug_print_buf, r.str().c_str(), sizeof(dbug_print_buf) - 1);
+	return dbug_print_buf;
+}
+
+const char * dbug_print_rec(const dfield_t* field, ulint n)
+{
+	rec_printer r(field, n);
+	strmake(dbug_print_buf, r.str().c_str(), sizeof(dbug_print_buf) - 1);
+	return dbug_print_buf;
+}
+
+const char * dbug_print_rec(const rec_t* rec, dict_index_t* index)
+{
+	rec_offs	offsets_[REC_OFFS_NORMAL_SIZE];
+	rec_offs*	offsets		= offsets_;
+	rec_offs_init(offsets_);
+	mem_heap_t*	tmp_heap	= NULL;
+	offsets = rec_get_offsets(rec, index, offsets, true,
+				  ULINT_UNDEFINED, &tmp_heap);
+	rec_printer r(rec, offsets);
+	strmake(dbug_print_buf, r.str().c_str(), sizeof(dbug_print_buf) - 1);
+	return dbug_print_buf;
+}
+#endif /* !DBUG_OFF */
 
 #endif /* !UNIV_INNOCHECKSUM */

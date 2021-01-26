@@ -2818,7 +2818,7 @@ static bool wait_for_relay_log_space(Relay_log_info* rli)
       DBUG_PRINT("info", ("log_space_limit=%llu log_space_total=%llu "
                           "ignore_log_space_limit=%d "
                           "sql_force_rotate_relay=%d", 
-                        rli->log_space_limit, rli->log_space_total,
+                        rli->log_space_limit, uint64(rli->log_space_total),
                         (int) rli->ignore_log_space_limit,
                         (int) rli->sql_force_rotate_relay));
     }
@@ -5084,7 +5084,7 @@ Stopping slave I/O thread due to out-of-memory error from master");
       {
         DBUG_PRINT("info", ("log_space_limit=%llu log_space_total=%llu "
                             "ignore_log_space_limit=%d",
-                            rli->log_space_limit, rli->log_space_total,
+                            rli->log_space_limit, uint64(rli->log_space_total),
                             (int) rli->ignore_log_space_limit));
       }
 #endif
@@ -5106,15 +5106,16 @@ err:
   // print the current replication position
   if (mi->using_gtid == Master_info::USE_GTID_NO)
     sql_print_information("Slave I/O thread exiting, read up to log '%s', "
-                          "position %llu", IO_RPL_LOG_NAME, mi->master_log_pos);
+                          "position %llu, master %s:%d", IO_RPL_LOG_NAME, mi->master_log_pos,
+                           mi->host, mi->port);
   else
   {
     StringBuffer<100> tmp;
     mi->gtid_current_pos.to_string(&tmp);
     sql_print_information("Slave I/O thread exiting, read up to log '%s', "
-                          "position %llu; GTID position %s",
+                          "position %llu; GTID position %s, master %s:%d",
                           IO_RPL_LOG_NAME, mi->master_log_pos,
-                          tmp.c_ptr_safe());
+                          tmp.c_ptr_safe(), mi->host, mi->port);
   }
   repl_semisync_slave.slave_stop(mi);
   thd->reset_query();
@@ -5717,8 +5718,9 @@ pthread_handler_t handle_slave_sql(void *arg)
       tmp.append(STRING_WITH_LEN("'"));
     }
     sql_print_information("Slave SQL thread exiting, replication stopped in "
-                          "log '%s' at position %llu%s", RPL_LOG_NAME,
-                          rli->group_master_log_pos, tmp.c_ptr_safe());
+                          "log '%s' at position %llu%s, master: %s:%d", RPL_LOG_NAME,
+                          rli->group_master_log_pos, tmp.c_ptr_safe(),
+                          mi->host, mi->port);
   }
 #ifdef WITH_WSREP
   wsrep_after_command_before_result(thd);

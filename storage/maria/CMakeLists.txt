@@ -52,6 +52,11 @@ IF(APPLE)
   ADD_DEFINITIONS(-fno-common)
 ENDIF()
 
+IF(CMAKE_SYSTEM_NAME MATCHES AIX)
+  # Workaround linker bug on AIX
+  SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-berok")
+ENDIF()
+
 MYSQL_ADD_PLUGIN(aria ${ARIA_SOURCES} STORAGE_ENGINE MANDATORY
                  LINK_LIBRARIES myisam mysys mysys_ssl
                  RECOMPILE_FOR_EMBEDDED)
@@ -109,7 +114,8 @@ INCLUDE (CheckIncludeFiles)
 SET(S3_SOURCES s3_func.c
     libmarias3/src/debug.c libmarias3/src/error.c libmarias3/src/marias3.c
     libmarias3/src/request.c libmarias3/src/response.c libmarias3/src/sha256.c
-    libmarias3/src/sha256-internal.c libmarias3/src/xml.c)
+    libmarias3/src/sha256-internal.c libmarias3/src/xml.c
+    libmarias3/src/assume_role.c)
 
 IF(NOT PLUGIN_S3 STREQUAL NO)
   FIND_PACKAGE(CURL)

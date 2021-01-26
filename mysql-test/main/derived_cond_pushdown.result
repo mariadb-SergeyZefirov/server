@@ -10024,11 +10024,11 @@ EXPLAIN
       "access_type": "ALL",
       "rows": 3,
       "filtered": 100,
-      "attached_condition": "case when (tab2.max_a = 1 or tab2.max_a = 2) then 1 else 0 end = 1",
+      "attached_condition": "case when tab2.max_a = 1 or tab2.max_a = 2 then 1 else 0 end = 1",
       "materialized": {
         "query_block": {
           "select_id": 3,
-          "having_condition": "case when (max_a = 1 or max_a = 2) then 1 else 0 end = 1",
+          "having_condition": "case when max_a = 1 or max_a = 2 then 1 else 0 end = 1",
           "filesort": {
             "sort_key": "t1.b",
             "temporary_table": {
@@ -10073,11 +10073,11 @@ EXPLAIN
       "access_type": "ALL",
       "rows": 3,
       "filtered": 100,
-      "attached_condition": "case when (tab2.max_a = 1 or tab2.max_a > 2 and tab2.max_a < 4) then 1 else 0 end = 1",
+      "attached_condition": "case when tab2.max_a = 1 or tab2.max_a > 2 and tab2.max_a < 4 then 1 else 0 end = 1",
       "materialized": {
         "query_block": {
           "select_id": 3,
-          "having_condition": "case when (max_a = 1 or max_a > 2 and max_a < 4) then 1 else 0 end = 1",
+          "having_condition": "case when max_a = 1 or max_a > 2 and max_a < 4 then 1 else 0 end = 1",
           "filesort": {
             "sort_key": "t1.b",
             "temporary_table": {
@@ -10122,11 +10122,11 @@ EXPLAIN
       "access_type": "ALL",
       "rows": 3,
       "filtered": 100,
-      "attached_condition": "case when (tab2.max_a > 1 and (tab2.max_a = 2 or tab2.max_a > 2)) then 1 else 0 end = 1",
+      "attached_condition": "case when tab2.max_a > 1 and (tab2.max_a = 2 or tab2.max_a > 2) then 1 else 0 end = 1",
       "materialized": {
         "query_block": {
           "select_id": 3,
-          "having_condition": "case when (max_a > 1 and (max_a = 2 or max_a > 2)) then 1 else 0 end = 1",
+          "having_condition": "case when max_a > 1 and (max_a = 2 or max_a > 2) then 1 else 0 end = 1",
           "filesort": {
             "sort_key": "t1.b",
             "temporary_table": {
@@ -10171,7 +10171,7 @@ EXPLAIN
       "access_type": "ALL",
       "rows": 3,
       "filtered": 100,
-      "attached_condition": "case when (tab2.b = 2 or tab2.b = 4) then 1 else 0 end = 1",
+      "attached_condition": "case when tab2.b = 2 or tab2.b = 4 then 1 else 0 end = 1",
       "materialized": {
         "query_block": {
           "select_id": 3,
@@ -10183,7 +10183,7 @@ EXPLAIN
                 "access_type": "ALL",
                 "rows": 3,
                 "filtered": 100,
-                "attached_condition": "case when (t1.b = 2 or t1.b = 4) then 1 else 0 end = 1"
+                "attached_condition": "case when t1.b = 2 or t1.b = 4 then 1 else 0 end = 1"
               }
             }
           }
@@ -10566,6 +10566,47 @@ a
 abc
 DROP VIEW v1;
 DROP TABLE t1;
+#
+# MDEV-19179: pushdown into UNION of aggregation selects whose
+#             corresponding columns have different names
+#
+create table t1 (a int);
+insert into t1 values (3), (7), (1);
+select *
+from (select min(a) as x from t1 union all select max(a) as y from t1) t
+where x>0;
+x
+1
+7
+explain extended select *
+from (select min(a) as x from t1 union all select max(a) as y from t1) t
+where x>0;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	PRIMARY	<derived2>	ALL	NULL	NULL	NULL	NULL	6	100.00	Using where
+2	DERIVED	t1	ALL	NULL	NULL	NULL	NULL	3	100.00	
+3	UNION	t1	ALL	NULL	NULL	NULL	NULL	3	100.00	
+Warnings:
+Note	1003	/* select#1 */ select `t`.`x` AS `x` from (/* select#2 */ select min(`test`.`t1`.`a`) AS `x` from `test`.`t1` having `x` > 0 union all /* select#3 */ select max(`test`.`t1`.`a`) AS `x` from `test`.`t1` having `x` > 0) `t` where `t`.`x` > 0
+prepare stmt from "select *
+from (select min(a) as x from t1 union all select max(a) as y from t1) t
+where x>0";
+execute stmt;
+x
+1
+7
+execute stmt;
+x
+1
+7
+deallocate prepare stmt;
+create view v1(m) as
+select min(a) as x from t1 union all select max(a) as y from t1;
+select * from v1 where m > 0;
+m
+1
+7
+drop view v1;
+drop table t1;
 # End of 10.2 tests
 #
 # MDEV-14579: pushdown conditions into materialized views/derived tables
@@ -16993,6 +17034,78 @@ id
 2
 3
 DROP TABLE t;
+#
+# MDEV-23804: Server crashes in st_select_lex::collect_grouping_fields_for_derived
+#
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (3),(4);
+CREATE VIEW v1 AS SELECT a FROM t1 UNION VALUES (3),(4);
+ANALYZE FORMAT=JSON SELECT * from v1 WHERE a=3;
+ANALYZE
+{
+  "query_block": {
+    "select_id": 1,
+    "r_loops": 1,
+    "r_total_time_ms": "REPLACED",
+    "table": {
+      "table_name": "<derived2>",
+      "access_type": "ALL",
+      "r_loops": 1,
+      "rows": 4,
+      "r_rows": 2,
+      "r_table_time_ms": "REPLACED",
+      "r_other_time_ms": "REPLACED",
+      "filtered": 100,
+      "r_filtered": 50,
+      "attached_condition": "v1.a = 3",
+      "materialized": {
+        "query_block": {
+          "union_result": {
+            "table_name": "<union2,3>",
+            "access_type": "ALL",
+            "r_loops": 1,
+            "r_rows": 2,
+            "query_specifications": [
+              {
+                "query_block": {
+                  "select_id": 2,
+                  "r_loops": 1,
+                  "r_total_time_ms": "REPLACED",
+                  "table": {
+                    "table_name": "t1",
+                    "access_type": "ALL",
+                    "r_loops": 1,
+                    "rows": 2,
+                    "r_rows": 2,
+                    "r_table_time_ms": "REPLACED",
+                    "r_other_time_ms": "REPLACED",
+                    "filtered": 100,
+                    "r_filtered": 50,
+                    "attached_condition": "t1.a = 3"
+                  }
+                }
+              },
+              {
+                "query_block": {
+                  "select_id": 3,
+                  "operation": "UNION",
+                  "table": {
+                    "message": "No tables used"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+SELECT * from v1 WHERE a=3;
+a
+3
+DROP VIEW v1;
+DROP TABLE t1;
 # End of 10.3 tests
 #
 # MDEV-18679: materialized view with SELECT S containing materialized

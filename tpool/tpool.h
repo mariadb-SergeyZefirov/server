@@ -114,7 +114,7 @@ enum class aio_opcode
   AIO_PREAD,
   AIO_PWRITE
 };
-const int MAX_AIO_USERDATA_LEN= 40;
+constexpr size_t MAX_AIO_USERDATA_LEN= 3 * sizeof(void*);
 
 /** IO control block, includes parameters for the IO, and the callback*/
 
@@ -220,7 +220,7 @@ public:
   {
     if (use_native_aio)
       m_aio.reset(create_native_aio(max_io));
-    if (!m_aio)
+    else
       m_aio.reset(create_simulated_aio(this));
     return !m_aio ? -1 : 0;
   }

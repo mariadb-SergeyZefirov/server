@@ -2465,7 +2465,7 @@ static Sys_var_ulong Sys_max_sort_length(
        "the first max_sort_length bytes of each value are used; the rest "
        "are ignored)",
        SESSION_VAR(max_sort_length), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(8, 8192*1024L), DEFAULT(1024), BLOCK_SIZE(1));
+       VALID_RANGE(64, 8192*1024L), DEFAULT(1024), BLOCK_SIZE(1));
 
 static Sys_var_ulong Sys_max_sp_recursion_depth(
        "max_sp_recursion_depth",
@@ -4325,7 +4325,7 @@ static bool fix_autocommit(sys_var *self, THD *thd, enum_var_type type)
     if (trans_commit_stmt(thd) || trans_commit(thd))
     {
       thd->variables.option_bits&= ~OPTION_AUTOCOMMIT;
-      thd->mdl_context.release_transactional_locks();
+      thd->release_transactional_locks();
       WSREP_DEBUG("autocommit, MDL TRX lock released: %lld",
                   (longlong) thd->thread_id);
       return true;
@@ -4785,11 +4785,11 @@ static Sys_var_ulong Sys_default_week_format(
        SESSION_VAR(default_week_format), CMD_LINE(REQUIRED_ARG),
        VALID_RANGE(0, 7), DEFAULT(0), BLOCK_SIZE(1));
 
-static Sys_var_ulonglong Sys_group_concat_max_len(
+static Sys_var_uint Sys_group_concat_max_len(
        "group_concat_max_len",
        "The maximum length of the result of function GROUP_CONCAT()",
        SESSION_VAR(group_concat_max_len), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(4, SIZE_T_MAX), DEFAULT(1024*1024), BLOCK_SIZE(1));
+       VALID_RANGE(4, UINT_MAX32), DEFAULT(1024*1024), BLOCK_SIZE(1));
 
 static char *glob_hostname_ptr;
 static Sys_var_charptr Sys_hostname(
@@ -6051,8 +6051,10 @@ static Sys_var_uint Sys_wsrep_gtid_domain_id(
        "wsrep_gtid_domain_id", "When wsrep_gtid_mode is set, this value is "
        "used as gtid_domain_id for galera transactions and also copied to the "
        "joiner nodes during state transfer. It is ignored, otherwise.",
-       GLOBAL_VAR(wsrep_gtid_server.domain_id), CMD_LINE(REQUIRED_ARG),
-       VALID_RANGE(0, UINT_MAX32), DEFAULT(0), BLOCK_SIZE(1));
+       GLOBAL_VAR(wsrep_gtid_domain_id), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, UINT_MAX32), DEFAULT(0), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+       ON_UPDATE(wsrep_gtid_domain_id_update));
 
 static Sys_var_ulonglong Sys_wsrep_gtid_seq_no(
        "wsrep_gtid_seq_no",

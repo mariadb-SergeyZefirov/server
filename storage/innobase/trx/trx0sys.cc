@@ -154,16 +154,15 @@ trx_sysf_create(
 	then enter the kernel: we must do it in this order to conform
 	to the latching order rules. */
 
-	mtr_x_lock_space(fil_system.sys_space, mtr);
+	mtr->x_lock_space(fil_system.sys_space);
 	compile_time_assert(TRX_SYS_SPACE == 0);
 
 	/* Create the trx sys file block in a new allocated file segment */
 	block = fseg_create(fil_system.sys_space,
 			    TRX_SYS + TRX_SYS_FSEG_HEADER,
 			    mtr);
-	buf_block_dbg_add_level(block, SYNC_TRX_SYS_HEADER);
 
-	ut_a(block->page.id().page_no() == TRX_SYS_PAGE_NO);
+	ut_a(block->page.id() == page_id_t(0, TRX_SYS_PAGE_NO));
 
 	mtr->write<2>(*block, FIL_PAGE_TYPE + block->frame,
 		      FIL_PAGE_TYPE_TRX_SYS);
@@ -195,7 +194,7 @@ trx_sysf_create(
 						     slot_no, block, mtr);
 
 	ut_a(slot_no == TRX_SYS_SYSTEM_RSEG_ID);
-	ut_a(rblock->page.id().page_no() == FSP_FIRST_RSEG_PAGE_NO);
+	ut_a(rblock->page.id() == page_id_t(0, FSP_FIRST_RSEG_PAGE_NO));
 }
 
 /** Create the instance */

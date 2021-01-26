@@ -259,6 +259,7 @@ connection server_1;
 CREATE TABLE t3 (a INT PRIMARY KEY, b INT, KEY b_idx(b)) ENGINE=InnoDB;
 INSERT INTO t3 VALUES (1,NULL), (2,2), (3,NULL), (4,4), (5, NULL), (6, 6);
 CREATE TABLE t4 (a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t4 VALUES(100, 100);
 SET @old_format= @@SESSION.binlog_format;
 SET binlog_format='statement';
 connection server_2;
@@ -344,6 +345,7 @@ DROP function foo;
 connection server_2;
 connection server_1;
 CREATE TABLE t1 (a int PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t1 VALUES(100, 100);
 connection server_2;
 include/stop_slave.inc
 SET @old_parallel_threads=@@GLOBAL.slave_parallel_threads;
@@ -372,7 +374,7 @@ connection server_2;
 SET @old_dbug= @@GLOBAL.debug_dbug;
 SET @@GLOBAL.debug_dbug="+d,rpl_parallel_simulate_wait_at_retry";
 include/start_slave.inc
-# Make sure the 2nd seqno_1001 worker has gotten to waiting
+# Make sure both workers are waiting at their sync points
 # Signal to the 1st to proceed after it has reached termination state
 SET @@DEBUG_SYNC='now SIGNAL proceed_by_1000';
 connection spoiler_21;

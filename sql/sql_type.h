@@ -374,7 +374,7 @@ class Dec_ptr_and_buffer: public Dec_ptr
 protected:
   my_decimal m_buffer;
 public:
-  int round_to(my_decimal *to, uint scale, decimal_round_mode mode)
+  int round_to(my_decimal *to, int scale, decimal_round_mode mode)
   {
     DBUG_ASSERT(m_ptr);
     return m_ptr->round_to(to, scale, mode);
@@ -382,6 +382,14 @@ public:
   int round_self(uint scale, decimal_round_mode mode)
   {
     return round_to(&m_buffer, scale, mode);
+  }
+  int round_self_if_needed(int scale, decimal_round_mode mode)
+  {
+    if (scale >= m_ptr->frac)
+      return E_DEC_OK;
+    int res= m_ptr->round_to(&m_buffer, scale, mode);
+    m_ptr= &m_buffer;
+    return res;
   }
   String *to_string_round(String *to, uint dec)
   {
@@ -3934,8 +3942,7 @@ public:
   virtual Field *make_schema_field(MEM_ROOT *root,
                                    TABLE *table,
                                    const Record_addr &addr,
-                                   const ST_FIELD_INFO &def,
-                                   bool show_field) const
+                                   const ST_FIELD_INFO &def) const
   {
     DBUG_ASSERT(0);
     return NULL;
@@ -3979,7 +3986,6 @@ public:
                           const Type_std_attributes *item,
                           SORT_FIELD_ATTR *attr) const= 0;
   virtual bool is_packable() const { return false; }
-
 
   virtual uint32 max_display_length(const Item *item) const= 0;
   virtual uint32 Item_decimal_notation_int_digits(const Item *item) const { return 0; }
@@ -4043,9 +4049,21 @@ public:
                                Item *target_expr, Item *target_value,
                                Item_bool_func2 *source,
                                Item *source_expr, Item *source_const) const= 0;
+
+  /*
+    @brief
+      Check if an IN subquery allows materialization or not
+    @param
+      inner              expression on the inner side of the IN subquery
+      outer              expression on the outer side of the IN subquery
+      is_in_predicate    SET to true if IN subquery was converted from an
+                         IN predicate or we are checking if materialization
+                         strategy can be used for an IN predicate
+  */
   virtual bool
   subquery_type_allows_materialization(const Item *inner,
-                                       const Item *outer) const= 0;
+                                       const Item *outer,
+                                       bool is_in_predicate) const= 0;
   /**
     Make a simple constant replacement item for a constant "src",
     so the new item can futher be used for comparison with "cmp", e.g.:
@@ -4305,8 +4323,8 @@ public:
     DBUG_ASSERT(0);
     return 0;
   }
-  bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override
+  bool subquery_type_allows_materialization(const Item *, const Item *,
+                                            bool) const override
   {
     DBUG_ASSERT(0);
     return false;
@@ -4708,7 +4726,8 @@ public:
   int stored_field_cmp_to_item(THD *thd, Field *field, Item *item)
                                const override;
   bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer)
+                                            const Item *outer,
+                                            bool is_in_predicate)
                                             const override;
   void make_sort_key_part(uchar *to, Item *item,
                           const SORT_FIELD_ATTR *sort_field,
@@ -4813,12 +4832,13 @@ public:
     return item_val.is_null() ? 0 : my_decimal(field).cmp(item_val.ptr());
   }
   bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override;
+                                            const Item *outer,
+                                            bool is_in_predicate)
+    const override;
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_num_distinct_aggregator_field(MEM_ROOT *, const Item *)
     const override;
   void make_sort_key_part(uchar *to, Item *item,
@@ -5068,7 +5088,9 @@ public:
   const Type_handler *type_handler_for_comparison() const override;
   int stored_field_cmp_to_item(THD *thd, Field *field, Item *item) const override;
   bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override;
+                                            const Item *outer,
+                                            bool is_in_predicate)
+    const override;
   Field *make_num_distinct_aggregator_field(MEM_ROOT *, const Item *) const override;
   Field *make_table_field(MEM_ROOT *root,
                           const LEX_CSTRING *name,
@@ -5209,7 +5231,9 @@ public:
                                    Item *source_expr, Item *source_const)
     const override;
   bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override;
+                                            const Item *outer,
+                                            bool is_in_predicate)
+    const override;
   bool Item_func_min_max_fix_attributes(THD *thd, Item_func_min_max *func,
                                         Item **items, uint nitems)
     const override;
@@ -5249,7 +5273,7 @@ public:
   bool Item_func_mul_fix_length_and_dec(Item_func_mul *) const override;
   bool Item_func_div_fix_length_and_dec(Item_func_div *) const override;
   bool Item_func_mod_fix_length_and_dec(Item_func_mod *) const override;
-  const Vers_type_handler *vers() const override { return &vers_type_timestamp; }
+  const Vers_type_handler *vers() const override;
 };
 
 
@@ -5286,7 +5310,7 @@ public:
   void sort_length(THD *thd,
                    const Type_std_attributes *item,
                    SORT_FIELD_ATTR *attr) const override;
-  bool is_packable()const override { return true; }
+  bool is_packable() const override { return true; }
   bool union_element_finalize(const Item * item) const override;
   uint calc_key_length(const Column_definition &def) const override;
   bool Column_definition_prepare_stage1(THD *thd,
@@ -5347,7 +5371,9 @@ public:
                                    Item *source_expr, Item *source_const) const
     override;
   bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override;
+                                            const Item *outer,
+                                            bool is_in_predicate)
+    const override;
   Item *make_const_item_for_comparison(THD *, Item *src, const Item *cmp) const
     override;
   Item_cache *Item_get_cache(THD *thd, const Item *item) const override;
@@ -5416,7 +5442,7 @@ public:
   bool Item_func_mul_fix_length_and_dec(Item_func_mul *) const override;
   bool Item_func_div_fix_length_and_dec(Item_func_div *) const override;
   bool Item_func_mod_fix_length_and_dec(Item_func_mod *) const override;
-  const Vers_type_handler *vers() const override { return &vers_type_timestamp; }
+  const Vers_type_handler *vers() const override;
 };
 
 
@@ -5477,8 +5503,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5529,8 +5554,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5581,8 +5605,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5648,8 +5671,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5879,8 +5901,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5935,8 +5956,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5991,8 +6011,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Item_literal *create_literal_item(THD *thd, const char *str, size_t length,
                                     CHARSET_INFO *cs, bool send_error)
                                     const override;
@@ -6202,8 +6221,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Item_literal *create_literal_item(THD *thd, const char *str, size_t length,
                                     CHARSET_INFO *cs, bool send_error)
                                     const override;
@@ -6333,8 +6351,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Item *create_typecast_item(THD *thd, Item *item,
                              const Type_cast_attributes &attr) const override;
   bool validate_implicit_default_value(THD *thd, const Column_definition &def)
@@ -6909,8 +6926,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -6988,8 +7004,8 @@ public:
   {
     return blob_type_handler(item);
   }
-  bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override
+  bool subquery_type_allows_materialization(const Item *, const Item *, bool)
+    const override
   {
     return false; // Materialization does not work with BLOB columns
   }
@@ -7030,8 +7046,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -7039,7 +7054,7 @@ public:
                                    const Bit_addr &bit,
                                    const Column_definition_attributes *attr,
                                    uint32 flags) const override;
-  const Vers_type_handler *vers() const override { return &vers_type_timestamp; }
+  const Vers_type_handler *vers() const override;
 };
 
 
@@ -7120,7 +7135,7 @@ public:
   {
     return MYSQL_TYPE_BLOB_COMPRESSED;
   }
-  ulong KEY_pack_flags(uint column_nr) const override
+  ulong KEY_pack_flags(uint) const override
   {
     DBUG_ASSERT(0);
     return 0;
@@ -7131,7 +7146,7 @@ public:
   Field *make_conversion_table_field(MEM_ROOT *root,
                                      TABLE *table, uint metadata,
                                      const Field *target) const override;
-  enum_dynamic_column_type dyncol_type(const Type_all_attributes *attr)
+  enum_dynamic_column_type dyncol_type(const Type_all_attributes *)
                                        const override
   {
     DBUG_ASSERT(0);
@@ -7214,8 +7229,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
 };
 
 

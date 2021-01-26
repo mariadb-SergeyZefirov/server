@@ -1902,18 +1902,11 @@ public:
   {
     enum store_key_result result;
     THD *thd= to_field->table->in_use;
-    enum_check_fields saved_count_cuted_fields= thd->count_cuted_fields;
-    sql_mode_t orig_sql_mode= thd->variables.sql_mode;
+    Check_level_instant_set check_level_save(thd, CHECK_FIELD_IGNORE);
+    Sql_mode_save sql_mode(thd);
     thd->variables.sql_mode&= ~(MODE_NO_ZERO_IN_DATE | MODE_NO_ZERO_DATE);
     thd->variables.sql_mode|= MODE_INVALID_DATES;
-
-    thd->count_cuted_fields= CHECK_FIELD_IGNORE;
-
     result= copy_inner();
-
-    thd->count_cuted_fields= saved_count_cuted_fields;
-    thd->variables.sql_mode= orig_sql_mode;
-
     return result;
   }
 
@@ -2436,10 +2429,9 @@ TABLE *create_tmp_table(THD *thd,TMP_TABLE_PARAM *param,List<Item> &fields,
                         bool keep_row_order= FALSE);
 TABLE *create_tmp_table_for_schema(THD *thd, TMP_TABLE_PARAM *param,
                                    const ST_SCHEMA_TABLE &schema_table,
-                                   const MY_BITMAP &bitmap,
                                    longlong select_options,
                                    const LEX_CSTRING &alias,
-                                   bool keep_row_order);
+                                   bool do_not_open, bool keep_row_order);
 
 void free_tmp_table(THD *thd, TABLE *entry);
 bool create_internal_tmp_table_from_heap(THD *thd, TABLE *table,
@@ -2515,29 +2507,6 @@ public:
 
 
 class select_handler;
-
-
-class Pushdown_select: public Sql_alloc
-{
-private:
-  bool is_analyze;
-  List<Item> result_columns;
-  bool send_result_set_metadata();
-  bool send_data();
-  bool send_eof();
-
-public:
-  SELECT_LEX *select;
-  select_handler *handler;
-
-  Pushdown_select(SELECT_LEX *sel, select_handler *h);
-
-  ~Pushdown_select();
-
-  bool init();
-
-  int execute(); 
-};
 
 
 bool test_if_order_compatible(SQL_I_List<ORDER> &a, SQL_I_List<ORDER> &b);

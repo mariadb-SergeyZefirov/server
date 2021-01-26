@@ -2826,6 +2826,8 @@ int Lex_input_stream::scan_ident_delimited(THD *thd,
         Return the quote character, to have the parser fail on syntax error.
       */
       m_ptr= (char *) m_tok_start + 1;
+      if (m_echo)
+        m_cpp_ptr= (char *) m_cpp_tok_start + 1;
       return quote_char;
     }
     int var_length= cs->charlen(get_ptr() - 1, get_end_of_query());
@@ -3567,8 +3569,10 @@ void LEX::print(String *str, enum_query_type query_type)
     str->append(STRING_WITH_LEN("UPDATE "));
     if (ignore)
       str->append(STRING_WITH_LEN("IGNORE "));
-    // table name
-    str->append(query_tables->alias);
+    // table name. If the query was using a view, we need
+    // the underlying table name, not the view name
+    TABLE_LIST *base_tbl= query_tables->table->pos_in_table_list;
+    base_tbl->print(thd, table_map(0), str, query_type);
     str->append(STRING_WITH_LEN(" SET "));
     // print item assignments
     List_iterator<Item> it(sel->item_list);
@@ -3585,6 +3589,41 @@ void LEX::print(String *str, enum_query_type query_type)
       str->append(STRING_WITH_LEN("="));
       value->print(str, query_type);
     }
+
+    if (sel->where)
+    {
+      str->append(STRING_WITH_LEN(" WHERE "));
+      sel->where->print(str, query_type);
+    }
+
+    if (sel->order_list.elements)
+    {
+      str->append(STRING_WITH_LEN(" ORDER BY "));
+      for (ORDER *ord= sel->order_list.first; ord; ord= ord->next)
+      {
+        if (ord != sel->order_list.first)
+          str->append(STRING_WITH_LEN(", "));
+        (*ord->item)->print(str, query_type);
+      }
+    }
+    if (sel->select_limit)
+    {
+      str->append(STRING_WITH_LEN(" LIMIT "));
+      sel->select_limit->print(str, query_type);
+    }
+  }
+  else if (sql_command == SQLCOM_DELETE)
+  {
+    SELECT_LEX *sel= first_select_lex();
+    str->append(STRING_WITH_LEN("DELETE "));
+    if (ignore)
+      str->append(STRING_WITH_LEN("IGNORE "));
+
+    str->append(STRING_WITH_LEN("FROM "));
+    // table name. If the query was using a view, we need
+    // the underlying table name, not the view name
+    TABLE_LIST *base_tbl= query_tables->table->pos_in_table_list;
+    base_tbl->print(thd, table_map(0), str, query_type);
 
     if (sel->where)
     {
@@ -3997,21 +4036,21 @@ bool LEX::can_not_use_merged()
   }
 }
 
-/*
-  Detect that we need only table structure of derived table/view
+/**
+  Detect that we need only table structure of derived table/view.
 
-  SYNOPSIS
-    only_view_structure()
+  Also used by I_S tables (@see create_schema_table) to detect that
+  they need a full table structure and cannot optimize unused columns away
 
-  RETURN
-    TRUE yes, we need only structure
-    FALSE no, we need data
+  @retval TRUE yes, we need only structure
+  @retval FALSE no, we need data
 */
 
 bool LEX::only_view_structure()
 {
   switch (sql_command) {
   case SQLCOM_SHOW_CREATE:
+  case SQLCOM_CHECKSUM:
   case SQLCOM_SHOW_TABLES:
   case SQLCOM_SHOW_FIELDS:
   case SQLCOM_REVOKE_ALL:
@@ -4019,6 +4058,8 @@ bool LEX::only_view_structure()
   case SQLCOM_GRANT:
   case SQLCOM_CREATE_VIEW:
     return TRUE;
+  case SQLCOM_CREATE_TABLE:
+    return create_info.like();
   default:
     return FALSE;
   }
@@ -5428,9 +5469,11 @@ void st_select_lex::set_explain_type(bool on_the_fly)
               /*
                 pos_in_table_list=NULL for e.g. post-join aggregation JOIN_TABs.
               */
-              if (tab->table && tab->table->pos_in_table_list &&
-                  tab->table->pos_in_table_list->with &&
-                  tab->table->pos_in_table_list->with->is_recursive)
+              if (!(tab->table && tab->table->pos_in_table_list))
+	        continue;
+              TABLE_LIST *tbl= tab->table->pos_in_table_list;
+              if (tbl->with && tbl->with->is_recursive &&
+                  tbl->is_with_table_recursive_reference())
               {
                 uses_cte= true;
                 break;
@@ -10207,7 +10250,8 @@ bool LEX::new_sp_instr_stmt(THD *thd,
   qbuff.length= prefix.length + suffix.length;
   if (!(qbuff.str= (char*) alloc_root(thd->mem_root, qbuff.length + 1)))
     return true;
-  memcpy(qbuff.str, prefix.str, prefix.length);
+  if (prefix.length)
+    memcpy(qbuff.str, prefix.str, prefix.length);
   strmake(qbuff.str + prefix.length, suffix.str, suffix.length);
   i->m_query= qbuff;
   return sphead->add_instr(i);
@@ -10274,7 +10318,7 @@ bool LEX::sp_proc_stmt_statement_finalize(THD *thd, bool no_lookahead)
     It is done by transformer.
 
     The extracted condition is saved in cond_pushed_into_where of this select.
-    cond can remain un empty after the extraction of the condition that can be
+    COND can remain not empty after the extraction of the conditions that can be
     pushed into WHERE. It is saved in remaining_cond.
 
   @note

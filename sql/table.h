@@ -2244,7 +2244,6 @@ struct TABLE_LIST
     parsing 'this' is a NATURAL/USING join iff (natural_join != NULL).
   */
   TABLE_LIST *natural_join;
-  bool part_of_natural_join;
   /*
     True if 'this' represents a nested join that is a NATURAL JOIN.
     For one of the operands of 'this', the member 'natural_join' points
@@ -2548,8 +2547,12 @@ struct TABLE_LIST
     Indicates what triggers we need to pre-load for this TABLE_LIST
     when opening an associated TABLE. This is filled after
     the parsed tree is created.
+
+    slave_fk_event_map is filled on the slave side with bitmaps value
+    representing row-based event operation to help find and prelock
+    possible FK constrain-related child tables.
   */
-  uint8 trg_event_map;
+  uint8 trg_event_map, slave_fk_event_map;
   /* TRUE <=> this table is a const one and was optimized away. */
   bool optimized_away;
 
@@ -3196,7 +3199,8 @@ inline void mark_as_null_row(TABLE *table)
 {
   table->null_row=1;
   table->status|=STATUS_NULL_ROW;
-  bfill(table->null_flags,table->s->null_bytes,255);
+  if (table->s->null_bytes)
+    bfill(table->null_flags,table->s->null_bytes,255);
 }
 
 bool is_simple_order(ORDER *order);

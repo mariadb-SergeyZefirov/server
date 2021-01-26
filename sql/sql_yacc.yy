@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2000, 2015, Oracle and/or its affiliates.
-   Copyright (c) 2010, 2020, MariaDB Corporation.
+   Copyright (c) 2010, 2020, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -115,6 +115,14 @@ int yylex(void *yylval, void *yythd);
 #endif
 
 
+static Item* escape(THD *thd)
+{
+  thd->lex->escape_used= false;
+  const char *esc= thd->variables.sql_mode & MODE_NO_BACKSLASH_ESCAPES ? "" : "\\";
+  return new (thd->mem_root) Item_string_ascii(thd, esc, MY_TEST(esc[0]));
+}
+
+
 /**
   @brief Bison callback to report a syntax/OOM error
 
@@ -170,7 +178,11 @@ void _CONCAT_UNDERSCORED(turn_parser_debug_on,yyparse)()
      The result will be in the process stderr (var/log/master.err)
    */
 
+#ifndef _AIX
   extern int yydebug;
+#else
+  static int yydebug;
+#endif
   yydebug= 1;
 }
 #endif
@@ -325,16 +337,16 @@ bool my_yyoverflow(short **a, YYSTYPE **b, size_t *yystacksize);
 %parse-param { THD *thd }
 %lex-param { THD *thd }
 /*
-  We should not introduce new conflicts any more.
+  We should not introduce any further shift/reduce conflicts.
 */
 
 /* Start SQL_MODE_DEFAULT_SPECIFIC */
-%expect 37
+%expect 46
 /* End SQL_MODE_DEFAULT_SPECIFIC */
 
 
 /* Start SQL_MODE_ORACLE_SPECIFIC
-%expect 40
+%expect 49
 End SQL_MODE_ORACLE_SPECIFIC */
 
 
@@ -1142,16 +1154,6 @@ End SQL_MODE_ORACLE_SPECIFIC */
 %token  <kwd>  XML_SYM
 %token  <kwd>  YEAR_SYM                      /* SQL-2003-R */
 
-
-/*
-  Give ESCAPE (in LIKE) a very low precedence.
-  This allows the concatenation operator || to be used on the right
-  side of "LIKE" with sql_mode=PIPES_AS_CONCAT (without ORACLE):
-    SELECT 'ab' LIKE 'a'||'b'||'c';
-*/
-%left   PREC_BELOW_ESCAPE
-%left   ESCAPE_SYM
-
 /* A dummy token to force the priority of table_ref production in a join. */
 %left   CONDITIONLESS_JOIN
 %left   JOIN_SYM INNER_SYM STRAIGHT_JOIN CROSS LEFT RIGHT ON_SYM USING
@@ -1162,10 +1164,12 @@ End SQL_MODE_ORACLE_SPECIFIC */
 %left   AND_SYM AND_AND_SYM
 
 %left   PREC_BELOW_NOT
-%left   NOT_SYM
 
-%left   BETWEEN_SYM CASE_SYM WHEN_SYM THEN_SYM ELSE
-%left   '=' EQUAL_SYM GE '>' LE '<' NE IS LIKE SOUNDS_SYM REGEXP IN_SYM
+%nonassoc NOT_SYM
+%left   '=' EQUAL_SYM GE '>' LE '<' NE
+%nonassoc IS
+%right BETWEEN_SYM
+%left   LIKE SOUNDS_SYM REGEXP IN_SYM
 %left   '|'
 %left   '&'
 %left   SHIFT_LEFT SHIFT_RIGHT
@@ -1173,9 +1177,9 @@ End SQL_MODE_ORACLE_SPECIFIC */
 %left   '*' '/' '%' DIV_SYM MOD_SYM
 %left   '^'
 %left   MYSQL_CONCAT_SYM
-%left   NEG '~' NOT2_SYM BINARY
-%left   COLLATE_SYM
-%left SUBQUERY_AS_EXPR
+%nonassoc NEG '~' NOT2_SYM BINARY
+%nonassoc COLLATE_SYM
+%nonassoc SUBQUERY_AS_EXPR
 
 /*
   Tokens that can change their meaning from identifier to something else
@@ -1441,14 +1445,13 @@ End SQL_MODE_ORACLE_SPECIFIC */
 %type <item>
         literal insert_ident order_ident temporal_literal
         simple_ident expr sum_expr in_sum_expr
-        variable variable_aux bool_pri
+        variable variable_aux
         predicate bit_expr parenthesized_expr
         table_wild simple_expr column_default_non_parenthesized_expr udf_expr
         primary_expr string_factor_expr mysql_concatenation_expr
         select_sublist_qualified_asterisk
         expr_or_default set_expr_or_default
         signed_literal expr_or_literal
-        opt_escape
         sp_opt_default
         simple_ident_nospvar
         field_or_var limit_option
@@ -2502,7 +2505,7 @@ create:
             Lex->pop_select(); //main select
           }
         | create_or_replace USER_SYM opt_if_not_exists clear_privileges
-          grant_list opt_require_clause opt_resource_options opt_account_locking opt_password_expiration
+          grant_list opt_require_clause opt_resource_options opt_account_locking_and_opt_password_expiration
           {
             if (unlikely(Lex->set_command_with_check(SQLCOM_CREATE_USER,
                                                      $1 | $3)))
@@ -6556,6 +6559,11 @@ opt_compressed:
         | compressed { }
         ;
 
+opt_enable:
+          /* empty */ {}
+        | ENABLE_SYM { }
+        ;
+
 compressed:
           COMPRESSED_SYM opt_compression_method
           {
@@ -6582,7 +6590,7 @@ compressed_deprecated_column_attribute:
         ;
 
 asrow_attribute:
-          not NULL_SYM
+          not NULL_SYM opt_enable
           {
             Lex->last_field->flags|= NOT_NULL_FLAG;
           }
@@ -7313,7 +7321,7 @@ alter:
           } OPTIONS_SYM '(' server_options_list ')' { }
           /* ALTER USER foo is allowed for MySQL compatibility. */
         | ALTER USER_SYM opt_if_exists clear_privileges grant_list
-          opt_require_clause opt_resource_options opt_account_locking opt_password_expiration
+          opt_require_clause opt_resource_options opt_account_locking_and_opt_password_expiration
           {
             Lex->create_info.set($3);
             Lex->sql_command= SQLCOM_ALTER_USER;
@@ -7349,37 +7357,44 @@ alter:
           } stmt_end {}
         ;
 
-opt_account_locking:
-        /* Nothing */ {}
-        | ACCOUNT_SYM LOCK_SYM
+account_locking_option:
+          LOCK_SYM
           {
             Lex->account_options.account_locked= ACCOUNTLOCK_LOCKED;
           }
-        | ACCOUNT_SYM UNLOCK_SYM
+        | UNLOCK_SYM
           {
             Lex->account_options.account_locked= ACCOUNTLOCK_UNLOCKED;
           }
         ;
-opt_password_expiration:
-        /* Nothing */ {}
-        | PASSWORD_SYM EXPIRE_SYM
+
+opt_password_expire_option:
+          /* empty */
           {
             Lex->account_options.password_expire= PASSWORD_EXPIRE_NOW;
           }
-        | PASSWORD_SYM EXPIRE_SYM NEVER_SYM
+        | NEVER_SYM
           {
             Lex->account_options.password_expire= PASSWORD_EXPIRE_NEVER;
           }
-        | PASSWORD_SYM EXPIRE_SYM DEFAULT
+        | DEFAULT
           {
             Lex->account_options.password_expire= PASSWORD_EXPIRE_DEFAULT;
           }
-        | PASSWORD_SYM EXPIRE_SYM INTERVAL_SYM NUM DAY_SYM
+        | INTERVAL_SYM NUM DAY_SYM
           {
             Lex->account_options.password_expire= PASSWORD_EXPIRE_INTERVAL;
-            if (!(Lex->account_options.num_expiration_days= atoi($4.str)))
-              my_yyabort_error((ER_WRONG_VALUE, MYF(0), "DAY", $4.str));
+            if (!(Lex->account_options.num_expiration_days= atoi($2.str)))
+              my_yyabort_error((ER_WRONG_VALUE, MYF(0), "DAY", $2.str));
           }
+        ;
+
+opt_account_locking_and_opt_password_expiration:
+          /* empty */
+        | ACCOUNT_SYM account_locking_option
+        | PASSWORD_SYM EXPIRE_SYM opt_password_expire_option
+        | ACCOUNT_SYM account_locking_option PASSWORD_SYM EXPIRE_SYM opt_password_expire_option
+        | PASSWORD_SYM EXPIRE_SYM opt_password_expire_option ACCOUNT_SYM account_locking_option
         ;
 
 ev_alter_on_schedule_completion:
@@ -7757,6 +7772,8 @@ alter_list_item:
           }
         | ALTER opt_column opt_if_exists_table_element field_ident SET DEFAULT column_default_expr
           {
+            if (check_expression($7, &$4, VCOL_DEFAULT))
+              MYSQL_YYABORT;
             if (unlikely(Lex->add_alter_list($4, $7, $3)))
               MYSQL_YYABORT;
           }
@@ -9299,71 +9316,67 @@ expr:
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bool_pri IS TRUE_SYM %prec IS
+        | expr IS TRUE_SYM %prec IS
           {
             $$= new (thd->mem_root) Item_func_istrue(thd, $1);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bool_pri IS not TRUE_SYM %prec IS
+        | expr IS not TRUE_SYM %prec IS
           {
             $$= new (thd->mem_root) Item_func_isnottrue(thd, $1);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bool_pri IS FALSE_SYM %prec IS
+        | expr IS FALSE_SYM %prec IS
           {
             $$= new (thd->mem_root) Item_func_isfalse(thd, $1);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bool_pri IS not FALSE_SYM %prec IS
+        | expr IS not FALSE_SYM %prec IS
           {
             $$= new (thd->mem_root) Item_func_isnotfalse(thd, $1);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bool_pri IS UNKNOWN_SYM %prec IS
+        | expr IS UNKNOWN_SYM %prec IS
           {
             $$= new (thd->mem_root) Item_func_isnull(thd, $1);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bool_pri IS not UNKNOWN_SYM %prec IS
+        | expr IS not UNKNOWN_SYM %prec IS
           {
             $$= new (thd->mem_root) Item_func_isnotnull(thd, $1);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bool_pri %prec PREC_BELOW_NOT
-        ;
-
-bool_pri:
-          bool_pri IS NULL_SYM %prec IS
+        | expr IS NULL_SYM %prec PREC_BELOW_NOT
           {
             $$= new (thd->mem_root) Item_func_isnull(thd, $1);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bool_pri IS not NULL_SYM %prec IS
+        | expr IS not NULL_SYM %prec IS
           {
             $$= new (thd->mem_root) Item_func_isnotnull(thd, $1);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bool_pri EQUAL_SYM predicate %prec EQUAL_SYM
+        | expr EQUAL_SYM predicate %prec EQUAL_SYM
           {
             $$= new (thd->mem_root) Item_func_equal(thd, $1, $3);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bool_pri comp_op predicate %prec '='
+        | expr comp_op predicate %prec '='
           {
             $$= (*$2)(0)->create(thd, $1, $3);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bool_pri comp_op all_or_any '(' subselect ')' %prec '='
+        | expr comp_op all_or_any '(' subselect ')' %prec '='
           {
             $$= all_any_subquery_creator(thd, $1, $2, $3, $5);
             if (unlikely($$ == NULL))
@@ -9373,42 +9386,42 @@ bool_pri:
         ;
 
 predicate:
-          bit_expr IN_SYM subquery
+          predicate IN_SYM subquery
           {
             $$= new (thd->mem_root) Item_in_subselect(thd, $1, $3);
-            if (unlikely($$ == NULL))
+            if (unlikely(!$$))
               MYSQL_YYABORT;
           }
-        | bit_expr not IN_SYM subquery
+        | predicate not IN_SYM subquery
           {
             Item *item= new (thd->mem_root) Item_in_subselect(thd, $1, $4);
-            if (unlikely(item == NULL))
+            if (unlikely(!item))
               MYSQL_YYABORT;
             $$= negate_expression(thd, item);
-            if (unlikely($$ == NULL))
+            if (unlikely(!$$))
               MYSQL_YYABORT;
           }
-        | bit_expr IN_SYM '(' expr ')'
+        | predicate IN_SYM '(' expr ')'
           {
             $$= handle_sql2003_note184_exception(thd, $1, true, $4);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bit_expr IN_SYM '(' expr ',' expr_list ')'
-          { 
+        | predicate IN_SYM '(' expr ',' expr_list ')'
+          {
             $6->push_front($4, thd->mem_root);
             $6->push_front($1, thd->mem_root);
             $$= new (thd->mem_root) Item_func_in(thd, *$6);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bit_expr not IN_SYM '(' expr ')'
+        | predicate not IN_SYM '(' expr ')'
           {
             $$= handle_sql2003_note184_exception(thd, $1, false, $5);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bit_expr not IN_SYM '(' expr ',' expr_list ')'
+        | predicate not IN_SYM '(' expr ',' expr_list ')'
           {
             $7->push_front($5, thd->mem_root);
             $7->push_front($1, thd->mem_root);
@@ -9417,13 +9430,13 @@ predicate:
               MYSQL_YYABORT;
             $$= item->neg_transformer(thd);
           }
-        | bit_expr BETWEEN_SYM bit_expr AND_SYM predicate
+        | predicate BETWEEN_SYM predicate AND_SYM predicate %prec BETWEEN_SYM
           {
             $$= new (thd->mem_root) Item_func_between(thd, $1, $3, $5);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bit_expr not BETWEEN_SYM bit_expr AND_SYM predicate
+        | predicate not BETWEEN_SYM predicate AND_SYM predicate %prec BETWEEN_SYM
           {
             Item_func_between *item;
             item= new (thd->mem_root) Item_func_between(thd, $1, $4, $6);
@@ -9431,7 +9444,7 @@ predicate:
               MYSQL_YYABORT;
             $$= item->neg_transformer(thd);
           }
-        | bit_expr SOUNDS_SYM LIKE bit_expr
+        | predicate SOUNDS_SYM LIKE predicate
           {
             Item *item1= new (thd->mem_root) Item_func_soundex(thd, $1);
             Item *item4= new (thd->mem_root) Item_func_soundex(thd, $4);
@@ -9441,28 +9454,41 @@ predicate:
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bit_expr LIKE bit_expr opt_escape
+        | predicate LIKE predicate
           {
-            $$= new (thd->mem_root) Item_func_like(thd, $1, $3, $4,
-                                                   Lex->escape_used);
-            if (unlikely($$ == NULL))
+            $$= new (thd->mem_root) Item_func_like(thd, $1, $3, escape(thd), false);
+            if (unlikely(!$$))
               MYSQL_YYABORT;
           }
-        | bit_expr not LIKE bit_expr opt_escape
+        | predicate LIKE predicate ESCAPE_SYM predicate %prec LIKE
           {
-            Item *item= new (thd->mem_root) Item_func_like(thd, $1, $4, $5,
-                                                             Lex->escape_used);
-            if (unlikely(item == NULL))
+            Lex->escape_used= true;
+            $$= new (thd->mem_root) Item_func_like(thd, $1, $3, $5, true);
+            if (unlikely(!$$))
+              MYSQL_YYABORT;
+          }
+        | predicate not LIKE predicate
+          {
+            Item *item= new (thd->mem_root) Item_func_like(thd, $1, $4, escape(thd), false);
+            if (unlikely(!item))
               MYSQL_YYABORT;
             $$= item->neg_transformer(thd);
           }
-        | bit_expr REGEXP bit_expr
+        | predicate not LIKE predicate ESCAPE_SYM predicate %prec LIKE
+          {
+            Lex->escape_used= true;
+            Item *item= new (thd->mem_root) Item_func_like(thd, $1, $4, $6, true);
+            if (unlikely(!item))
+              MYSQL_YYABORT;
+            $$= item->neg_transformer(thd);
+          }
+        | predicate REGEXP predicate
           {
             $$= new (thd->mem_root) Item_func_regex(thd, $1, $3);
             if (unlikely($$ == NULL))
               MYSQL_YYABORT;
           }
-        | bit_expr not REGEXP bit_expr
+        | predicate not REGEXP predicate
           {
             Item *item= new (thd->mem_root) Item_func_regex(thd, $1, $4);
             if (unlikely(item == NULL))
@@ -10592,18 +10618,19 @@ function_call_generic:
               names are resolved with the following order:
               - MySQL native functions,
               - User Defined Functions,
+              - Constructors, like POINT(1,1)
               - Stored Functions (assuming the current <use> database)
 
               This will be revised with WL#2128 (SQL PATH)
             */
-            if ((h= Type_handler::handler_by_name(thd, $1)) &&
-                (item= h->make_constructor_item(thd, $4)))
-            {
-              // Found a constructor with a proper argument count
-            }
-            else if ((builder= find_native_function_builder(thd, &$1)))
+            if ((builder= find_native_function_builder(thd, &$1)))
             {
               item= builder->create_func(thd, &$1, $4);
+            }
+            else if ((h= Type_handler::handler_by_name(thd, $1)) &&
+                     (item= h->make_constructor_item(thd, $4)))
+            {
+              // Found a constructor with a proper argument count
             }
             else
             {
@@ -11721,6 +11748,16 @@ table_primary_derived:
             if (!($$= Lex->parsed_derived_table($1->master_unit(), $2, $3)))
               MYSQL_YYABORT;
           }
+/* Start SQL_MODE_ORACLE_SPECIFIC
+        | subquery
+          opt_for_system_time_clause
+          {
+            LEX_CSTRING alias;
+            if ($1->make_unique_derived_name(thd, &alias) ||
+                !($$= Lex->parsed_derived_table($1->master_unit(), $2, &alias)))
+              MYSQL_YYABORT;
+          }
+End SQL_MODE_ORACLE_SPECIFIC */
         ;
 
 opt_outer:
@@ -11901,23 +11938,6 @@ opt_having_clause:
             sel->parsing_place= NO_MATTER;
             if ($3)
               $3->top_level_item();
-          }
-        ;
-
-opt_escape:
-          ESCAPE_SYM simple_expr 
-          {
-            Lex->escape_used= TRUE;
-            $$= $2;
-          }
-        | /* empty */        %prec PREC_BELOW_ESCAPE
-          {
-            Lex->escape_used= FALSE;
-            $$= ((thd->variables.sql_mode & MODE_NO_BACKSLASH_ESCAPES) ?
-                 new (thd->mem_root) Item_string_ascii(thd, "", 0) :
-                 new (thd->mem_root) Item_string_ascii(thd, "\\", 1));
-            if (unlikely($$ == NULL))
-              MYSQL_YYABORT;
           }
         ;
 
@@ -14181,6 +14201,8 @@ backup_statements:
         }
 	| LOCK_SYM
           {
+            if (unlikely(Lex->sphead))
+              my_yyabort_error((ER_SP_BADSTATEMENT, MYF(0), "BACKUP LOCK"));
             if (Lex->main_select_push())
               MYSQL_YYABORT;
           }
@@ -14194,6 +14216,8 @@ backup_statements:
           }
         | UNLOCK_SYM
           {
+            if (unlikely(Lex->sphead))
+              my_yyabort_error((ER_SP_BADSTATEMENT, MYF(0), "BACKUP UNLOCK"));
 	    /* Table list is empty for unlock */
             Lex->sql_command= SQLCOM_BACKUP_LOCK;
           }
@@ -17026,6 +17050,7 @@ object_privilege:
         | BINLOG_SYM REPLAY_SYM            { $$= BINLOG_REPLAY_ACL; }
         | REPLICATION MASTER_SYM ADMIN_SYM { $$= REPL_MASTER_ADMIN_ACL; }
         | REPLICATION SLAVE ADMIN_SYM      { $$= REPL_SLAVE_ADMIN_ACL; }
+        | SLAVE MONITOR_SYM                { $$= SLAVE_MONITOR_ACL; }
         ;
 
 opt_and:

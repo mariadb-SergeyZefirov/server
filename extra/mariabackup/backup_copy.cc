@@ -868,20 +868,13 @@ datafile_rsync_backup(const char *filepath, bool save_to_list, FILE *f)
 	return(true);
 }
 
-
-static
-bool
-backup_file_vprintf(const char *filename, const char *fmt, va_list ap)
+bool backup_file_print_buf(const char *filename, const char *buf, int buf_len)
 {
 	ds_file_t	*dstfile	= NULL;
 	MY_STAT		 stat;			/* unused for now */
-	char		*buf		= 0;
-	int		 buf_len;
 	const char	*action;
 
 	memset(&stat, 0, sizeof(stat));
-
-	buf_len = vasprintf(&buf, fmt, ap);
 
 	stat.st_size = buf_len;
 	stat.st_mtime = my_time(0);
@@ -906,7 +899,6 @@ backup_file_vprintf(const char *filename, const char *fmt, va_list ap)
 
 	/* close */
 	msg("        ...done");
-	free(buf);
 
 	if (ds_close(dstfile)) {
 		goto error_close;
@@ -915,7 +907,6 @@ backup_file_vprintf(const char *filename, const char *fmt, va_list ap)
 	return(true);
 
 error:
-	free(buf);
 	if (dstfile != NULL) {
 		ds_close(dstfile);
 	}
@@ -923,8 +914,21 @@ error:
 error_close:
 	msg("Error: backup file failed.");
 	return(false); /*ERROR*/
-}
 
+	return true;
+};
+
+static
+bool
+backup_file_vprintf(const char *filename, const char *fmt, va_list ap)
+{
+	char		*buf		= 0;
+	int		 buf_len;
+	buf_len = vasprintf(&buf, fmt, ap);
+	bool result = backup_file_print_buf(filename, buf, buf_len);
+	free(buf);
+	return result;
+}
 
 bool
 backup_file_printf(const char *filename, const char *fmt, ...)
@@ -961,7 +965,7 @@ run_data_threads(datadir_iter_t *it, os_thread_func_t func, uint n)
 		data_threads[i].n_thread = i + 1;
 		data_threads[i].count = &count;
 		data_threads[i].count_mutex = &count_mutex;
-		os_thread_create(func, data_threads + i, &data_threads[i].id);
+		data_threads[i].id = os_thread_create(func, data_threads + i);
 	}
 
 	/* Wait for threads to exit */
@@ -1380,9 +1384,9 @@ out:
 	return(ret);
 }
 
-void backup_fix_ddl(void);
+void backup_fix_ddl(CorruptedPages &);
 
-static lsn_t get_current_lsn(MYSQL *connection)
+lsn_t get_current_lsn(MYSQL *connection)
 {
 	static const char lsn_prefix[] = "\nLog sequence number ";
 	lsn_t lsn = 0;
@@ -1405,7 +1409,7 @@ static lsn_t get_current_lsn(MYSQL *connection)
 lsn_t server_lsn_after_lock;
 extern void backup_wait_for_lsn(lsn_t lsn);
 /** Start --backup */
-bool backup_start()
+bool backup_start(CorruptedPages &corrupted_pages)
 {
 	if (!opt_no_lock) {
 		if (opt_safe_slave_backup) {
@@ -1440,7 +1444,7 @@ bool backup_start()
 
 	msg("Waiting for log copy thread to read lsn %llu", (ulonglong)server_lsn_after_lock);
 	backup_wait_for_lsn(server_lsn_after_lock);
-	backup_fix_ddl();
+	backup_fix_ddl(corrupted_pages);
 
 	// There is no need to stop slave thread before coping non-Innodb data when
 	// --no-lock option is used because --no-lock option requires that no DDL or
@@ -1785,7 +1789,6 @@ copy_back()
 	}
 
 	srv_max_n_threads = 1000;
-	sync_check_init();
 
 	/* copy undo tablespaces */
 
@@ -1986,7 +1989,6 @@ cleanup:
 
 	ds_data = NULL;
 
-	sync_check_close();
 	return(ret);
 }
 
@@ -2082,7 +2084,6 @@ decrypt_decompress()
 	datadir_iter_t *it = NULL;
 
 	srv_max_n_threads = 1000;
-	sync_check_init();
 
 	/* cd to backup directory */
 	if (my_setwd(xtrabackup_target_dir, MYF(MY_WME)))
@@ -2110,8 +2111,6 @@ decrypt_decompress()
 	}
 
 	ds_data = NULL;
-
-	sync_check_close();
 
 	return(ret);
 }

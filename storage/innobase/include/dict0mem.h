@@ -2,7 +2,7 @@
 
 Copyright (c) 1996, 2017, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
-Copyright (c) 2013, 2020, MariaDB Corporation.
+Copyright (c) 2013, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -35,7 +35,7 @@ Created 1/8/1996 Heikki Tuuri
 #include "btr0types.h"
 #include "lock0types.h"
 #include "que0types.h"
-#include "sync0rw.h"
+#include "sux_lock.h"
 #include "ut0mem.h"
 #include "ut0rnd.h"
 #include "ut0byte.h"
@@ -298,19 +298,17 @@ parent table will fail, and user has to drop excessive foreign constraint
 before proceeds. */
 #define FK_MAX_CASCADE_DEL		15
 
-/** Creates a table memory object.
-@param[in]	name		table name
-@param[in]	space		tablespace
-@param[in]	n_cols		total number of columns including virtual and
-				non-virtual columns
-@param[in]	n_v_cols	number of virtual columns
-@param[in]	flags		table flags
-@param[in]	flags2		table flags2
-@param[in]	init_stats_latch	whether to init the stats latch
+/** Create a table memory object.
+@param name     table name
+@param space    tablespace
+@param n_cols   total number of columns (both virtual and non-virtual)
+@param n_v_cols number of virtual columns
+@param flags    table flags
+@param flags2   table flags2
 @return own: table object */
 dict_table_t *dict_mem_table_create(const char *name, fil_space_t *space,
                                     ulint n_cols, ulint n_v_cols, ulint flags,
-                                    ulint flags2, bool init_stats_latch= true);
+                                    ulint flags2);
 /****************************************************************/ /**
  Free a table memory object. */
 void
@@ -766,9 +764,6 @@ struct dict_v_col_t{
 	/** column pos in table */
 	unsigned		v_pos:10;
 
-	/** number of indexes */
-	unsigned		n_v_indexes:12;
-
 	/** Virtual index list, and column position in the index */
 	std::forward_list<dict_v_idx_t, ut_allocator<dict_v_idx_t> >
 	v_indexes;
@@ -777,21 +772,17 @@ struct dict_v_col_t{
   @param index  index to be detached from */
   void detach(const dict_index_t &index)
   {
-    if (!n_v_indexes) return;
+    if (v_indexes.empty()) return;
     auto i= v_indexes.before_begin();
-    ut_d(unsigned n= 0);
     do {
       auto prev = i++;
       if (i == v_indexes.end())
       {
-        ut_ad(n == n_v_indexes);
         return;
       }
-      ut_ad(++n <= n_v_indexes);
       if (i->index == &index)
       {
         v_indexes.erase_after(prev);
-        n_v_indexes--;
         return;
       }
     }
@@ -1125,8 +1116,8 @@ public:
 				when InnoDB was started up */
 	zip_pad_info_t	zip_pad;/*!< Information about state of
 				compression failures and successes */
-	rw_lock_t	lock;	/*!< read-write lock protecting the
-				upper levels of the index tree */
+  /** lock protecting the non-leaf index pages */
+  mutable index_lock lock;
 
 	/** Determine if the index has been committed to the
 	data dictionary.
@@ -1377,6 +1368,11 @@ public:
 	everything in overflow) size of the longest possible row and index
 	of a field which made index records too big to fit on a page.*/
 	inline record_size_info_t record_size_info() const;
+
+  /** Clear the index tree and reinitialize the root page, in the
+  rollback of TRX_UNDO_EMPTY. The BTR_SEG_LEAF is freed and reinitialized.
+  @param thr query thread */
+  void clear(que_thr_t *thr);
 };
 
 /** Detach a virtual column from an index.
@@ -1450,6 +1446,10 @@ struct dict_foreign_t{
 
 	dict_vcol_set*	v_cols;		/*!< set of virtual columns affected
 					by foreign key constraint. */
+
+	/** Check whether the fulltext index gets affected by
+	foreign key constraint */
+	bool affects_fulltext() const;
 };
 
 std::ostream&
@@ -1809,6 +1809,13 @@ struct dict_table_t {
 		return(UNIV_LIKELY(!file_unreadable));
 	}
 
+	/** @return whether the table is accessible */
+	bool is_accessible() const
+	{
+		return UNIV_LIKELY(is_readable() && !corrupted && space)
+			&& !space->is_stopping();
+	}
+
 	/** Check if a table name contains the string "/#sql"
 	which denotes temporary or intermediate tables in MariaDB. */
 	static bool is_temporary_name(const char* name)
@@ -1947,6 +1954,9 @@ struct dict_table_t {
 	bool parse_name(char (&db_name)[NAME_LEN + 1],
 			char (&tbl_name)[NAME_LEN + 1],
 			size_t *db_name_len, size_t *tbl_name_len) const;
+
+  /** Clear the table when rolling back TRX_UNDO_EMPTY */
+  void clear(que_thr_t *thr);
 
 private:
 	/** Initialize instant->field_map.
@@ -2125,6 +2135,11 @@ public:
 	loading the definition or CREATE TABLE, or ALTER TABLE (prepare,
 	commit, and rollback phases). */
 	trx_id_t				def_trx_id;
+	/** Last transaction that inserted into an empty table.
+	Updated while holding exclusive table lock and an exclusive
+	latch on the clustered index root page (which must also be
+	an empty leaf page), and an ahi_latch (if btr_search_enabled). */
+	Atomic_relaxed<trx_id_t>		bulk_trx_id;
 
 	/*!< set of foreign key constraints in the table; these refer to
 	columns in other tables */
@@ -2133,22 +2148,8 @@ public:
 	/*!< set of foreign key constraints which refer to this table */
 	dict_foreign_set			referenced_set;
 
-	/** Statistics for query optimization. @{ */
-
-	/** This latch protects:
-	dict_table_t::stat_initialized,
-	dict_table_t::stat_n_rows (*),
-	dict_table_t::stat_clustered_index_size,
-	dict_table_t::stat_sum_of_other_index_sizes,
-	dict_table_t::stat_modified_counter (*),
-	dict_table_t::indexes*::stat_n_diff_key_vals[],
-	dict_table_t::indexes*::stat_index_size,
-	dict_table_t::indexes*::stat_n_leaf_pages.
-	(*) Those are not always protected for
-	performance reasons. */
-	rw_lock_t				stats_latch;
-
-  bool stats_latch_inited= false;
+	/** Statistics for query optimization. Mostly protected by
+	dict_sys.mutex. @{ */
 
 	/** TRUE if statistics have been calculated the first time after
 	database startup or table creation. */
@@ -2310,7 +2311,6 @@ private:
 	table is NOT allowed until this count gets to zero. MySQL does NOT
 	itself check the number of open handles at DROP. */
 	Atomic_counter<uint32_t>		n_ref_count;
-
 public:
 	/** List of locks on the table. Protected by lock_sys.mutex. */
 	table_lock_list_t			locks;

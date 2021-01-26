@@ -51,12 +51,7 @@ struct ha_table_option_struct
 	uint		encryption;		/*!<  DEFAULT, ON, OFF */
 	ulonglong	encryption_key_id;	/*!< encryption key id  */
 };
-/* JAN: TODO: MySQL 5.7 handler.h */
-struct st_handler_tablename
-{
-  const char *db;
-  const char *tablename;
-};
+
 /** The class defining a handle to an Innodb table */
 class ha_innobase final : public handler
 {
@@ -212,8 +207,7 @@ public:
 	int delete_table(const char *name) override;
 
 	int rename_table(const char* from, const char* to) override;
-	int defragment_table(const char* name, const char* index_name,
-						bool async);
+	inline int defragment_table();
 	int check(THD* thd, HA_CHECK_OPT* check_opt) override;
 	char* update_table_comment(const char* comment) override;
 
@@ -460,6 +454,9 @@ protected:
 	/** Resets a query execution 'template'.
 	@see build_template() */
 	void reset_template();
+
+	/** @return whether the table is read-only */
+	bool is_read_only() const;
 
 	inline void update_thd(THD* thd);
 	void update_thd();
@@ -970,6 +967,3 @@ which is in the prepared state
 
 @return 0 or error number */
 int innobase_rollback_by_xid(handlerton* hton, XID* xid);
-
-/** Free tablespace resources allocated. */
-void innobase_space_shutdown();

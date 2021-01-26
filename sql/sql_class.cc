@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2000, 2015, Oracle and/or its affiliates.
-   Copyright (c) 2008, 2020, MariaDB Corporation.
+   Copyright (c) 2008, 2021, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -1298,6 +1298,7 @@ void THD::init()
   first_successful_insert_id_in_prev_stmt_for_binlog= 0;
   first_successful_insert_id_in_cur_stmt= 0;
   current_backup_stage= BACKUP_FINISHED;
+  backup_commit_lock= 0;
 #ifdef WITH_WSREP
   wsrep_last_query_id= 0;
   wsrep_xid.null();
@@ -1530,16 +1531,29 @@ void THD::reset_db(const LEX_CSTRING *new_db)
 
 /* Do operations that may take a long time */
 
-void THD::cleanup(void)
+void THD::cleanup(bool have_mutex)
 {
   DBUG_ENTER("THD::cleanup");
   DBUG_ASSERT(cleanup_done == 0);
 
-  set_killed(KILL_CONNECTION);
+  if (have_mutex)
+    set_killed_no_mutex(KILL_CONNECTION,0,0);
+  else
+    set_killed(KILL_CONNECTION);
 #ifdef WITH_WSREP
   if (wsrep_cs().state() != wsrep::client_state::s_none)
   {
-    wsrep_cs().cleanup();
+    if (have_mutex)
+    {
+      mysql_mutex_assert_owner(static_cast<mysql_mutex_t*>
+                               (m_wsrep_mutex.native()));
+      // Below wsrep-lib function will not acquire any mutexes
+      wsrep::unique_lock<wsrep::mutex> lock(m_wsrep_mutex, std::adopt_lock);
+      wsrep_cs().cleanup(lock);
+      lock.release();
+    }
+    else
+      wsrep_cs().cleanup();
   }
   wsrep_client_thread= false;
 #endif /* WITH_WSREP */
@@ -1564,7 +1578,7 @@ void THD::cleanup(void)
     and left the mode a few lines above), there will be outstanding
     metadata locks. Release them.
   */
-  mdl_context.release_transactional_locks();
+  mdl_context.release_transactional_locks(this);
 
   backup_end(this);
   backup_unlock(this);
@@ -1613,16 +1627,38 @@ void THD::cleanup(void)
 void THD::free_connection()
 {
   DBUG_ASSERT(free_connection_done == 0);
-  my_free((char*) db.str);
+  /* Make sure threads are not available via server_threads.  */
+  assert_not_linked();
+
+  /*
+    Other threads may have a lock on THD::LOCK_thd_data or
+    THD::LOCK_thd_kill to ensure that this THD is not deleted
+    while they access it. The following mutex_lock ensures
+    that no one else is using this THD and it's now safe to
+    continue.
+
+    For example consider KILL-statement execution on
+    sql_parse.cc kill_one_thread() that will use
+    THD::LOCK_thd_data to protect victim thread during
+    THD::awake().
+  */
+  mysql_mutex_lock(&LOCK_thd_data);
+  mysql_mutex_lock(&LOCK_thd_kill);
+
+#ifdef WITH_WSREP
+  delete wsrep_rgi;
+  wsrep_rgi= nullptr;
+#endif /* WITH_WSREP */
+  my_free(const_cast<char*>(db.str));
   db= null_clex_str;
 #ifndef EMBEDDED_LIBRARY
   if (net.vio)
     vio_delete(net.vio);
-  net.vio= 0;
+  net.vio= nullptr;
   net_end(&net);
 #endif
- if (!cleanup_done)
-   cleanup();
+  if (!cleanup_done)
+    cleanup(true); // We have locked THD::LOCK_thd_kill
   ha_close_connection(this);
   plugin_thdvar_cleanup(this);
   mysql_audit_free_thd(this);
@@ -1634,6 +1670,8 @@ void THD::free_connection()
   profiling.restart();                          // Reset profiling
 #endif
   debug_sync_reset_thread(this);
+  mysql_mutex_unlock(&LOCK_thd_kill);
+  mysql_mutex_unlock(&LOCK_thd_data);
 }
 
 /*
@@ -1689,24 +1727,10 @@ THD::~THD()
   if (!status_in_global)
     add_status_to_global();
 
-  /*
-    Other threads may have a lock on LOCK_thd_kill to ensure that this
-    THD is not deleted while they access it. The following mutex_lock
-    ensures that no one else is using this THD and it's now safe to delete
-  */
-  if (WSREP_NNULL(this)) mysql_mutex_lock(&LOCK_thd_data);
-  mysql_mutex_lock(&LOCK_thd_kill);
-  mysql_mutex_unlock(&LOCK_thd_kill);
-  if (WSREP_NNULL(this)) mysql_mutex_unlock(&LOCK_thd_data);
-
   if (!free_connection_done)
     free_connection();
 
 #ifdef WITH_WSREP
-  if (wsrep_rgi != NULL) {
-    delete wsrep_rgi;
-    wsrep_rgi = NULL;
-  }
   mysql_cond_destroy(&COND_wsrep_thd);
 #endif
   mdl_context.destroy();
@@ -2588,7 +2612,7 @@ void THD::give_protection_error()
     my_error(ER_BACKUP_LOCK_IS_ACTIVE, MYF(0));
   else
   {
-    DBUG_ASSERT(global_read_lock.is_acquired());
+    DBUG_ASSERT(global_read_lock.is_acquired() || mdl_backup_lock);
     my_error(ER_CANT_UPDATE_WITH_READLOCK, MYF(0));
   }
 }
@@ -3153,12 +3177,12 @@ static File create_file(THD *thd, char *path, sql_exchange *exchange,
   }
   /* Create the file world readable */
   if ((file= mysql_file_create(key_select_to_file,
-                               path, 0666, O_WRONLY|O_EXCL, MYF(MY_WME))) < 0)
+                               path, 0644, O_WRONLY|O_EXCL, MYF(MY_WME))) < 0)
     return file;
 #ifdef HAVE_FCHMOD
-  (void) fchmod(file, 0666);			// Because of umask()
+  (void) fchmod(file, 0644);			// Because of umask()
 #else
-  (void) chmod(path, 0666);
+  (void) chmod(path, 0644);
 #endif
   if (init_io_cache(cache, file, 0L, WRITE_CACHE, 0L, 1, MYF(MY_WME)))
   {
@@ -4918,7 +4942,7 @@ void destroy_background_thd(MYSQL_THD thd)
 void reset_thd(MYSQL_THD thd)
 {
   close_thread_tables(thd);
-  thd->mdl_context.release_transactional_locks();
+  thd->release_transactional_locks();
   thd->free_items();
   free_root(thd->mem_root, MYF(MY_KEEP_PREALLOC));
 }
@@ -4981,7 +5005,8 @@ extern "C" size_t thd_query_safe(MYSQL_THD thd, char *buf, size_t buflen)
   if (!mysql_mutex_trylock(&thd->LOCK_thd_data))
   {
     len= MY_MIN(buflen - 1, thd->query_length());
-    memcpy(buf, thd->query(), len);
+    if (len)
+      memcpy(buf, thd->query(), len);
     mysql_mutex_unlock(&thd->LOCK_thd_data);
   }
   buf[len]= '\0';
@@ -5036,6 +5061,14 @@ extern "C" enum enum_server_command thd_current_command(MYSQL_THD thd)
 {
   return thd->get_command();
 }
+
+#ifdef HAVE_REPLICATION /* Working around MDEV-24622 */
+/** @return whether the current thread is for applying binlog in a replica */
+extern "C" int thd_is_slave(const MYSQL_THD thd)
+{
+  return thd && thd->slave_thread;
+}
+#endif /* HAVE_REPLICATION */
 
 /* Returns high resolution timestamp for the start
   of the current query. */
@@ -6552,8 +6585,8 @@ exit:;
 /**
   Check if we should log a table DDL to the binlog
 
-  @@return true  yes
-  @@return false no
+  @retval true  yes
+  @retval false no
 */
 
 bool THD::binlog_table_should_be_logged(const LEX_CSTRING *db)
@@ -7442,14 +7475,14 @@ int THD::binlog_query(THD::enum_binlog_query_type qtype, char const *query_arg,
       */
       if (binlog_should_compress(query_len))
       {
-        Query_compressed_log_event qinfo(this, query_arg, query_len, is_trans, direct,
-                            suppress_use, errcode);
+        Query_compressed_log_event qinfo(this, query_arg, query_len, is_trans,
+                                         direct, suppress_use, errcode);
         error= mysql_bin_log.write(&qinfo);
       }
       else
       {
         Query_log_event qinfo(this, query_arg, query_len, is_trans, direct,
-          suppress_use, errcode);
+                              suppress_use, errcode);
         error= mysql_bin_log.write(&qinfo);
       }
       /*
@@ -7466,6 +7499,38 @@ int THD::binlog_query(THD::enum_binlog_query_type qtype, char const *query_arg,
   }
   DBUG_RETURN(0);
 }
+
+
+/**
+  Binlog current query as a statement, ignoring the binlog filter setting.
+
+  The filter is in decide_logging_format() to mark queries to not be stored
+  in the binary log, for example by a shared distributed engine like S3.
+  This function resets the filter to ensure the the query is logged if
+  the binlog is active.
+
+  Note that 'direct' is set to false, which means that the query will
+  not be directly written to the binary log but instead to the cache.
+
+  @retval false   ok
+  @retval true    error
+*/
+
+
+bool THD::binlog_current_query_unfiltered()
+{
+  if (!mysql_bin_log.is_open())
+    return 0;
+
+  reset_binlog_local_stmt_filter();
+  clear_binlog_local_stmt_filter();
+  return binlog_query(THD::STMT_QUERY_TYPE, query(), query_length(),
+                      /* is_trans */     FALSE,
+                      /* direct */       FALSE,
+                      /* suppress_use */ FALSE,
+                      /* Error */        0) > 0;
+}
+
 
 void
 THD::wait_for_wakeup_ready()
@@ -7642,16 +7707,33 @@ wait_for_commit::register_wait_for_prior_commit(wait_for_commit *waitee)
 }
 
 
-/*
-  Wait for commit of another transaction to complete, as already registered
+/**
+  Waits for commit of another transaction to complete, as already registered
   with register_wait_for_prior_commit(). If the commit already completed,
   returns immediately.
+
+  If thd->backup_commit_lock is set, release it while waiting for other threads
 */
+
 int
 wait_for_commit::wait_for_prior_commit2(THD *thd)
 {
   PSI_stage_info old_stage;
   wait_for_commit *loc_waitee;
+  bool backup_lock_released= 0;
+
+  /*
+    Release MDL_BACKUP_COMMIT LOCK while waiting for other threads to commit
+    This is needed to avoid deadlock between the other threads (which not
+    yet have the MDL_BACKUP_COMMIT_LOCK) and any threads using
+    BACKUP LOCK BLOCK_COMMIT.
+  */
+  if (thd->backup_commit_lock && thd->backup_commit_lock->ticket)
+  {
+    backup_lock_released= 1;
+    thd->mdl_context.release_lock(thd->backup_commit_lock->ticket);
+    thd->backup_commit_lock->ticket= 0;
+  }
 
   mysql_mutex_lock(&LOCK_wait_commit);
   DEBUG_SYNC(thd, "wait_for_prior_commit_waiting");
@@ -7701,10 +7783,16 @@ wait_for_commit::wait_for_prior_commit2(THD *thd)
     use within enter_cond/exit_cond.
   */
   DEBUG_SYNC(thd, "wait_for_prior_commit_killed");
+  if (backup_lock_released)
+    thd->mdl_context.acquire_lock(thd->backup_commit_lock,
+                                  thd->variables.lock_wait_timeout);
   return wakeup_error;
 
 end:
   thd->EXIT_COND(&old_stage);
+  if (backup_lock_released)
+    thd->mdl_context.acquire_lock(thd->backup_commit_lock,
+                                  thd->variables.lock_wait_timeout);
   return wakeup_error;
 }
 

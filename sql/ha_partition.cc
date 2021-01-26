@@ -1,6 +1,6 @@
 /*
   Copyright (c) 2005, 2019, Oracle and/or its affiliates.
-  Copyright (c) 2009, 2020, MariaDB
+  Copyright (c) 2009, 2021, MariaDB
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -2069,6 +2069,7 @@ int ha_partition::change_partitions(HA_CREATE_INFO *create_info,
     DBUG_ASSERT(part_elem->part_state == PART_TO_BE_REORGED);
     part_elem->part_state= PART_TO_BE_DROPPED;
   }
+  DBUG_ASSERT(m_new_file == 0);
   m_new_file= new_file_array;
   if (unlikely((error= copy_partitions(copied, deleted))))
   {
@@ -2077,6 +2078,7 @@ int ha_partition::change_partitions(HA_CREATE_INFO *create_info,
       They will later be deleted through the ddl-log.
     */
     cleanup_new_partition(part_count);
+    m_new_file= 0;
   }
   DBUG_RETURN(error);
 }
@@ -2166,6 +2168,8 @@ int ha_partition::copy_partitions(ulonglong * const copied,
     file->ha_rnd_end();
     reorg_part++;
   }
+  DBUG_EXECUTE_IF("debug_abort_copy_partitions",
+                  DBUG_RETURN(HA_ERR_UNSUPPORTED); );
   DBUG_RETURN(FALSE);
 error:
   m_reorged_file[reorg_part]->ha_rnd_end();
@@ -4439,7 +4443,7 @@ int ha_partition::write_row(const uchar * buf)
 
   DBUG_ASSERT(!m_file[part_id]->row_logging);
   error= m_file[part_id]->ha_write_row(buf);
-  if (have_auto_increment && !table->s->next_number_keypart)
+  if (!error && have_auto_increment && !table->s->next_number_keypart)
     set_auto_increment_if_higher(table->next_number_field);
 
 exit:
@@ -9141,6 +9145,7 @@ int ha_partition::extra(enum ha_extra_function operation)
   case HA_EXTRA_BEGIN_ALTER_COPY:
   case HA_EXTRA_END_ALTER_COPY:
   case HA_EXTRA_FAKE_START_STMT:
+  case HA_EXTRA_IGNORE_INSERT:
     DBUG_RETURN(loop_partitions(extra_cb, &operation));
   default:
   {

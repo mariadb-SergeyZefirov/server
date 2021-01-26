@@ -37,7 +37,6 @@ Full Text Search interface
 #include "dict0priv.h"
 #include "dict0stats.h"
 #include "btr0pcur.h"
-#include "sync0sync.h"
 
 static const ulint FTS_MAX_ID_LEN = 32;
 
@@ -189,6 +188,14 @@ struct fts_tokenize_param_t {
 	ulint		add_pos;	/*!< Added position for tokens */
 };
 
+/** Free a query graph */
+void fts_que_graph_free(que_t *graph)
+{
+  dict_sys.mutex_lock();
+  que_graph_free(graph);
+  dict_sys.mutex_unlock();
+}
+
 /** Run SYNC on the table, i.e., write out data from the cache to the
 FTS auxiliary INDEX table and clear the cache at the end.
 @param[in,out]	sync		sync state
@@ -284,12 +291,11 @@ static
 void
 fts_cache_destroy(fts_cache_t* cache)
 {
-	rw_lock_free(&cache->lock);
-	rw_lock_free(&cache->init_lock);
-	mutex_free(&cache->optimize_lock);
-	mutex_free(&cache->deleted_lock);
-	mutex_free(&cache->doc_id_lock);
-	os_event_destroy(cache->sync->event);
+	mysql_mutex_destroy(&cache->lock);
+	mysql_mutex_destroy(&cache->init_lock);
+	mysql_mutex_destroy(&cache->deleted_lock);
+	mysql_mutex_destroy(&cache->doc_id_lock);
+	mysql_cond_destroy(&cache->sync->cond);
 
 	if (cache->stopword_info.cached_stopword) {
 		rbt_free(cache->stopword_info.cached_stopword);
@@ -455,7 +461,7 @@ fts_load_user_stopword(
 	fts_stopword_t*	stopword_info)		/*!< in: Stopword info */
 {
 	if (!fts->dict_locked) {
-		mutex_enter(&dict_sys.mutex);
+		dict_sys.mutex_lock();
 	}
 
 	/* Validate the user table existence in the right format */
@@ -464,7 +470,7 @@ fts_load_user_stopword(
 	if (!stopword_info->charset) {
 cleanup:
 		if (!fts->dict_locked) {
-			mutex_exit(&dict_sys.mutex);
+			dict_sys.mutex_unlock();
 		}
 
 		return ret;
@@ -581,10 +587,10 @@ fts_cache_init(
 
 	cache->total_size = 0;
 
-	mutex_enter((ib_mutex_t*) &cache->deleted_lock);
+	mysql_mutex_lock(&cache->deleted_lock);
 	cache->deleted_doc_ids = ib_vector_create(
 		cache->sync_heap, sizeof(doc_id_t), 4);
-	mutex_exit((ib_mutex_t*) &cache->deleted_lock);
+	mysql_mutex_unlock(&cache->deleted_lock);
 
 	/* Reset the cache data for all the FTS indexes. */
 	for (i = 0; i < ib_vector_size(cache->indexes); ++i) {
@@ -614,17 +620,10 @@ fts_cache_create(
 
 	cache->cache_heap = heap;
 
-	rw_lock_create(fts_cache_rw_lock_key, &cache->lock, SYNC_FTS_CACHE);
-
-	rw_lock_create(
-		fts_cache_init_rw_lock_key, &cache->init_lock,
-		SYNC_FTS_CACHE_INIT);
-
-	mutex_create(LATCH_ID_FTS_DELETE, &cache->deleted_lock);
-
-	mutex_create(LATCH_ID_FTS_OPTIMIZE, &cache->optimize_lock);
-
-	mutex_create(LATCH_ID_FTS_DOC_ID, &cache->doc_id_lock);
+	mysql_mutex_init(fts_cache_mutex_key, &cache->lock, nullptr);
+	mysql_mutex_init(fts_cache_init_mutex_key, &cache->init_lock, nullptr);
+	mysql_mutex_init(fts_delete_mutex_key, &cache->deleted_lock, nullptr);
+	mysql_mutex_init(fts_doc_id_mutex_key, &cache->doc_id_lock, nullptr);
 
 	/* This is the heap used to create the cache itself. */
 	cache->self_heap = ib_heap_allocator_create(heap);
@@ -637,7 +636,7 @@ fts_cache_create(
 		mem_heap_zalloc(heap, sizeof(fts_sync_t)));
 
 	cache->sync->table = table;
-	cache->sync->event = os_event_create(0);
+	mysql_cond_init(0, &cache->sync->cond, nullptr);
 
 	/* Create the index cache vector that will hold the inverted indexes. */
 	cache->indexes = ib_vector_create(
@@ -670,7 +669,7 @@ fts_add_index(
 	ut_ad(fts);
 	cache = table->fts->cache;
 
-	rw_lock_x_lock(&cache->init_lock);
+	mysql_mutex_lock(&cache->init_lock);
 
 	ib_vector_push(fts->indexes, &index);
 
@@ -681,7 +680,7 @@ fts_add_index(
 		index_cache = fts_cache_index_cache_create(table, index);
 	}
 
-	rw_lock_x_unlock(&cache->init_lock);
+	mysql_mutex_unlock(&cache->init_lock);
 }
 
 /*******************************************************************//**
@@ -695,7 +694,7 @@ fts_reset_get_doc(
 	fts_get_doc_t*  get_doc;
 	ulint		i;
 
-	ut_ad(rw_lock_own(&cache->init_lock, RW_LOCK_X));
+	mysql_mutex_assert_owner(&cache->init_lock);
 
 	ib_vector_reset(cache->get_docs);
 
@@ -863,7 +862,7 @@ fts_drop_index(
 		fts_cache_t*            cache = table->fts->cache;
 		fts_index_cache_t*      index_cache;
 
-		rw_lock_x_lock(&cache->init_lock);
+		mysql_mutex_lock(&cache->init_lock);
 
 		index_cache = fts_find_index_cache(cache, index);
 
@@ -880,7 +879,7 @@ fts_drop_index(
 			fts_reset_get_doc(cache);
 		}
 
-		rw_lock_x_unlock(&cache->init_lock);
+		mysql_mutex_unlock(&cache->init_lock);
 	}
 
 	err = fts_drop_index_tables(trx, index);
@@ -913,15 +912,15 @@ fts_que_graph_free_check_lock(
 	}
 
 	if (!has_dict) {
-		mutex_enter(&dict_sys.mutex);
+		dict_sys.mutex_lock();
 	}
 
-	ut_ad(mutex_own(&dict_sys.mutex));
+	dict_sys.assert_locked();
 
 	que_graph_free(graph);
 
 	if (!has_dict) {
-		mutex_exit(&dict_sys.mutex);
+		dict_sys.mutex_unlock();
 	}
 }
 
@@ -979,7 +978,7 @@ fts_cache_index_cache_create(
 
 	ut_a(cache != NULL);
 
-	ut_ad(rw_lock_own(&cache->init_lock, RW_LOCK_X));
+	mysql_mutex_assert_owner(&cache->init_lock);
 
 	/* Must not already exist in the cache vector. */
 	ut_a(fts_find_index_cache(cache, index) == NULL);
@@ -1096,9 +1095,9 @@ fts_cache_clear(
 
 	cache->total_size = 0;
 
-	mutex_enter((ib_mutex_t*) &cache->deleted_lock);
+	mysql_mutex_lock(&cache->deleted_lock);
 	cache->deleted_doc_ids = NULL;
-	mutex_exit((ib_mutex_t*) &cache->deleted_lock);
+	mysql_mutex_unlock(&cache->deleted_lock);
 
 	mem_heap_free(static_cast<mem_heap_t*>(cache->sync_heap->arg));
 	cache->sync_heap->arg = NULL;
@@ -1114,12 +1113,12 @@ fts_get_index_cache(
 	fts_cache_t*		cache,		/*!< in: cache to search */
 	const dict_index_t*	index)		/*!< in: index to search for */
 {
-	ulint			i;
+#ifdef SAFE_MUTEX
+	ut_ad(mysql_mutex_is_owner(&cache->lock)
+	      || mysql_mutex_is_owner(&cache->init_lock));
+#endif /* SAFE_MUTEX */
 
-	ut_ad(rw_lock_own((rw_lock_t*) &cache->lock, RW_LOCK_X)
-	      || rw_lock_own((rw_lock_t*) &cache->init_lock, RW_LOCK_X));
-
-	for (i = 0; i < ib_vector_size(cache->indexes); ++i) {
+	for (ulint i = 0; i < ib_vector_size(cache->indexes); ++i) {
 		fts_index_cache_t*	index_cache;
 
 		index_cache = static_cast<fts_index_cache_t*>(
@@ -1147,7 +1146,7 @@ fts_get_index_get_doc(
 {
 	ulint			i;
 
-	ut_ad(rw_lock_own((rw_lock_t*) &cache->init_lock, RW_LOCK_X));
+	mysql_mutex_assert_owner(&cache->init_lock);
 
 	for (i = 0; i < ib_vector_size(cache->get_docs); ++i) {
 		fts_get_doc_t*	get_doc;
@@ -1180,7 +1179,7 @@ fts_tokenizer_word_get(
 	fts_tokenizer_word_t*	word;
 	ib_rbt_bound_t		parent;
 
-	ut_ad(rw_lock_own(&cache->lock, RW_LOCK_X));
+	mysql_mutex_assert_owner(&cache->lock);
 
 	/* If it is a stopword, do not index it */
 	if (!fts_check_token(text,
@@ -1238,11 +1237,11 @@ fts_cache_node_add_positions(
 	byte*		ptr_start;
 	ulint		doc_id_delta;
 
-#ifdef UNIV_DEBUG
+#ifdef SAFE_MUTEX
 	if (cache) {
-		ut_ad(rw_lock_own(&cache->lock, RW_LOCK_X));
+		mysql_mutex_assert_owner(&cache->lock);
 	}
-#endif /* UNIV_DEBUG */
+#endif /* SAFE_MUTEX */
 
 	ut_ad(doc_id >= node->last_doc_id);
 
@@ -1353,7 +1352,7 @@ fts_cache_add_doc(
 		return;
 	}
 
-	ut_ad(rw_lock_own(&cache->lock, RW_LOCK_X));
+	mysql_mutex_assert_owner(&cache->lock);
 
 	n_words = rbt_size(tokens);
 
@@ -2562,9 +2561,9 @@ fts_get_next_doc_id(
 	}
 
 	DEBUG_SYNC_C("get_next_FTS_DOC_ID");
-	mutex_enter(&cache->doc_id_lock);
+	mysql_mutex_lock(&cache->doc_id_lock);
 	*doc_id = cache->next_doc_id++;
-	mutex_exit(&cache->doc_id_lock);
+	mysql_mutex_unlock(&cache->doc_id_lock);
 
 	return(DB_SUCCESS);
 }
@@ -2659,13 +2658,13 @@ retry:
 		cache->synced_doc_id = ut_max(cmp_doc_id, *doc_id);
 	}
 
-	mutex_enter(&cache->doc_id_lock);
+	mysql_mutex_lock(&cache->doc_id_lock);
 	/* For each sync operation, we will add next_doc_id by 1,
 	so to mark a sync operation */
 	if (cache->next_doc_id < cache->synced_doc_id + 1) {
 		cache->next_doc_id = cache->synced_doc_id + 1;
 	}
-	mutex_exit(&cache->doc_id_lock);
+	mysql_mutex_unlock(&cache->doc_id_lock);
 
 	if (cmp_doc_id > *doc_id) {
 		error = fts_update_sync_doc_id(
@@ -2807,9 +2806,9 @@ fts_add(
 
 	fts_add_doc_by_id(ftt, doc_id, row->fts_indexes);
 
-	mutex_enter(&table->fts->cache->deleted_lock);
+	mysql_mutex_lock(&table->fts->cache->deleted_lock);
 	++table->fts->cache->added;
-	mutex_exit(&table->fts->cache->deleted_lock);
+	mysql_mutex_unlock(&table->fts->cache->deleted_lock);
 
 	if (!DICT_TF2_FLAG_IS_SET(table, DICT_TF2_FTS_HAS_DOC_ID)
 	    && doc_id >= table->fts->cache->next_doc_id) {
@@ -2857,7 +2856,7 @@ fts_delete(
 	is re-established and sync-ed */
 	if (table->fts->added_synced
 	    && doc_id > cache->synced_doc_id) {
-		mutex_enter(&table->fts->cache->deleted_lock);
+		mysql_mutex_lock(&table->fts->cache->deleted_lock);
 
 		/* The Doc ID could belong to those left in
 		ADDED table from last crash. So need to check
@@ -2868,7 +2867,7 @@ fts_delete(
 			--table->fts->cache->added;
 		}
 
-		mutex_exit(&table->fts->cache->deleted_lock);
+		mysql_mutex_unlock(&table->fts->cache->deleted_lock);
 
 		/* Only if the row was really deleted. */
 		ut_a(row->state == FTS_DELETE || row->state == FTS_MODIFY);
@@ -2902,11 +2901,11 @@ fts_delete(
 	/* Increment the total deleted count, this is used to calculate the
 	number of documents indexed. */
 	if (error == DB_SUCCESS) {
-		mutex_enter(&table->fts->cache->deleted_lock);
+		mysql_mutex_lock(&table->fts->cache->deleted_lock);
 
 		++table->fts->cache->deleted;
 
-		mutex_exit(&table->fts->cache->deleted_lock);
+		mysql_mutex_unlock(&table->fts->cache->deleted_lock);
 	}
 
 	return(error);
@@ -2962,11 +2961,11 @@ fts_commit_table(
 	ftt->fts_trx->trx = trx;
 
 	if (cache->get_docs == NULL) {
-		rw_lock_x_lock(&cache->init_lock);
+		mysql_mutex_lock(&cache->init_lock);
 		if (cache->get_docs == NULL) {
 			cache->get_docs = fts_get_docs_create(cache);
 		}
-		rw_lock_x_unlock(&cache->init_lock);
+		mysql_mutex_unlock(&cache->init_lock);
 	}
 
 	for (node = rbt_first(rows);
@@ -3331,7 +3330,7 @@ fts_add_doc_from_tuple(
 
                if (doc.found) {
                        mtr_commit(&mtr);
-                       rw_lock_x_lock(&table->fts->cache->lock);
+                       mysql_mutex_lock(&table->fts->cache->lock);
 
                        if (table->fts->cache->stopword_info.status
                            & STOPWORD_NOT_INIT) {
@@ -3344,7 +3343,7 @@ fts_add_doc_from_tuple(
                                get_doc->index_cache,
                                doc_id, doc.tokens);
 
-                       rw_lock_x_unlock(&table->fts->cache->lock);
+                       mysql_mutex_unlock(&table->fts->cache->lock);
 
                        if (cache->total_size > fts_max_cache_size / 5
                            || fts_need_sync) {
@@ -3496,7 +3495,7 @@ fts_add_doc_by_id(
 				btr_pcur_store_position(doc_pcur, &mtr);
 				mtr_commit(&mtr);
 
-				rw_lock_x_lock(&table->fts->cache->lock);
+				mysql_mutex_lock(&table->fts->cache->lock);
 
 				if (table->fts->cache->stopword_info.status
 				    & STOPWORD_NOT_INIT) {
@@ -3516,12 +3515,17 @@ fts_add_doc_by_id(
 					need_sync = true;
 				}
 
-				rw_lock_x_unlock(&table->fts->cache->lock);
+				mysql_mutex_unlock(&table->fts->cache->lock);
 
 				DBUG_EXECUTE_IF(
 					"fts_instrument_sync",
 					fts_optimize_request_sync_table(table);
-					os_event_wait(cache->sync->event);
+					mysql_mutex_lock(&cache->lock);
+					if (cache->sync->in_progress)
+						mysql_cond_wait(
+							&cache->sync->cond,
+							&cache->lock);
+					mysql_mutex_unlock(&cache->lock);
 				);
 
 				DBUG_EXECUTE_IF(
@@ -3958,7 +3962,7 @@ fts_sync_write_words(
 			/*FIXME: we need to handle the error properly. */
 			if (error == DB_SUCCESS) {
 				if (unlock_cache) {
-					rw_lock_x_unlock(
+					mysql_mutex_unlock(
 						&table->fts->cache->lock);
 				}
 
@@ -3976,7 +3980,7 @@ fts_sync_write_words(
 				);
 
 				if (unlock_cache) {
-					rw_lock_x_lock(
+					mysql_mutex_lock(
 						&table->fts->cache->lock);
 				}
 			}
@@ -4135,7 +4139,7 @@ fts_sync_commit(
 	fts_cache_clear(cache);
 	DEBUG_SYNC_C("fts_deleted_doc_ids_clear");
 	fts_cache_init(cache);
-	rw_lock_x_unlock(&cache->lock);
+	mysql_mutex_unlock(&cache->lock);
 
 	if (UNIV_LIKELY(error == DB_SUCCESS)) {
 		fts_sql_commit(trx);
@@ -4204,7 +4208,7 @@ fts_sync_rollback(
 		}
 	}
 
-	rw_lock_x_unlock(&cache->lock);
+	mysql_mutex_unlock(&cache->lock);
 
 	fts_sql_rollback(trx);
 
@@ -4234,21 +4238,19 @@ fts_sync(
 	dberr_t		error = DB_SUCCESS;
 	fts_cache_t*	cache = sync->table->fts->cache;
 
-	rw_lock_x_lock(&cache->lock);
+	mysql_mutex_lock(&cache->lock);
 
 	/* Check if cache is being synced.
 	Note: we release cache lock in fts_sync_write_words() to
 	avoid long wait for the lock by other threads. */
-	while (sync->in_progress) {
-		rw_lock_x_unlock(&cache->lock);
-
-		if (wait) {
-			os_event_wait(sync->event);
-		} else {
+	if (sync->in_progress) {
+		if (!wait) {
+			mysql_mutex_unlock(&cache->lock);
 			return(DB_SUCCESS);
 		}
-
-		rw_lock_x_lock(&cache->lock);
+		do {
+			mysql_cond_wait(&sync->cond, &cache->lock);
+		} while (sync->in_progress);
 	}
 
 	sync->unlock_cache = unlock_cache;
@@ -4314,23 +4316,23 @@ end_sync:
 		fts_sync_rollback(sync);
 	}
 
-	rw_lock_x_lock(&cache->lock);
-
+	mysql_mutex_lock(&cache->lock);
+	ut_ad(sync->in_progress);
 	sync->interrupted = false;
 	sync->in_progress = false;
-	os_event_set(sync->event);
-	rw_lock_x_unlock(&cache->lock);
+	mysql_cond_broadcast(&sync->cond);
+	mysql_mutex_unlock(&cache->lock);
 
 	/* We need to check whether an optimize is required, for that
 	we make copies of the two variables that control the trigger. These
 	variables can change behind our back and we don't want to hold the
 	lock for longer than is needed. */
-	mutex_enter(&cache->deleted_lock);
+	mysql_mutex_lock(&cache->deleted_lock);
 
 	cache->added = 0;
 	cache->deleted = 0;
 
-	mutex_exit(&cache->deleted_lock);
+	mysql_mutex_unlock(&cache->deleted_lock);
 
 	return(error);
 }
@@ -4714,7 +4716,7 @@ fts_get_docs_create(
 {
 	ib_vector_t*	get_docs;
 
-	ut_ad(rw_lock_own(&cache->init_lock, RW_LOCK_X));
+	mysql_mutex_assert_owner(&cache->init_lock);
 
 	/* We need one instance of fts_get_doc_t per index. */
 	get_docs = ib_vector_create(cache->self_heap, sizeof(fts_get_doc_t), 4);
@@ -4780,11 +4782,11 @@ fts_init_doc_id(
 {
 	doc_id_t	max_doc_id = 0;
 
-	rw_lock_x_lock(&table->fts->cache->lock);
+	mysql_mutex_lock(&table->fts->cache->lock);
 
 	/* Return if the table is already initialized for DOC ID */
 	if (table->fts->cache->first_doc_id != FTS_NULL_DOC_ID) {
-		rw_lock_x_unlock(&table->fts->cache->lock);
+		mysql_mutex_unlock(&table->fts->cache->lock);
 		return(0);
 	}
 
@@ -4805,7 +4807,7 @@ fts_init_doc_id(
 
 	table->fts->cache->first_doc_id = max_doc_id;
 
-	rw_lock_x_unlock(&table->fts->cache->lock);
+	mysql_mutex_unlock(&table->fts->cache->lock);
 
 	ut_ad(max_doc_id > 0);
 
@@ -5137,12 +5139,8 @@ fts_cache_find_word(
 {
 	ib_rbt_bound_t		parent;
 	const ib_vector_t*	nodes = NULL;
-#ifdef UNIV_DEBUG
-	dict_table_t*		table = index_cache->index->table;
-	fts_cache_t*		cache = table->fts->cache;
 
-	ut_ad(rw_lock_own(&cache->lock, RW_LOCK_X));
-#endif /* UNIV_DEBUG */
+	mysql_mutex_assert_owner(&index_cache->index->table->fts->cache->lock);
 
 	/* Lookup the word in the rb tree */
 	if (rbt_search(index_cache->words, &parent, text) == 0) {
@@ -5161,27 +5159,20 @@ Append deleted doc ids to vector. */
 void
 fts_cache_append_deleted_doc_ids(
 /*=============================*/
-	const fts_cache_t*	cache,		/*!< in: cache to use */
+	fts_cache_t*		cache,		/*!< in: cache to use */
 	ib_vector_t*		vector)		/*!< in: append to this vector */
 {
-	mutex_enter(const_cast<ib_mutex_t*>(&cache->deleted_lock));
+  mysql_mutex_lock(&cache->deleted_lock);
 
-	if (cache->deleted_doc_ids == NULL) {
-		mutex_exit((ib_mutex_t*) &cache->deleted_lock);
-		return;
-	}
+  if (cache->deleted_doc_ids)
+    for (ulint i= 0; i < ib_vector_size(cache->deleted_doc_ids); ++i)
+    {
+      doc_id_t *update= static_cast<doc_id_t*>(
+        ib_vector_get(cache->deleted_doc_ids, i));
+      ib_vector_push(vector, &update);
+    }
 
-
-	for (ulint i = 0; i < ib_vector_size(cache->deleted_doc_ids); ++i) {
-		doc_id_t*	update;
-
-		update = static_cast<doc_id_t*>(
-			ib_vector_get(cache->deleted_doc_ids, i));
-
-		ib_vector_push(vector, &update);
-	}
-
-	mutex_exit((ib_mutex_t*) &cache->deleted_lock);
+  mysql_mutex_unlock(&cache->deleted_lock);
 }
 
 /*********************************************************************//**
@@ -5269,15 +5260,12 @@ fts_t::fts_t(
 	mem_heap_t*		heap)
 	:
 	added_synced(0), dict_locked(0),
-	bg_threads(0),
 	add_wq(NULL),
 	cache(NULL),
 	doc_col(ULINT_UNDEFINED), in_queue(false), sync_message(false),
 	fts_heap(heap)
 {
 	ut_a(table->fts == NULL);
-
-	mutex_create(LATCH_ID_FTS_BG_THREADS, &bg_threads_mutex);
 
 	ib_alloc_t*	heap_alloc = ib_heap_allocator_create(fts_heap);
 
@@ -5289,8 +5277,6 @@ fts_t::fts_t(
 /** fts_t destructor. */
 fts_t::~fts_t()
 {
-	mutex_free(&bg_threads_mutex);
-
 	ut_ad(add_wq == NULL);
 
 	if (cache != NULL) {
@@ -5743,7 +5729,7 @@ fts parent table id and index id.
 				index id */
 static void fil_get_fts_spaces(fts_space_set_t& fts_space_set)
 {
-  mutex_enter(&fil_system.mutex);
+  mysql_mutex_lock(&fil_system.mutex);
 
   for (fil_space_t *space= UT_LIST_GET_FIRST(fil_system.space_list);
        space;
@@ -5757,7 +5743,7 @@ static void fil_get_fts_spaces(fts_space_set_t& fts_space_set)
       fts_space_set.insert(std::make_pair(table_id, index_id));
   }
 
-  mutex_exit(&fil_system.mutex);
+  mysql_mutex_unlock(&fil_system.mutex);
 }
 
 /** Check whether the parent table id and index id of fts auxilary
@@ -6214,13 +6200,12 @@ fts_init_recover_doc(
 This function brings FTS index in sync when FTS index is first
 used. There are documents that have not yet sync-ed to auxiliary
 tables from last server abnormally shutdown, we will need to bring
-such document into FTS cache before any further operations
-@return TRUE if all OK */
-ibool
+such document into FTS cache before any further operations */
+void
 fts_init_index(
 /*===========*/
 	dict_table_t*	table,		/*!< in: Table with FTS */
-	ibool		has_cache_lock)	/*!< in: Whether we already have
+	bool		has_cache_lock)	/*!< in: Whether we already have
 					cache lock */
 {
 	dict_index_t*   index;
@@ -6229,18 +6214,18 @@ fts_init_index(
 	fts_cache_t*    cache = table->fts->cache;
 	bool		need_init = false;
 
-	ut_ad(!mutex_own(&dict_sys.mutex));
+	dict_sys.assert_not_locked();
 
 	/* First check cache->get_docs is initialized */
 	if (!has_cache_lock) {
-		rw_lock_x_lock(&cache->lock);
+		mysql_mutex_lock(&cache->lock);
 	}
 
-	rw_lock_x_lock(&cache->init_lock);
+	mysql_mutex_lock(&cache->init_lock);
 	if (cache->get_docs == NULL) {
 		cache->get_docs = fts_get_docs_create(cache);
 	}
-	rw_lock_x_unlock(&cache->init_lock);
+	mysql_mutex_unlock(&cache->init_lock);
 
 	if (table->fts->added_synced) {
 		goto func_exit;
@@ -6290,17 +6275,15 @@ fts_init_index(
 
 func_exit:
 	if (!has_cache_lock) {
-		rw_lock_x_unlock(&cache->lock);
+		mysql_mutex_unlock(&cache->lock);
 	}
 
 	if (need_init) {
-		mutex_enter(&dict_sys.mutex);
+		dict_sys.mutex_lock();
 		/* Register the table with the optimize thread. */
 		fts_optimize_add_table(table);
-		mutex_exit(&dict_sys.mutex);
+		dict_sys.mutex_unlock();
 	}
-
-	return(TRUE);
 }
 
 /** Check if the all the auxillary tables associated with FTS index are in

@@ -1113,7 +1113,7 @@ public:
   */
   LEX *parent_lex;
   enum olap_type olap;
-  /* FROM clause - points to the beginning of the TABLE_LIST::next_local list. */
+  /* FROM clause - points to the beginning of the TABLE_LIST::next_local list */
   SQL_I_List<TABLE_LIST>  table_list;
 
   /*
@@ -1129,8 +1129,8 @@ public:
   List<Item>          pre_fix; /* above list before fix_fields */
   bool                is_item_list_lookup;
   /* 
-    Usualy it is pointer to ftfunc_list_alloc, but in union used to create fake
-    select_lex for calling mysql_select under results of union
+    Usually it is pointer to ftfunc_list_alloc, but in union used to create
+    fake select_lex for calling mysql_select under results of union
   */
   List<Item_func_match> *ftfunc_list;
   List<Item_func_match> ftfunc_list_alloc;
@@ -1334,10 +1334,8 @@ public:
   table_value_constr *tvc;
   bool in_tvc;
 
-  /* The interface employed to execute the select query by a foreign engine */
-  select_handler *select_h;
   /* The object used to organize execution of the query by a foreign engine */
-  Pushdown_select *pushdown_select;
+  select_handler *pushdown_select;
 
   /** System Versioning */
 public:
@@ -4471,6 +4469,12 @@ public:
 
   int add_period(Lex_ident name, Lex_ident_sys_st start, Lex_ident_sys_st end)
   {
+    if (lex_string_cmp(system_charset_info, &start, &end) == 0)
+    {
+      my_error(ER_FIELD_SPECIFIED_TWICE, MYF(0), start.str);
+      return 1;
+    }
+
     Table_period_info &info= create_info.period_info;
 
     if (check_exists && info.name.streq(name))

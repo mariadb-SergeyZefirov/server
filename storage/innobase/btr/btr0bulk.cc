@@ -43,7 +43,6 @@ PageBulk::init()
 {
 	buf_block_t*	new_block;
 	page_t*		new_page;
-	ulint		new_page_no;
 
 	ut_ad(m_heap == NULL);
 	m_heap = mem_heap_create(1000);
@@ -61,12 +60,10 @@ PageBulk::init()
 		alloc_mtr.start();
 		m_index->set_modified(alloc_mtr);
 
-		ulint	n_reserved;
-		bool	success;
-		success = fsp_reserve_free_extents(&n_reserved,
-						   m_index->table->space,
-						   1, FSP_NORMAL, &alloc_mtr);
-		if (!success) {
+		uint32_t n_reserved;
+		if (!fsp_reserve_free_extents(&n_reserved,
+					      m_index->table->space,
+					      1, FSP_NORMAL, &alloc_mtr)) {
 			alloc_mtr.commit();
 			m_mtr.commit();
 			return(DB_OUT_OF_FILE_SPACE);
@@ -81,7 +78,7 @@ PageBulk::init()
 		alloc_mtr.commit();
 
 		new_page = buf_block_get_frame(new_block);
-		new_page_no = page_get_page_no(new_page);
+		m_page_no = new_block->page.id().page_no();
 
 		byte* index_id = my_assume_aligned<2>
 			(PAGE_HEADER + PAGE_INDEX_ID + new_page);
@@ -108,8 +105,7 @@ PageBulk::init()
 					  false, &m_mtr);
 
 		new_page = buf_block_get_frame(new_block);
-		new_page_no = page_get_page_no(new_page);
-		ut_ad(m_page_no == new_page_no);
+		ut_ad(new_block->page.id().page_no() == m_page_no);
 
 		ut_ad(page_dir_get_n_heap(new_page) == PAGE_HEAP_NO_USER_LOW);
 
@@ -125,7 +121,6 @@ PageBulk::init()
 
 	m_block = new_block;
 	m_page = new_page;
-	m_page_no = new_page_no;
 	m_cur_rec = page_get_infimum_rec(new_page);
 	ut_ad(m_is_comp == !!page_is_comp(new_page));
 	m_free_space = page_get_free_space_of_empty(m_is_comp);
@@ -839,7 +834,7 @@ PageBulk::release()
 	finish();
 
 	/* We fix the block because we will re-pin it soon. */
-	buf_block_buf_fix_inc(m_block, __FILE__, __LINE__);
+	buf_block_buf_fix_inc(m_block);
 
 	/* No other threads can modify this block. */
 	m_modify_clock = buf_block_get_modify_clock(m_block);
@@ -854,14 +849,16 @@ PageBulk::latch()
 	m_mtr.start();
 	m_index->set_modified(m_mtr);
 
+	ut_ad(m_block->page.buf_fix_count());
+
 	/* In case the block is S-latched by page_cleaner. */
 	if (!buf_page_optimistic_get(RW_X_LATCH, m_block, m_modify_clock,
-				     __FILE__, __LINE__, &m_mtr)) {
+				     &m_mtr)) {
 		m_block = buf_page_get_gen(page_id_t(m_index->table->space_id,
 						     m_page_no),
 					   0, RW_X_LATCH,
 					   m_block, BUF_GET_IF_IN_POOL,
-					   __FILE__, __LINE__, &m_mtr, &m_err);
+					   &m_mtr, &m_err);
 
 		if (m_err != DB_SUCCESS) {
 			return (m_err);
@@ -871,6 +868,8 @@ PageBulk::latch()
 	}
 
 	buf_block_buf_fix_dec(m_block);
+
+	ut_ad(m_block->page.buf_fix_count());
 
 	ut_ad(m_cur_rec > m_page && m_cur_rec < m_heap_top);
 
@@ -950,9 +949,7 @@ BtrBulk::pageCommit(
 		page_bulk->set_modified();
 	}
 
-	ut_ad(!rw_lock_own_flagged(&m_index->lock,
-				   RW_LOCK_FLAG_X | RW_LOCK_FLAG_SX
-				   | RW_LOCK_FLAG_S));
+	ut_ad(!m_index->lock.have_any());
 
 	/* Compress page if it's a compressed table. */
 	if (page_bulk->getPageZip() != NULL && !page_bulk->compress()) {
@@ -981,7 +978,7 @@ inline void BtrBulk::logFreeCheck()
 	if (log_sys.check_flush_or_checkpoint()) {
 		release();
 
-		log_free_check();
+		log_check_margins();
 
 		latch();
 	}
@@ -1111,13 +1108,9 @@ BtrBulk::insert(
 				goto func_exit;
 			}
 
-			/* Wake up page cleaner to flush dirty pages. */
 			srv_inc_activity_count();
-			os_event_set(buf_flush_event);
-
 			logFreeCheck();
 		}
-
 	}
 
 	/* Convert tuple to rec. */
@@ -1163,7 +1156,7 @@ if no error occurs.
 dberr_t
 BtrBulk::finish(dberr_t	err)
 {
-	ulint		last_page_no = FIL_NULL;
+	uint32_t last_page_no = FIL_NULL;
 
 	ut_ad(!m_index->table->is_temporary());
 
@@ -1228,8 +1221,6 @@ BtrBulk::finish(dberr_t	err)
 		err = pageCommit(&root_page_bulk, NULL, false);
 		ut_ad(err == DB_SUCCESS);
 	}
-
-	ut_ad(!sync_check_iterate(dict_sync_check()));
 
 	ut_ad(err != DB_SUCCESS
 	      || btr_validate_index(m_index, NULL) == DB_SUCCESS);

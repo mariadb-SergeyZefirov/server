@@ -31,6 +31,7 @@ Created 1/8/1996 Heikki Tuuri
 #include "data0data.h"
 #include "dict0mem.h"
 #include "fsp0fsp.h"
+#include "srw_lock.h"
 #include <deque>
 
 class MDL_ticket;
@@ -910,19 +911,6 @@ inline ulint dict_tf_get_zip_size(ulint flags)
 		: 0;
 }
 
-/** Determine the extent size (in pages) for the given table
-@param[in]	table	the table whose extent size is being
-			calculated.
-@return extent size in pages (256, 128 or 64) */
-inline ulint dict_table_extent_size(const dict_table_t* table)
-{
-	if (ulint zip_size = table->space->zip_size()) {
-		return (1U << 20) / zip_size;
-	}
-
-	return FSP_EXTENT_SIZE;
-}
-
 /********************************************************************//**
 Checks if a column is in the ordering columns of the clustered index of a
 table. Column prefixes are treated like whole columns.
@@ -1273,15 +1261,6 @@ dict_index_get_page(
 /*================*/
 	const dict_index_t*	tree)	/*!< in: index */
 	MY_ATTRIBUTE((nonnull, warn_unused_result));
-/*********************************************************************//**
-Gets the read-write lock of the index tree.
-@return read-write lock */
-UNIV_INLINE
-rw_lock_t*
-dict_index_get_lock(
-/*================*/
-	dict_index_t*	index)	/*!< in: index */
-	MY_ATTRIBUTE((nonnull, warn_unused_result));
 /********************************************************************//**
 Returns free space reserved for future updates of records. This is
 relevant only in the case of many consecutive inserts, as updates
@@ -1332,9 +1311,6 @@ dict_index_calc_min_rec_len(
 /*========================*/
 	const dict_index_t*	index)	/*!< in: index */
 	MY_ATTRIBUTE((nonnull, warn_unused_result));
-
-#define dict_mutex_enter_for_mysql() mutex_enter(&dict_sys.mutex)
-#define dict_mutex_exit_for_mysql() mutex_exit(&dict_sys.mutex)
 
 /********************************************************************//**
 Checks if the database name in two table names is the same.
@@ -1399,35 +1375,33 @@ constraint */
 /* Buffers for storing detailed information about the latest foreign key
 and unique key errors */
 extern FILE*		dict_foreign_err_file;
-extern ib_mutex_t	dict_foreign_err_mutex; /* mutex protecting the
-						foreign key error messages */
+extern mysql_mutex_t dict_foreign_err_mutex;
 
 /** InnoDB data dictionary cache */
 class dict_sys_t
 {
+  /** The my_hrtime_coarse().val of the oldest mutex_lock_wait() start, or 0 */
+  std::atomic<ulonglong> mutex_wait_start;
+
+  /** @brief the data dictionary rw-latch protecting dict_sys
+
+  Table create, drop, etc. reserve this in X-mode (along with
+  acquiring dict_sys.mutex); implicit or
+  backround operations that are not fully covered by MDL
+  (rollback, foreign key checks) reserve this in S-mode.
+
+  This latch also prevents lock waits when accessing the InnoDB
+  data dictionary tables. @see trx_t::dict_operation_lock_mode */
+  MY_ALIGNED(CACHE_LINE_SIZE) srw_lock latch;
+#ifdef UNIV_DEBUG
+  /** whether latch is being held in exclusive mode (by any thread) */
+  bool latch_ex;
+#endif
+  /** Mutex protecting dict_sys. Whenever latch is acquired
+  exclusively, also the mutex will be acquired.
+  FIXME: merge the mutex and the latch, once MDEV-23484 has been fixed */
+  mysql_mutex_t mutex;
 public:
-	DictSysMutex	mutex;		/*!< mutex protecting the data
-					dictionary; protects also the
-					disk-based dictionary system tables;
-					this mutex serializes CREATE TABLE
-					and DROP TABLE, as well as reading
-					the dictionary data for a table from
-					system tables */
-	/** @brief the data dictionary rw-latch protecting dict_sys
-
-	Table create, drop, etc. reserve this in X-mode; implicit or
-	backround operations purge, rollback, foreign key checks reserve this
-	in S-mode; not all internal InnoDB operations are covered by MDL.
-
-	This latch also prevents lock waits when accessing the InnoDB
-	data dictionary tables. @see trx_t::dict_operation_lock_mode */
-	rw_lock_t	latch;
-	row_id_t	row_id;		/*!< the next row id to assign;
-					NOTE that at a checkpoint this
-					must be written to the dict system
-					header and flushed to a file; in
-					recovery this must be derived from
-					the log records */
 	hash_table_t	table_hash;	/*!< hash table of the tables, based
 					on name */
 	/** hash table of persistent table IDs */
@@ -1445,13 +1419,34 @@ public:
 	UT_LIST_BASE_NODE_T(dict_table_t)
 			table_non_LRU;	/*!< List of tables that can't be
 					evicted from the cache */
+
 private:
-	bool m_initialised;
-	/** the sequence of temporary table IDs */
-	std::atomic<table_id_t> temp_table_id;
-	/** hash table of temporary table IDs */
-	hash_table_t temp_id_hash;
+  bool m_initialised= false;
+  /** the sequence of temporary table IDs */
+  std::atomic<table_id_t> temp_table_id{DICT_HDR_FIRST_ID};
+  /** hash table of temporary table IDs */
+  hash_table_t temp_id_hash;
+  /** the next value of DB_ROW_ID, backed by DICT_HDR_ROW_ID
+  (FIXME: remove this, and move to dict_table_t) */
+  Atomic_relaxed<row_id_t> row_id;
+  /** The synchronization interval of row_id */
+  static constexpr size_t ROW_ID_WRITE_MARGIN= 256;
 public:
+  /** Diagnostic message for exceeding the mutex_lock_wait() timeout */
+  static const char fatal_msg[];
+
+  /** @return A new value for GEN_CLUST_INDEX(DB_ROW_ID) */
+  inline row_id_t get_new_row_id();
+
+  /** Ensure that row_id is not smaller than id, on IMPORT TABLESPACE */
+  inline void update_row_id(row_id_t id);
+
+  /** Recover the global DB_ROW_ID sequence on database startup */
+  void recover_row_id(row_id_t id)
+  {
+    row_id= ut_uint64_align_up(id, ROW_ID_WRITE_MARGIN) + ROW_ID_WRITE_MARGIN;
+  }
+
 	/** @return a new temporary table ID */
 	table_id_t get_temporary_table_id() {
 		return temp_table_id.fetch_add(1, std::memory_order_relaxed);
@@ -1464,7 +1459,7 @@ public:
 	(should only happen during the rollback of CREATE...SELECT) */
 	dict_table_t* get_temporary_table(table_id_t id)
 	{
-		ut_ad(mutex_own(&mutex));
+		mysql_mutex_assert_owner(&mutex);
 		dict_table_t* table;
 		ulint fold = ut_fold_ull(id);
 		HASH_SEARCH(id_hash, &temp_id_hash, fold, dict_table_t*, table,
@@ -1483,7 +1478,7 @@ public:
 	@retval	NULL	if not cached */
 	dict_table_t* get_table(table_id_t id)
 	{
-		ut_ad(mutex_own(&mutex));
+		mysql_mutex_assert_owner(&mutex);
 		dict_table_t* table;
 		ulint fold = ut_fold_ull(id);
 		HASH_SEARCH(id_hash, &table_id_hash, fold, dict_table_t*,
@@ -1492,12 +1487,6 @@ public:
 		DBUG_ASSERT(!table || !table->is_temporary());
 		return table;
 	}
-
-  /**
-    Constructor.  Further initialisation happens in create().
-  */
-
-  dict_sys_t() : m_initialised(false), temp_table_id(DICT_HDR_FIRST_ID) {}
 
   bool is_initialised() const { return m_initialised; }
 
@@ -1524,7 +1513,7 @@ public:
   {
     ut_ad(table);
     ut_ad(table->can_be_evicted == in_lru);
-    ut_ad(mutex_own(&mutex));
+    mysql_mutex_assert_owner(&mutex);
     for (const dict_table_t* t = UT_LIST_GET_FIRST(in_lru
 					     ? table_LRU : table_non_LRU);
 	 t; t = UT_LIST_GET_NEXT(table_LRU, t))
@@ -1555,27 +1544,51 @@ public:
   /** Acquire a reference to a cached table. */
   inline void acquire(dict_table_t* table);
 
-#ifdef UNIV_DEBUG
-  /** Assert that the data dictionary is locked */
-  void assert_locked()
-  {
-    ut_ad(mutex_own(&mutex));
-    ut_ad(rw_lock_own(&latch, RW_LOCK_X));
-  }
+  /** Assert that the mutex is locked */
+  void assert_locked() const { mysql_mutex_assert_owner(&mutex); }
+  /** Assert that the mutex is not locked */
+  void assert_not_locked() const { mysql_mutex_assert_not_owner(&mutex); }
+#ifdef SAFE_MUTEX
+  bool mutex_is_locked() const { return mysql_mutex_is_owner(&mutex); }
 #endif
+private:
+  /** Acquire the mutex */
+  ATTRIBUTE_NOINLINE void mutex_lock_wait();
+public:
+  /** @return the my_hrtime_coarse().val of the oldest mutex_lock_wait() start,
+  assuming that requests are served on a FIFO basis */
+  ulonglong oldest_wait() const
+  { return mutex_wait_start.load(std::memory_order_relaxed); }
+
+#ifdef HAVE_PSI_MUTEX_INTERFACE
+  /** Acquire the mutex */
+  ATTRIBUTE_NOINLINE void mutex_lock();
+  /** Release the mutex */
+  ATTRIBUTE_NOINLINE void mutex_unlock();
+#else
+  /** Acquire the mutex */
+  void mutex_lock() { if (mysql_mutex_trylock(&mutex)) mutex_lock_wait(); }
+
+  /** Release the mutex */
+  void mutex_unlock() { mysql_mutex_unlock(&mutex); }
+#endif
+
   /** Lock the data dictionary cache. */
-  void lock(const char* file, unsigned line)
-  {
-    rw_lock_x_lock_func(&latch, 0, file, line);
-    mutex_enter_loc(&mutex, file, line);
-  }
+  void lock(SRW_LOCK_ARGS(const char *file, unsigned line));
 
   /** Unlock the data dictionary cache. */
   void unlock()
   {
-    mutex_exit(&mutex);
-    rw_lock_x_unlock(&latch);
+    ut_ad(latch_ex);
+    ut_d(latch_ex= false);
+    mutex_unlock();
+    latch.wr_unlock();
   }
+
+  /** Prevent modifications of the data dictionary */
+  void freeze() { latch.rd_lock(SRW_LOCK_CALL); ut_ad(!latch_ex); }
+  /** Allow modifications of the data dictionary */
+  void unfreeze() { ut_ad(!latch_ex); latch.rd_unlock(); }
 
   /** Estimate the used memory occupied by the data dictionary
   table and index objects.
@@ -1599,7 +1612,7 @@ public:
 extern dict_sys_t	dict_sys;
 
 #define dict_table_prevent_eviction(table) dict_sys.prevent_eviction(table)
-#define dict_sys_lock() dict_sys.lock(__FILE__, __LINE__)
+#define dict_sys_lock() dict_sys.lock(SRW_LOCK_CALL)
 #define dict_sys_unlock() dict_sys.unlock()
 
 /* Auxiliary structs for checking a table definition @{ */
@@ -1802,20 +1815,6 @@ dict_table_decode_n_col(
 	ulint	encoded,
 	ulint*	n_col,
 	ulint*	n_v_col);
-
-/** Look for any dictionary objects that are found in the given tablespace.
-@param[in]	space_id	Tablespace ID to search for.
-@return true if tablespace is empty. */
-bool
-dict_space_is_empty(
-	ulint	space_id);
-
-/** Find the space_id for the given name in sys_tablespaces.
-@param[in]	name	Tablespace name to search for.
-@return the tablespace ID. */
-ulint
-dict_space_get_id(
-	const char*	name);
 
 /** Free the virtual column template
 @param[in,out]	vc_templ	virtual column template */

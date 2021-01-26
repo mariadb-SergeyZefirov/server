@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2014, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2019, MariaDB Corporation.
+Copyright (c) 2017, 2020, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -24,11 +24,9 @@ Transaction system global type definitions
 Created 3/26/1996 Heikki Tuuri
 *******************************************************/
 
-#ifndef trx0types_h
-#define trx0types_h
-
-#include "ut0byte.h"
-#include "ut0mutex.h"
+#pragma once
+#include "univ.i"
+#include "ut0new.h"
 
 #include <vector>
 
@@ -135,10 +133,4 @@ typedef	byte	trx_undo_rec_t;
 
 /* @} */
 
-typedef ib_mutex_t RsegMutex;
-typedef ib_mutex_t TrxMutex;
-typedef ib_mutex_t PQMutex;
-typedef ib_mutex_t TrxSysMutex;
-
 typedef std::vector<trx_id_t, ut_allocator<trx_id_t> >	trx_ids_t;
-#endif /* trx0types_h */

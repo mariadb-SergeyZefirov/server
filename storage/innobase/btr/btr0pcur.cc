@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2016, 2020, MariaDB Corporation.
+Copyright (c) 2016, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -153,9 +153,11 @@ before_first:
 			/* If the table is emptied during an ALGORITHM=NOCOPY
 			DROP COLUMN ... that is not ALGORITHM=INSTANT,
 			then we must preserve any instant ADD metadata. */
-			ut_ad(index->table->instant);
+			ut_ad(index->table->instant
+			      || block->page.id().page_no() != index->page);
 #endif
-			ut_ad(index->is_instant());
+			ut_ad(index->is_instant()
+			      || block->page.id().page_no() != index->page);
 			ut_ad(page_get_n_recs(block->frame) == 1);
 			ut_ad(page_is_leaf(block->frame));
 			ut_ad(!page_has_prev(block->frame));
@@ -173,7 +175,9 @@ before_first:
 			rec = page_rec_get_next(rec);
 			if (page_rec_is_supremum(rec)) {
 				ut_ad(page_has_next(block->frame)
-				      || rec_is_alter_metadata(p, *index));
+				      || rec_is_alter_metadata(p, *index)
+				      || block->page.id().page_no()
+				      != index->page);
 				goto before_first;
 			}
 		}
@@ -202,11 +206,10 @@ before_first:
 						 cursor->old_n_fields,
 						 &cursor->old_rec_buf,
 						 &cursor->buf_size);
-	cursor->block_when_stored = block;
+	cursor->block_when_stored.store(block);
 
 	/* Function try to check if block is S/X latch. */
 	cursor->modify_clock = buf_block_get_modify_clock(block);
-	cursor->withdraw_clock = buf_pool.withdraw_clock();
 }
 
 /**************************************************************//**
@@ -236,6 +239,26 @@ btr_pcur_copy_stored_position(
 	pcur_receive->old_n_fields = pcur_donate->old_n_fields;
 }
 
+/** Structure acts as functor to do the latching of leaf pages.
+It returns true if latching of leaf pages succeeded and false
+otherwise. */
+struct optimistic_latch_leaves
+{
+  btr_pcur_t *const cursor;
+  ulint *latch_mode;
+  mtr_t *const mtr;
+
+  optimistic_latch_leaves(btr_pcur_t *cursor, ulint *latch_mode, mtr_t *mtr)
+  :cursor(cursor), latch_mode(latch_mode), mtr(mtr) {}
+
+  bool operator() (buf_block_t *hint) const
+  {
+    return hint && btr_cur_optimistic_latch_leaves(
+             hint, cursor->modify_clock, latch_mode,
+             btr_pcur_get_btr_cur(cursor), mtr);
+  }
+};
+
 /**************************************************************//**
 Restores the stored position of a persistent cursor bufferfixing the page and
 obtaining the specified latches. If the cursor position was saved when the
@@ -252,12 +275,9 @@ restores to before first or after the last in the tree.
 record and it can be restored on a user record whose ordering fields
 are identical to the ones of the original user record */
 ibool
-btr_pcur_restore_position_func(
-/*===========================*/
+btr_pcur_restore_position(
 	ulint		latch_mode,	/*!< in: BTR_SEARCH_LEAF, ... */
 	btr_pcur_t*	cursor,		/*!< in: detached persistent cursor */
-	const char*	file,		/*!< in: file name */
-	unsigned	line,		/*!< in: line where called */
 	mtr_t*		mtr)		/*!< in: mtr */
 {
 	dict_index_t*	index;
@@ -288,9 +308,7 @@ btr_pcur_restore_position_func(
 
 		if (err != DB_SUCCESS) {
 			ib::warn() << " Error code: " << err
-				   << " btr_pcur_restore_position_func "
-				   << " called from file: "
-				   << file << " line: " << line
+				   << " btr_pcur_restore_position "
 				   << " table: " << index->table->name
 				   << " index: " << index->name;
 		}
@@ -298,7 +316,7 @@ btr_pcur_restore_position_func(
 		cursor->latch_mode =
 			BTR_LATCH_MODE_WITHOUT_INTENTION(latch_mode);
 		cursor->pos_state = BTR_PCUR_IS_POSITIONED;
-		cursor->block_when_stored = btr_pcur_get_block(cursor);
+		cursor->block_when_stored.clear();
 
 		return(FALSE);
 	}
@@ -313,19 +331,11 @@ btr_pcur_restore_position_func(
 	case BTR_MODIFY_PREV:
 		/* Try optimistic restoration. */
 
-		if (!buf_pool.is_obsolete(cursor->withdraw_clock)
-		    && btr_cur_optimistic_latch_leaves(
-			cursor->block_when_stored, cursor->modify_clock,
-			&latch_mode, btr_pcur_get_btr_cur(cursor),
-			file, line, mtr)) {
-
+		if (cursor->block_when_stored.run_with_hint(
+			optimistic_latch_leaves(cursor, &latch_mode,
+						mtr))) {
 			cursor->pos_state = BTR_PCUR_IS_POSITIONED;
 			cursor->latch_mode = latch_mode;
-
-			buf_block_dbg_add_level(
-				btr_pcur_get_block(cursor),
-				dict_index_is_ibuf(index)
-				? SYNC_IBUF_TREE_NODE : SYNC_TREE_NODE);
 
 			if (cursor->rel_pos == BTR_PCUR_ON) {
 #ifdef UNIV_DEBUG
@@ -395,7 +405,7 @@ btr_pcur_restore_position_func(
 #ifdef BTR_CUR_HASH_ADAPT
 					NULL,
 #endif /* BTR_CUR_HASH_ADAPT */
-					file, line, mtr);
+					mtr);
 
 	/* Restore the old search mode */
 	cursor->search_mode = old_mode;
@@ -416,11 +426,10 @@ btr_pcur_restore_position_func(
 		since the cursor can now be on a different page!
 		But we can retain the value of old_rec */
 
-		cursor->block_when_stored = btr_pcur_get_block(cursor);
+		cursor->block_when_stored.store(btr_pcur_get_block(cursor));
 		cursor->modify_clock = buf_block_get_modify_clock(
-						cursor->block_when_stored);
+					cursor->block_when_stored.block());
 		cursor->old_stored = true;
-		cursor->withdraw_clock = buf_pool.withdraw_clock();
 
 		mem_heap_free(heap);
 
@@ -617,8 +626,7 @@ in the first case sets the cursor after last in tree, and in the latter case
 before first in tree. The latching mode must be BTR_SEARCH_LEAF or
 BTR_MODIFY_LEAF. */
 void
-btr_pcur_open_on_user_rec_func(
-/*===========================*/
+btr_pcur_open_on_user_rec(
 	dict_index_t*	index,		/*!< in: index */
 	const dtuple_t*	tuple,		/*!< in: tuple on which search done */
 	page_cur_mode_t	mode,		/*!< in: PAGE_CUR_L, ... */
@@ -626,12 +634,9 @@ btr_pcur_open_on_user_rec_func(
 					BTR_MODIFY_LEAF */
 	btr_pcur_t*	cursor,		/*!< in: memory buffer for persistent
 					cursor */
-	const char*	file,		/*!< in: file name */
-	unsigned	line,		/*!< in: line where called */
 	mtr_t*		mtr)		/*!< in: mtr */
 {
-	btr_pcur_open_low(index, 0, tuple, mode, latch_mode, cursor,
-			  file, line, 0, mtr);
+	btr_pcur_open_low(index, 0, tuple, mode, latch_mode, cursor, 0, mtr);
 
 	if ((mode == PAGE_CUR_GE) || (mode == PAGE_CUR_G)) {
 

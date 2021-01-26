@@ -1085,7 +1085,7 @@ Field_longstr::make_packed_sort_key_part(uchar *buff,
 uchar*
 Field_longstr::pack_sort_string(uchar *to, const SORT_FIELD_ATTR *sort_field)
 {
-  StringBuffer<LONGLONG_BUFFER_SIZE> buf;
+  StringBuffer<LONGLONG_BUFFER_SIZE+1> buf;
   val_str(&buf, &buf);
   return to + sort_field->pack_sort_string(to, &buf, field_charset());
 }
@@ -8549,7 +8549,7 @@ int Field_blob::store(const char *from,size_t length,CHARSET_INFO *cs)
     DBUG_ASSERT(length <= max_data_length());
     
     new_length= length;
-    copy_length= (size_t)MY_MIN(UINT_MAX,table->in_use->variables.group_concat_max_len);
+    copy_length= table->in_use->variables.group_concat_max_len;
     if (new_length > copy_length)
     {
       new_length= Well_formed_prefix(cs,
@@ -8724,7 +8724,10 @@ int Field_blob::cmp_binary(const uchar *a_ptr, const uchar *b_ptr,
   b_length=get_length(b_ptr);
   if (b_length > max_length)
     b_length=max_length;
-  diff=memcmp(a,b,MY_MIN(a_length,b_length));
+  if (uint32 len= MY_MIN(a_length,b_length))
+    diff= memcmp(a,b,len);
+  else
+    diff= 0;
   return diff ? diff : (int) (a_length - b_length);
 }
 
@@ -8751,7 +8754,8 @@ uint Field_blob::get_key_image_itRAW(const uchar *ptr_arg, uchar *buff,
     length=(uint) blob_length;
   }
   int2store(buff,length);
-  memcpy(buff+HA_KEY_BLOB_LENGTH, blob, length);
+  if (length)
+    memcpy(buff+HA_KEY_BLOB_LENGTH, blob, length);
   return HA_KEY_BLOB_LENGTH+length;
 }
 

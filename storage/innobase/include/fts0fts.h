@@ -316,18 +316,10 @@ public:
 	/** fts_t destructor. */
 	~fts_t();
 
-	/** Mutex protecting bg_threads* and fts_add_wq. */
-	ib_mutex_t	bg_threads_mutex;
-
-	/** Whether the ADDED table record sync-ed after
-	crash recovery; protected by bg_threads_mutex */
+	/** Whether the ADDED table record sync-ed after crash recovery */
 	unsigned	added_synced:1;
-	/** Whether the table holds dict_sys.mutex;
-	protected by bg_threads_mutex */
+	/** Whether the table holds dict_sys.mutex */
 	unsigned	dict_locked:1;
-
-	/** Number of background threads accessing this table. */
-	ulint		bg_threads;
 
 	/** Work queue for scheduling jobs for the FTS 'Add' thread, or NULL
 	if the thread has not yet been created. Each work item is a
@@ -385,12 +377,8 @@ extern ulong		fts_min_token_size;
 need a sync to free some memory */
 extern bool		fts_need_sync;
 
-#define	fts_que_graph_free(graph)			\
-do {							\
-	mutex_enter(&dict_sys.mutex);			\
-	que_graph_free(graph);				\
-	mutex_exit(&dict_sys.mutex);			\
-} while (0)
+/** Free a query graph */
+void fts_que_graph_free(que_t *graph);
 
 /******************************************************************//**
 Create a FTS cache. */
@@ -895,13 +883,12 @@ fts_table_fetch_doc_ids(
 This function brings FTS index in sync when FTS index is first
 used. There are documents that have not yet sync-ed to auxiliary
 tables from last server abnormally shutdown, we will need to bring
-such document into FTS cache before any further operations
-@return TRUE if all OK */
-ibool
+such document into FTS cache before any further operations */
+void
 fts_init_index(
 /*===========*/
 	dict_table_t*	table,			/*!< in: Table with FTS */
-	ibool		has_cache_lock);	/*!< in: Whether we already
+	bool		has_cache_lock);	/*!< in: Whether we already
 						have cache lock */
 /*******************************************************************//**
 Add a newly create index in FTS cache */

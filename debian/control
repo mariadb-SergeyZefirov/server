@@ -5,56 +5,61 @@ Maintainer: MariaDB Developers <maria-developers@lists.launchpad.net>
 Build-Depends: bison,
                chrpath,
                cmake,
+               cracklib-runtime,
                debhelper (>= 9),
                dh-apparmor,
                dh-exec,
                dh-systemd,
-               flex [i386 amd64],
+               flex [amd64],
                gdb,
                libaio-dev [linux-any],
-               libboost-atomic-dev [i386 amd64],
-               libboost-chrono-dev [i386 amd64],
-               libboost-date-time-dev [i386 amd64],
+               libarchive-dev,
+               libboost-atomic-dev [amd64],
+               libboost-chrono-dev [amd64],
+               libboost-date-time-dev [amd64],
                libboost-dev,
-               libboost-filesystem-dev [i386 amd64],
-               libboost-regex-dev [i386 amd64],
-               libboost-system-dev [i386 amd64],
-               libboost-thread-dev [i386 amd64],
+               libboost-filesystem-dev [amd64],
+               libboost-regex-dev [amd64],
+               libboost-system-dev [amd64],
+               libboost-thread-dev [amd64],
                libcrack2-dev (>= 2.9.0),
                libcurl4-openssl-dev | libcurl4-dev,
                libedit-dev,
+               libedit-dev:native,
                libjemalloc-dev [linux-any],
                libjudy-dev,
                libkrb5-dev,
                liblz4-dev,
                libncurses5-dev (>= 5.0-6~),
-               libnuma-dev [!armhf],
+               libncurses5-dev:native (>= 5.0-6~),
+               libnuma-dev [linux-any],
                libpam0g-dev,
                libpcre2-dev,
-               libreadline-gplv2-dev [i386 amd64],
+               libreadline-gplv2-dev [amd64],
                libsnappy-dev,
-               libssl-dev | libssl1.0-dev,
+               libssl-dev,
+               libssl-dev:native,
                libsystemd-dev [linux-any],
                libxml2-dev,
                libzstd-dev,
                lsb-release,
-               perl,
+               perl:any,
                po-debconf,
                psmisc,
                unixodbc-dev,
                uuid-dev,
                zlib1g-dev (>= 1:1.1.3-5~)
 Rules-Requires-Root: no
-Standards-Version: 3.8.2
+Standards-Version: 4.5.0
 Homepage: https://mariadb.org/
 Vcs-Browser: https://github.com/MariaDB/server/
 Vcs-Git: https://github.com/MariaDB/server.git
 
 Package: libmariadb-dev
 Architecture: any
-Multi-Arch: same
 Section: libdevel
 Depends: libmariadb3 (= ${binary:Version}),
+         libssl-dev,
          zlib1g-dev,
          ${misc:Depends},
          ${shlibs:Depends}
@@ -188,12 +193,12 @@ Description: Virtual package to satisfy external libmysqlclient18 depends
 
 Package: libmariadbd19
 Architecture: any
-Multi-Arch: same
 Section: libs
 Depends: ${misc:Depends},
          ${shlibs:Depends}
 Breaks: libmariadbd-dev (<< ${source:Version})
 Replaces: libmariadbd-dev (<< ${source:Version})
+Multi-Arch: same
 Description: MariaDB embedded database, shared library
  MariaDB is a fast, stable and true multi-user, multi-threaded SQL database
  server. SQL (Structured Query Language) is the most popular database query
@@ -204,7 +209,6 @@ Description: MariaDB embedded database, shared library
 
 Package: libmariadbd-dev
 Architecture: any
-Multi-Arch: same
 Section: libdevel
 Provides: libmysqld-dev
 Pre-Depends: ${misc:Pre-Depends}
@@ -241,6 +245,7 @@ Package: mariadb-common
 Architecture: all
 Depends: mysql-common (>= 5.6.25),
          ${misc:Depends}
+Multi-Arch: foreign
 Description: MariaDB common configuration files
  MariaDB is a fast, stable and true multi-user, multi-threaded SQL database
  server. SQL (Structured Query Language) is the most popular database query
@@ -285,16 +290,16 @@ Conflicts: mariadb-client-10.0,
            mysql-client-core-5.7,
            mysql-client-core-8.0,
            virtual-mysql-client-core
-Replaces: mariadb-client-core-5.1,
-          mariadb-client-core-5.2,
-          mariadb-client-core-5.3,
-          mariadb-client-core-5.5,
-          mariadb-client-core-10.0,
+Replaces: mariadb-client-core-10.0,
           mariadb-client-core-10.1,
           mariadb-client-core-10.2,
           mariadb-client-core-10.3,
           mariadb-client-core-10.4,
           mariadb-client-core-10.5,
+          mariadb-client-core-5.1,
+          mariadb-client-core-5.2,
+          mariadb-client-core-5.3,
+          mariadb-client-core-5.5,
           mysql-client-core-5.1,
           mysql-client-core-5.5,
           mysql-client-core-5.6,
@@ -346,16 +351,16 @@ Conflicts: mariadb-client (<< ${source:Version}),
            mysql-client-core-8.0,
            mytop,
            virtual-mysql-client
-Replaces: mariadb-client-5.1,
-          mariadb-client-5.2,
-          mariadb-client-5.3,
-          mariadb-client-5.5,
-          mariadb-client-10.0,
+Replaces: mariadb-client-10.0,
           mariadb-client-10.1,
           mariadb-client-10.2,
           mariadb-client-10.3,
           mariadb-client-10.4,
           mariadb-client-10.5,
+          mariadb-client-5.1,
+          mariadb-client-5.2,
+          mariadb-client-5.3,
+          mariadb-client-5.5,
           mysql-client-5.0,
           mysql-client-5.1,
           mysql-client-5.5,
@@ -400,16 +405,16 @@ Conflicts: mariadb-server-core-10.0,
            mysql-server-core-5.7,
            mysql-server-core-8.0,
            virtual-mysql-server-core
-Replaces: mariadb-server-core-5.1,
-          mariadb-server-core-5.2,
-          mariadb-server-core-5.3,
-          mariadb-server-core-5.5,
-          mariadb-server-core-10.0,
+Replaces: mariadb-server-core-10.0,
           mariadb-server-core-10.1,
           mariadb-server-core-10.2,
           mariadb-server-core-10.3,
           mariadb-server-core-10.4,
           mariadb-server-core-10.5,
+          mariadb-server-core-5.1,
+          mariadb-server-core-5.2,
+          mariadb-server-core-5.3,
+          mariadb-server-core-5.5,
           mysql-server-core-5.0,
           mysql-server-core-5.1,
           mysql-server-core-5.5,
@@ -443,7 +448,7 @@ Depends: galera-4 (>=26.4),
          lsb-base (>= 3.0-10),
          lsof [linux-any],
          mariadb-client-10.6 (>= ${source:Version}),
-         mariadb-server-core-10.6 (>= ${binary:Version}),
+         mariadb-server-core-10.6 (>= ${server:Version}),
          passwd,
          perl (>= 5.6),
          procps,
@@ -476,16 +481,16 @@ Conflicts: mariadb-server (<< ${source:Version}),
            mysql-server-5.7,
            mysql-server-8.0,
            virtual-mysql-server
-Replaces: mariadb-server-5.1,
-          mariadb-server-5.2,
-          mariadb-server-5.3,
-          mariadb-server-5.5,
-          mariadb-server-10.0,
+Replaces: mariadb-server-10.0,
           mariadb-server-10.1,
           mariadb-server-10.2,
           mariadb-server-10.3,
           mariadb-server-10.4,
           mariadb-server-10.5,
+          mariadb-server-5.1,
+          mariadb-server-5.2,
+          mariadb-server-5.3,
+          mariadb-server-5.5,
           mysql-server-4.1,
           mysql-server-5.0,
           mysql-server-5.1,
@@ -549,7 +554,7 @@ Description: Backup tool for MariaDB server
 Package: mariadb-plugin-connect
 Architecture: any
 Depends: libxml2,
-         mariadb-server-10.6 (= ${binary:Version}),
+         mariadb-server-10.6 (= ${server:Version}),
          unixodbc,
          ${misc:Depends},
          ${shlibs:Depends}
@@ -570,7 +575,7 @@ Description: Connect storage engine for MariaDB
 Package: mariadb-plugin-s3
 Architecture: any
 Depends: libcurl4,
-         mariadb-server-10.6 (= ${binary:Version}),
+         mariadb-server-10.6 (= ${server:Version}),
          ${misc:Depends},
          ${shlibs:Depends}
 Description: Amazon S3 archival storage engine for MariaDB
@@ -580,7 +585,7 @@ Description: Amazon S3 archival storage engine for MariaDB
 
 Package: mariadb-plugin-rocksdb
 Architecture: amd64 arm64 mips64el ppc64el
-Depends: mariadb-server-10.6 (= ${binary:Version}),
+Depends: mariadb-server-10.6 (= ${server:Version}),
          python3,
          rocksdb-tools,
          ${misc:Depends},
@@ -597,29 +602,10 @@ Description: RocksDB storage engine for MariaDB
  at maximising storage efficiency while maintaining InnoDB-like performance.
  This package contains the RocksDB plugin for MariaDB.
 
-Package: mariadb-plugin-columnstore
-Architecture: amd64 i386
-Depends: binutils,
-         libjemalloc1 | libjemalloc2,
-         libsnappy1 | libsnappy1v5,
-         mariadb-server-10.6 (= ${binary:Version}),
-         net-tools,
-         python3,
-         ${misc:Depends},
-         ${shlibs:Depends}
-Breaks: mariadb-columnstore-libs,
-        mariadb-columnstore-platform
-Replaces: mariadb-columnstore-libs,
-          mariadb-columnstore-platform
-Description: MariaDB ColumnStore storage engine
- The MariaDB ColumnStore storage engine is a high-performance columnar
- analytical engine, aimed at rapid processing of analytical queries on very
- large amounts of data.
-
 Package: mariadb-plugin-oqgraph
 Architecture: any
 Depends: libjudydebian1,
-         mariadb-server-10.6 (= ${binary:Version}),
+         mariadb-server-10.6 (= ${server:Version}),
          ${misc:Depends},
          ${shlibs:Depends}
 Breaks: mariadb-oqgraph-engine-10.1,
@@ -637,7 +623,7 @@ Description: OQGraph storage engine for MariaDB
 
 Package: mariadb-plugin-mroonga
 Architecture: any-alpha any-amd64 any-arm any-arm64 any-i386 any-ia64 any-mips64el any-mips64r6el any-mipsel any-mipsr6el any-nios2 any-powerpcel any-ppc64el any-sh3 any-sh4 any-tilegx
-Depends: mariadb-server-10.6 (= ${binary:Version}),
+Depends: mariadb-server-10.6 (= ${server:Version}),
          ${misc:Depends},
          ${shlibs:Depends}
 Breaks: mariadb-server-10.0,
@@ -657,7 +643,7 @@ Description: Mroonga storage engine for MariaDB
 
 Package: mariadb-plugin-spider
 Architecture: any
-Depends: mariadb-server-10.6 (= ${binary:Version}),
+Depends: mariadb-server-10.6 (= ${server:Version}),
          ${misc:Depends},
          ${shlibs:Depends}
 Breaks: mariadb-server-10.0,
@@ -679,7 +665,7 @@ Description: Spider storage engine for MariaDB
 Package: mariadb-plugin-gssapi-server
 Architecture: any
 Depends: libgssapi-krb5-2,
-         mariadb-server-10.6 (= ${binary:Version}),
+         mariadb-server-10.6,
          ${misc:Depends},
          ${shlibs:Depends}
 Breaks: mariadb-gssapi-server-10.1,
@@ -698,6 +684,7 @@ Description: GSSAPI authentication plugin for MariaDB server
 
 Package: mariadb-plugin-gssapi-client
 Architecture: any
+Multi-Arch: same
 Depends: libgssapi-krb5-2,
          mariadb-client-10.6 (= ${binary:Version}),
          ${misc:Depends},
@@ -719,7 +706,7 @@ Description: GSSAPI authentication plugin for MariaDB client
 Package: mariadb-plugin-cracklib-password-check
 Architecture: any
 Depends: libcrack2 (>= 2.9.0),
-         mariadb-server-10.6 (= ${binary:Version}),
+         mariadb-server-10.6,
          ${misc:Depends},
          ${shlibs:Depends}
 Description: CrackLib Password Validation Plugin for MariaDB
@@ -731,24 +718,24 @@ Description: CrackLib Password Validation Plugin for MariaDB
 Package: mariadb-test
 Architecture: any
 Depends: mariadb-client-10.6 (= ${binary:Version}),
-         mariadb-server-10.6 (= ${binary:Version}),
+         mariadb-server-10.6 (= ${server:Version}),
          mariadb-test-data (= ${source:Version}),
          virtual-mysql-testsuite,
          ${misc:Depends},
          ${perl:Depends},
          ${shlibs:Depends}
-Breaks: mariadb-test-5.5,
-        mariadb-test-10.0,
+Breaks: mariadb-test-10.0,
         mariadb-test-10.1,
         mariadb-test-10.2,
         mariadb-test-10.3,
         mariadb-test-10.4,
-Replaces: mariadb-test-5.5,
-          mariadb-test-10.0,
+        mariadb-test-5.5
+Replaces: mariadb-test-10.0,
           mariadb-test-10.1,
           mariadb-test-10.2,
           mariadb-test-10.3,
           mariadb-test-10.4,
+          mariadb-test-5.5,
           virtual-mysql-testsuite
 Provides: virtual-mysql-testsuite
 Suggests: patch
@@ -766,23 +753,23 @@ Multi-Arch: foreign
 Depends: ${misc:Depends},
          ${perl:Depends},
          ${shlibs:Depends}
-Breaks: mariadb-test-data-5.5,
-        mariadb-test-data-10.0,
+Breaks: mariadb-test-data-10.0,
         mariadb-test-data-10.1,
         mariadb-test-data-10.2,
         mariadb-test-data-10.3,
         mariadb-test-data-10.4,
+        mariadb-test-data-5.5,
         mysql-testsuite,
         mysql-testsuite-5.5,
         mysql-testsuite-5.6,
         mysql-testsuite-5.7,
         mysql-testsuite-8.0
-Replaces: mariadb-test-data-5.5,
-          mariadb-test-data-10.0,
+Replaces: mariadb-test-data-10.0,
           mariadb-test-data-10.1,
           mariadb-test-data-10.2,
           mariadb-test-data-10.3,
           mariadb-test-data-10.4,
+          mariadb-test-data-5.5,
           mysql-testsuite,
           mysql-testsuite-5.5,
           mysql-testsuite-5.6,

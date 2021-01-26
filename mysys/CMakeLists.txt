@@ -86,7 +86,14 @@ ELSEIF(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64")
       return ret;
     }
     #include <sys/auxv.h>
-    int main() { foo(0); getauxval(AT_HWCAP); }" HAVE_ARMV8_CRC)
+    int main() { foo(0);
+    #ifdef __linux__
+    getauxval(AT_HWCAP);
+    #else
+    unsigned long v;
+    elf_aux_info(AT_HWCAP, &v, sizeof(v));
+    #endif
+    }" HAVE_ARMV8_CRC)
 
     CHECK_CXX_SOURCE_COMPILES("
     asm(\".arch_extension crypto\");
@@ -95,7 +102,14 @@ ELSEIF(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64")
       return ret;
     }
     #include <sys/auxv.h>
-    int main() { foo(0); getauxval(AT_HWCAP); }" HAVE_ARMV8_CRYPTO)
+    int main() { foo(0);
+    #ifdef __linux__
+    getauxval(AT_HWCAP);
+    #else
+    unsigned long v;
+    elf_aux_info(AT_HWCAP, &v, sizeof(v));
+    #endif
+    }" HAVE_ARMV8_CRYPTO)
 
     CHECK_C_COMPILER_FLAG(-march=armv8-a+crc+crypto HAVE_ARMV8_CRC_CRYPTO_MARCH)
 
@@ -115,7 +129,7 @@ ELSEIF(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64")
         COMPILE_FLAGS "-march=armv8-a+crc+crypto")
     ENDIF()
   ENDIF()
-ELSEIF(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64")
+ELSEIF(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64|powerpc64")
   SET(MYSYS_SOURCES ${MYSYS_SOURCES} crc32/crc32_ppc64.c crc32/crc32c_ppc.c)
   SET_SOURCE_FILES_PROPERTIES(crc32/crc32_ppc64.c crc32/crc32c_ppc.c PROPERTIES
         COMPILE_FLAGS "${COMPILE_FLAGS} -maltivec -mvsx -mpower8-vector -mcrypto -mpower8-vector")
@@ -137,7 +151,7 @@ ENDIF()
 ADD_CONVENIENCE_LIBRARY(mysys ${MYSYS_SOURCES})
 MAYBE_DISABLE_IPO(mysys)
 TARGET_LINK_LIBRARIES(mysys dbug strings ${ZLIB_LIBRARY}
- ${LIBNSL} ${LIBM} ${LIBRT} ${LIBDL} ${LIBSOCKET} ${LIBEXECINFO})
+ ${LIBNSL} ${LIBM} ${LIBRT} ${CMAKE_DL_LIBS} ${LIBSOCKET} ${LIBEXECINFO})
 DTRACE_INSTRUMENT(mysys)
 
 IF(HAVE_BFD_H)

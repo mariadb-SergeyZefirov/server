@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2016, 2020, MariaDB Corporation.
+Copyright (c) 2016, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -44,6 +44,9 @@ Created 4/20/1996 Heikki Tuuri
 #include "buf0lru.h"
 #include "fts0fts.h"
 #include "fts0types.h"
+#ifdef BTR_CUR_HASH_ADAPT
+# include "btr0sea.h"
+#endif
 #ifdef WITH_WSREP
 #include "wsrep_mysqld.h"
 #endif /* WITH_WSREP */
@@ -460,7 +463,7 @@ row_ins_cascade_calc_update_vec(
 
 	n_fields_updated = 0;
 
-	bool affects_fulltext = false;
+	bool affects_fulltext = foreign->affects_fulltext();
 
 	if (table->fts) {
 		doc_id_pos = dict_table_get_nth_col_pos(
@@ -583,17 +586,6 @@ row_ins_cascade_calc_update_vec(
 							padded_data, min_size);
 				}
 
-				/* Check whether the current column has
-				FTS index on it */
-				if (table->fts
-				    && dict_table_is_fts_column(
-					table->fts->indexes,
-					dict_col_get_no(col),
-					col->is_virtual())
-					!= ULINT_UNDEFINED) {
-					affects_fulltext = true;
-				}
-
 				/* If Doc ID is updated, check whether the
 				Doc ID is valid */
 				if (table->fts
@@ -682,7 +674,7 @@ row_ins_set_detailed(
 {
 	ut_ad(!srv_read_only_mode);
 
-	mutex_enter(&srv_misc_tmpfile_mutex);
+	mysql_mutex_lock(&srv_misc_tmpfile_mutex);
 	rewind(srv_misc_tmpfile);
 
 	if (os_file_set_eof(srv_misc_tmpfile)) {
@@ -696,7 +688,7 @@ row_ins_set_detailed(
 		trx_set_detailed_error(trx, "temp file operation failed");
 	}
 
-	mutex_exit(&srv_misc_tmpfile_mutex);
+	mysql_mutex_unlock(&srv_misc_tmpfile_mutex);
 }
 
 /*********************************************************************//**
@@ -715,13 +707,13 @@ row_ins_foreign_trx_print(
 
 	ut_ad(!srv_read_only_mode);
 
-	lock_mutex_enter();
-	n_rec_locks = lock_number_of_rows_locked(&trx->lock);
+	lock_sys.mutex_lock();
+	n_rec_locks = trx->lock.n_rec_locks;
 	n_trx_locks = UT_LIST_GET_LEN(trx->lock.trx_locks);
 	heap_size = mem_heap_get_size(trx->lock.lock_heap);
-	lock_mutex_exit();
+	lock_sys.mutex_unlock();
 
-	mutex_enter(&dict_foreign_err_mutex);
+	mysql_mutex_lock(&dict_foreign_err_mutex);
 	rewind(dict_foreign_err_file);
 	ut_print_timestamp(dict_foreign_err_file);
 	fputs(" Transaction:\n", dict_foreign_err_file);
@@ -729,7 +721,7 @@ row_ins_foreign_trx_print(
 	trx_print_low(dict_foreign_err_file, trx, 600,
 		      n_rec_locks, n_trx_locks, heap_size);
 
-	ut_ad(mutex_own(&dict_foreign_err_mutex));
+	mysql_mutex_assert_owner(&dict_foreign_err_mutex);
 }
 
 /*********************************************************************//**
@@ -787,7 +779,7 @@ row_ins_foreign_report_err(
 	}
 	putc('\n', ef);
 
-	mutex_exit(&dict_foreign_err_mutex);
+	mysql_mutex_unlock(&dict_foreign_err_mutex);
 }
 
 /*********************************************************************//**
@@ -853,7 +845,7 @@ row_ins_foreign_report_add_err(
 	}
 	putc('\n', ef);
 
-	mutex_exit(&dict_foreign_err_mutex);
+	mysql_mutex_unlock(&dict_foreign_err_mutex);
 }
 
 /*********************************************************************//**
@@ -903,7 +895,7 @@ row_ins_foreign_fill_virtual(
 	update->old_vrow = row_build(
 		ROW_COPY_DATA, index, rec,
 		offsets, index->table, NULL, NULL,
-		&ext, cascade->heap);
+		&ext, update->heap);
 	n_diff = update->n_fields;
 
 	if (index->table->vc_templ == NULL) {
@@ -1223,8 +1215,6 @@ row_ins_foreign_check_on_constraint(
 		MEM_UNDEFINED(update->fields,
 			      update->n_fields * sizeof *update->fields);
 
-		bool affects_fulltext = false;
-
 		for (ulint i = 0; i < foreign->n_fields; i++) {
 			upd_field_t*	ufield = &update->fields[i];
 			ulint		col_no = dict_index_get_nth_col_no(
@@ -1241,19 +1231,9 @@ row_ins_foreign_check_on_constraint(
 			ufield->orig_len = 0;
 			ufield->exp = NULL;
 			dfield_set_null(&ufield->new_val);
-
-			if (!affects_fulltext
-			    && table->fts && dict_table_is_fts_column(
-				    table->fts->indexes,
-				    dict_index_get_nth_col(index, i)->ind,
-				    dict_index_get_nth_col(index, i)
-				    ->is_virtual())
-			    != ULINT_UNDEFINED) {
-				affects_fulltext = true;
-			}
 		}
 
-		if (affects_fulltext) {
+		if (foreign->affects_fulltext()) {
 			fts_trx_add_op(trx, table, doc_id, FTS_DELETE, NULL);
 		}
 
@@ -1267,24 +1247,10 @@ row_ins_foreign_check_on_constraint(
 				goto nonstandard_exit_func;
 			}
 		}
-	} else if (table->fts && cascade->is_delete == PLAIN_DELETE) {
+	} else if (table->fts && cascade->is_delete == PLAIN_DELETE
+		   && foreign->affects_fulltext()) {
 		/* DICT_FOREIGN_ON_DELETE_CASCADE case */
-		bool affects_fulltext = false;
-
-		for (ulint i = 0; i < foreign->n_fields; i++) {
-			if (dict_table_is_fts_column(
-				table->fts->indexes,
-				dict_index_get_nth_col(index, i)->ind,
-				dict_index_get_nth_col(index, i)->is_virtual())
-			    != ULINT_UNDEFINED) {
-				affects_fulltext = true;
-				break;
-			}
-		}
-
-		if (affects_fulltext) {
-			fts_trx_add_op(trx, table, doc_id, FTS_DELETE, NULL);
-		}
+		fts_trx_add_op(trx, table, doc_id, FTS_DELETE, NULL);
 	}
 
 	if (!node->is_delete
@@ -1518,8 +1484,6 @@ row_ins_check_foreign_constraint(
 	upd_node= NULL;
 #endif /* WITH_WSREP */
 
-	ut_ad(rw_lock_own(&dict_sys.latch, RW_LOCK_S));
-
 	err = DB_SUCCESS;
 
 	if (trx->check_foreigns == FALSE) {
@@ -1637,7 +1601,7 @@ row_ins_check_foreign_constraint(
 			err = DB_ROW_IS_REFERENCED;
 		}
 
-		mutex_exit(&dict_foreign_err_mutex);
+		mysql_mutex_unlock(&dict_foreign_err_mutex);
 		goto exit_func;
 	}
 
@@ -1907,8 +1871,14 @@ bool row_ins_foreign_index_entry(dict_foreign_t *foreign,
   {
     for (ulint j= 0; j < index->n_fields; j++)
     {
-      const char *col_name= dict_table_get_col_name(
-        index->table, dict_index_get_nth_col_no(index, j));
+      const dict_col_t *col= dict_index_get_nth_col(index, j);
+
+      /* A clustered index may contain instantly dropped columns,
+      which must be skipped. */
+      if (col->is_dropped())
+        continue;
+
+      const char *col_name= dict_table_get_col_name(index->table, col->ind);
       if (0 == innobase_strcasecmp(col_name, foreign->foreign_col_names[i]))
       {
         dfield_copy(&ref_entry->fields[i], &entry->fields[j]);
@@ -2112,8 +2082,7 @@ row_ins_scan_sec_index_for_duplicate(
 
 	rec_offs_init(offsets_);
 
-	ut_ad(s_latch == rw_lock_own_flagged(
-			&index->lock, RW_LOCK_FLAG_S | RW_LOCK_FLAG_SX));
+	ut_ad(s_latch == (index->lock.have_u_not_x() || index->lock.have_s()));
 
 	n_unique = dict_index_get_n_unique(index);
 
@@ -2404,6 +2373,18 @@ row_ins_duplicate_error_in_clust(
 duplicate:
 				trx->error_info = cursor->index;
 				err = DB_DUPLICATE_KEY;
+				if (cursor->index->table->versioned()
+				    && entry->vers_history_row())
+				{
+					ulint trx_id_len;
+					byte *trx_id = rec_get_nth_field(
+						rec, offsets, n_unique,
+						&trx_id_len);
+					ut_ad(trx_id_len == DATA_TRX_ID_LEN);
+					if (trx->id == trx_read_trx_id(trx_id)) {
+						err = DB_FOREIGN_DUPLICATE_KEY;
+					}
+				}
 				goto func_exit;
 			}
 		}
@@ -2552,6 +2533,12 @@ row_ins_index_entry_big_rec(
 	return(error);
 }
 
+#ifdef HAVE_REPLICATION /* Working around MDEV-24622 */
+extern "C" int thd_is_slave(const MYSQL_THD thd);
+#else
+# define thd_is_slave(thd) 0
+#endif
+
 /***************************************************************//**
 Tries to insert an entry into a clustered index, ignoring foreign key
 constraints. If a record with the same unique key is found, the other
@@ -2586,6 +2573,8 @@ row_ins_clust_index_entry_low(
 	rec_offs	offsets_[REC_OFFS_NORMAL_SIZE];
 	rec_offs*	offsets         = offsets_;
 	rec_offs_init(offsets_);
+	trx_t*		trx	= thr_get_trx(thr);
+	buf_block_t*	block;
 
 	DBUG_ENTER("row_ins_clust_index_entry_low");
 
@@ -2593,7 +2582,7 @@ row_ins_clust_index_entry_low(
 	ut_ad(!dict_index_is_unique(index)
 	      || n_uniq == dict_index_get_n_unique(index));
 	ut_ad(!n_uniq || n_uniq == dict_index_get_n_unique(index));
-	ut_ad(!thr_get_trx(thr)->in_rollback);
+	ut_ad(!trx->in_rollback);
 
 	mtr_start(&mtr);
 
@@ -2644,9 +2633,10 @@ row_ins_clust_index_entry_low(
 	the function will return in both low_match and up_match of the
 	cursor sensible values */
  	err = btr_pcur_open_low(index, 0, entry, PAGE_CUR_LE, mode, &pcur,
-			  __FILE__, __LINE__, auto_inc, &mtr);
+				auto_inc, &mtr);
 	if (err != DB_SUCCESS) {
 		index->table->file_unreadable = true;
+commit_exit:
 		mtr.commit();
 		goto func_exit;
 	}
@@ -2665,6 +2655,47 @@ row_ins_clust_index_entry_low(
 	}
 #endif /* UNIV_DEBUG */
 
+	block = btr_cur_get_block(cursor);
+
+	DBUG_EXECUTE_IF("row_ins_row_level", goto skip_bulk_insert;);
+
+	if (!(flags & BTR_NO_UNDO_LOG_FLAG)
+	    && page_is_empty(block->frame)
+	    && !entry->is_metadata() && !trx->duplicates
+	    && !trx->ddl && !trx->internal
+	    && block->page.id().page_no() == index->page
+	    && !index->table->skip_alter_undo
+	    && !trx->is_wsrep() /* FIXME: MDEV-24623 */
+	    && !thd_is_slave(trx->mysql_thd) /* FIXME: MDEV-24622 */) {
+		DEBUG_SYNC_C("empty_root_page_insert");
+
+		if (!index->table->is_temporary()) {
+			err = lock_table(0, index->table, LOCK_X, thr);
+
+			if (err != DB_SUCCESS) {
+				trx->error_state = err;
+				goto commit_exit;
+			}
+
+#ifdef BTR_CUR_HASH_ADAPT
+			if (btr_search_enabled) {
+				btr_search_x_lock_all();
+				index->table->bulk_trx_id = trx->id;
+				btr_search_x_unlock_all();
+			} else {
+				index->table->bulk_trx_id = trx->id;
+			}
+#else /* BTR_CUR_HASH_ADAPT */
+			index->table->bulk_trx_id = trx->id;
+#endif /* BTR_CUR_HASH_ADAPT */
+		}
+
+		static_cast<ins_node_t*>(thr->run_node)->bulk_insert = true;
+	}
+
+#ifndef DBUG_OFF
+skip_bulk_insert:
+#endif
 	if (UNIV_UNLIKELY(entry->info_bits != 0)) {
 		ut_ad(entry->is_metadata());
 		ut_ad(flags == BTR_NO_LOCKING_FLAG);
@@ -2675,7 +2706,7 @@ row_ins_clust_index_entry_low(
 
 		if (rec_get_info_bits(rec, page_rec_is_comp(rec))
 		    & REC_INFO_MIN_REC_FLAG) {
-			thr_get_trx(thr)->error_info = index;
+			trx->error_info = index;
 			err = DB_DUPLICATE_KEY;
 			goto err_exit;
 		}
@@ -2708,7 +2739,7 @@ row_ins_clust_index_entry_low(
 				/* fall through */
 			case DB_SUCCESS_LOCKED_REC:
 			case DB_DUPLICATE_KEY:
-				thr_get_trx(thr)->error_info = cursor->index;
+				trx->error_info = cursor->index;
 			}
 		} else {
 			/* Note that the following may return also
@@ -2792,7 +2823,7 @@ do_insert:
 				log_write_up_to(mtr.commit_lsn(), true););
 			err = row_ins_index_entry_big_rec(
 				entry, big_rec, offsets, &offsets_heap, index,
-				thr_get_trx(thr)->mysql_thd);
+				trx->mysql_thd);
 			dtuple_convert_back_big_rec(index, entry, big_rec);
 		} else {
 			if (err == DB_SUCCESS
@@ -2958,7 +2989,7 @@ row_ins_sec_index_entry_low(
 		err = btr_cur_search_to_nth_level(
 			index, 0, entry, PAGE_CUR_RTREE_INSERT,
 			search_mode,
-			&cursor, 0, __FILE__, __LINE__, &mtr);
+			&cursor, 0, &mtr);
 
 		if (mode == BTR_MODIFY_LEAF && rtr_info.mbr_adj) {
 			mtr_commit(&mtr);
@@ -2973,7 +3004,7 @@ row_ins_sec_index_entry_low(
 			err = btr_cur_search_to_nth_level(
 				index, 0, entry, PAGE_CUR_RTREE_INSERT,
 				search_mode,
-				&cursor, 0, __FILE__, __LINE__, &mtr);
+				&cursor, 0, &mtr);
 			mode = BTR_MODIFY_TREE;
 		}
 
@@ -2985,7 +3016,7 @@ row_ins_sec_index_entry_low(
 		err = btr_cur_search_to_nth_level(
 			index, 0, entry, PAGE_CUR_LE,
 			search_mode,
-			&cursor, 0, __FILE__, __LINE__, &mtr);
+			&cursor, 0, &mtr);
 	}
 
 	if (err != DB_SUCCESS) {
@@ -3043,9 +3074,9 @@ row_ins_sec_index_entry_low(
 			if (!index->is_committed()) {
 				ut_ad(!thr_get_trx(thr)
 				      ->dict_operation_lock_mode);
-				mutex_enter(&dict_sys.mutex);
+				dict_sys.mutex_lock();
 				dict_set_corrupted_index_cache_only(index);
-				mutex_exit(&dict_sys.mutex);
+				dict_sys.mutex_unlock();
 				/* Do not return any error to the
 				caller. The duplicate will be reported
 				by ALTER TABLE or CREATE UNIQUE INDEX.
@@ -3079,7 +3110,7 @@ row_ins_sec_index_entry_low(
 			index, 0, entry, PAGE_CUR_LE,
 			(search_mode
 			 & ~(BTR_INSERT | BTR_IGNORE_SEC_UNIQUE)),
-			&cursor, 0, __FILE__, __LINE__, &mtr);
+			&cursor, 0, &mtr);
 	}
 
 	if (row_ins_must_modify_rec(&cursor)) {
@@ -3534,22 +3565,9 @@ row_ins_alloc_row_id_step(
 /*======================*/
 	ins_node_t*	node)	/*!< in: row insert node */
 {
-	row_id_t	row_id;
-
-	ut_ad(node->state == INS_NODE_ALLOC_ROW_ID);
-
-	if (dict_index_is_unique(dict_table_get_first_index(node->table))) {
-
-		/* No row id is stored if the clustered index is unique */
-
-		return;
-	}
-
-	/* Fill in row id value to row */
-
-	row_id = dict_sys_get_new_row_id();
-
-	dict_sys_write_row_id(node->sys_buf, row_id);
+  ut_ad(node->state == INS_NODE_ALLOC_ROW_ID);
+  if (dict_table_get_first_index(node->table)->is_gen_clust())
+    dict_sys_write_row_id(node->sys_buf, dict_sys.get_new_row_id());
 }
 
 /***********************************************************//**
@@ -3616,6 +3634,16 @@ row_ins_get_row_from_select(
 	}
 }
 
+inline
+bool ins_node_t::vers_history_row() const
+{
+	if (!table->versioned())
+		return false;
+	dfield_t* row_end = dtuple_get_nth_field(row, table->vers_end);
+	return row_end->vers_history_row();
+}
+
+
 /***********************************************************//**
 Inserts a row to a table.
 @return DB_SUCCESS if operation successfully completed, else error
@@ -3654,12 +3682,31 @@ row_ins(
 	ut_ad(node->state == INS_NODE_INSERT_ENTRIES);
 
 	while (node->index != NULL) {
-		if (node->index->type != DICT_FTS) {
+		dict_index_t *index = node->index;
+		/*
+		   We do not insert history rows into FTS_DOC_ID_INDEX because
+		   it is unique by FTS_DOC_ID only and we do not want to add
+		   row_end to unique key. Fulltext field works the way new
+		   FTS_DOC_ID is created on every fulltext UPDATE, so holding only
+		   FTS_DOC_ID for history is enough.
+		*/
+		const unsigned type = index->type;
+		if (index->type & DICT_FTS) {
+		} else if (!(type & DICT_UNIQUE) || index->n_uniq > 1
+			   || !node->vers_history_row()) {
+
 			dberr_t err = row_ins_index_entry_step(node, thr);
 
 			if (err != DB_SUCCESS) {
 				DBUG_RETURN(err);
 			}
+		} else {
+			/* Unique indexes with system versioning must contain
+			the version end column. The only exception is a hidden
+			FTS_DOC_ID_INDEX that InnoDB may create on a hidden or
+			user-created FTS_DOC_ID column. */
+			ut_ad(!strcmp(index->name, FTS_DOC_ID_INDEX_NAME));
+			ut_ad(!strcmp(index->fields[0].name, FTS_DOC_ID_COL_NAME));
 		}
 
 		node->index = dict_table_get_next_index(node->index);
@@ -3740,10 +3787,6 @@ row_ins_step(
 		goto do_insert;
 	}
 
-	if (UNIV_LIKELY(!node->table->skip_alter_undo)) {
-		trx_write_trx_id(&node->sys_buf[DATA_ROW_ID_LEN], trx->id);
-	}
-
 	if (node->state == INS_NODE_SET_IX_LOCK) {
 
 		node->state = INS_NODE_ALLOC_ROW_ID;
@@ -3763,7 +3806,7 @@ row_ins_step(
 				err = DB_LOCK_WAIT;);
 
 		if (err != DB_SUCCESS) {
-
+			node->state = INS_NODE_SET_IX_LOCK;
 			goto error_handling;
 		}
 

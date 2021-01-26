@@ -369,6 +369,7 @@ MARIA_HA *maria_open(const char *name, int mode, uint open_flags,
 #ifdef WITH_S3_STORAGE_ENGINE
     else
     {
+      open_mode= mode;
       errpos= 1;
       if (s3f.set_database_and_table_from_path(s3, name_buff))
       {
@@ -1050,6 +1051,7 @@ MARIA_HA *maria_open(const char *name, int mode, uint open_flags,
         share->state_history->next= 0;
       }
     }
+    errpos= 7;
     thr_lock_init(&share->lock);
     mysql_mutex_init(key_SHARE_intern_lock,
                      &share->intern_lock, MY_MUTEX_INIT_FAST);
@@ -1193,6 +1195,9 @@ err:
     _ma_report_error(save_errno, &tmp_name);
   }
   switch (errpos) {
+  case 7:
+    thr_lock_delete(&share->lock);
+    /* fall through */
   case 6:
     /* Avoid mutex test in _ma_bitmap_end() */
     share->internal_table= 1;
@@ -1471,7 +1476,7 @@ static void setup_key_functions(register MARIA_KEYDEF *keyinfo)
 
 
 /**
-   @brief Function to save and store the header in the index file (.MYI)
+   @brief Function to save and store the header in the index file (.MAI)
 
    Operates under MARIA_SHARE::intern_lock if requested.
    Sets MARIA_SHARE::MARIA_STATE_INFO::is_of_horizon if transactional table.
