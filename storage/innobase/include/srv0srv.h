@@ -146,16 +146,6 @@ struct srv_stats_t
 	/** Number of data read in total (in bytes) */
 	ulint_ctr_1_t		data_read;
 
-	/** Wait time of database locks */
-	int64_ctr_1_t		n_lock_wait_time;
-
-	/** Number of database lock waits */
-	ulint_ctr_1_t		n_lock_wait_count;
-
-	/** Number of threads currently waiting on database locks */
-	MY_ALIGNED(CACHE_LINE_SIZE) Atomic_counter<ulint>
-				n_lock_wait_current_count;
-
 	/** Number of rows read. */
 	ulint_ctr_64_t		n_rows_read;
 
@@ -197,9 +187,6 @@ struct srv_stats_t
 
 	/** Number of temporary tablespace blocks decrypted */
 	ulint_ctr_64_t		n_temp_blocks_decrypted;
-
-	/** Number of lock deadlocks */
-	ulint_ctr_1_t		lock_deadlock_count;
 };
 
 /** We are prepared for a situation that we have this many threads waiting for
@@ -480,11 +467,6 @@ extern ulint	srv_dml_needed_delay;
 
 #define SRV_MAX_N_IO_THREADS	130
 
-/* Array of English strings describing the current state of an
-i/o handler thread */
-extern const char* srv_io_thread_op_info[];
-extern const char* srv_io_thread_function[];
-
 /** innodb_purge_threads; the number of purge tasks to use */
 extern uint srv_n_purge_threads;
 
@@ -616,19 +598,6 @@ srv_boot(void);
 Frees the data structures created in srv_init(). */
 void
 srv_free(void);
-/*==========*/
-/*********************************************************************//**
-Sets the info describing an i/o thread current state. */
-void
-srv_set_io_thread_op_info(
-/*======================*/
-	ulint		i,	/*!< in: the 'segment' of the i/o thread */
-	const char*	str);	/*!< in: constant char string describing the
-				state */
-/*********************************************************************//**
-Resets the info describing an i/o thread current state. */
-void
-srv_reset_io_thread_op_info();
 
 /** Wake up the purge if there is work to do. */
 void
@@ -642,8 +611,7 @@ ibool
 srv_printf_innodb_monitor(
 /*======================*/
 	FILE*	file,		/*!< in: output stream */
-	ibool	nowait,		/*!< in: whether to wait for the
-				lock_sys_t::mutex */
+	ibool	nowait,		/*!< in: whether to wait for lock_sys.latch */
 	ulint*	trx_start,	/*!< out: file position of the start of
 				the list of active transactions */
 	ulint*	trx_end);	/*!< out: file position of the end of
@@ -871,30 +839,6 @@ struct export_var_t{
 	ulint innodb_encryption_rotation_estimated_iops;
 	int64_t innodb_encryption_key_requests;
 	int64_t innodb_key_rotation_list_length;
-};
-
-/** Thread slot in the thread table.  */
-struct srv_slot_t{
-	bool		in_use;			/*!< true if this slot
-						is in use */
- 	/** time(NULL) when the thread was suspended.
- 	FIXME: Use my_interval_timer() or similar, to avoid bogus
- 	timeouts in lock_wait_check_and_cancel() or lock_wait_suspend_thread()
-	when the system time is adjusted to the past!
-
-	FIXME: This is duplicating trx_lock_t::wait_started,
-	which is being used for diagnostic purposes only. */
-	time_t		suspend_time;
-	ulong		wait_timeout;		/*!< wait time that if exceeded
-						the thread will be timed out.
-						Initialized by
-						lock_wait_table_reserve_slot()
-						for lock wait */
-	mysql_cond_t	cond;			/*!< condition variable for
-						waking up suspended thread,
-						under lock_sys.mutex */
-	que_thr_t*	thr;			/*!< suspended query thread
-						(only used for user threads) */
 };
 
 extern tpool::thread_pool *srv_thread_pool;

@@ -1172,22 +1172,6 @@ JOIN::prepare(TABLE_LIST *tables_init, COND *conds_init, uint og_num,
                                     FALSE, SELECT_ACL, SELECT_ACL, FALSE))
       DBUG_RETURN(-1);
 
-  /*
-    Permanently remove redundant parts from the query if
-      1) This is a subquery
-      2) This is the first time this query is optimized (since the
-         transformation is permanent
-      3) Not normalizing a view. Removal should take place when a
-         query involving a view is optimized, not when the view
-         is created
-  */
-  if (select_lex->master_unit()->item &&                               // 1)
-      select_lex->first_cond_optimization &&                           // 2)
-      !thd->lex->is_view_context_analysis())                           // 3)
-  {
-    remove_redundant_subquery_clauses(select_lex);
-  }
-
   /* System Versioning: handle FOR SYSTEM_TIME clause. */
   if (select_lex->vers_setup_conds(thd, tables_list) < 0)
     DBUG_RETURN(-1);
@@ -1269,6 +1253,23 @@ JOIN::prepare(TABLE_LIST *tables_init, COND *conds_init, uint og_num,
                           &hidden_group_fields,
                           &select_lex->select_n_reserved))
     DBUG_RETURN(-1);
+
+  /*
+    Permanently remove redundant parts from the query if
+      1) This is a subquery
+      2) This is the first time this query is optimized (since the
+         transformation is permanent
+      3) Not normalizing a view. Removal should take place when a
+         query involving a view is optimized, not when the view
+         is created
+  */
+  if (select_lex->master_unit()->item &&                               // 1)
+      select_lex->first_cond_optimization &&                           // 2)
+      !thd->lex->is_view_context_analysis())                           // 3)
+  {
+    remove_redundant_subquery_clauses(select_lex);
+  }
+
   /* Resolve the ORDER BY that was skipped, then remove it. */
   if (skip_order_by && select_lex !=
                        select_lex->master_unit()->global_parameters())
@@ -2075,7 +2076,7 @@ JOIN::optimize_inner()
             join->optimization_state == JOIN::OPTIMIZATION_PHASE_1_DONE &&
             join->with_two_phase_optimization)
           continue;
-        /* 
+        /*
           Do not push conditions from where into materialized inner tables
           of outer joins: this is not valid.
         */
@@ -2277,7 +2278,7 @@ setup_subq_exit:
   if (with_two_phase_optimization)
     optimization_state= JOIN::OPTIMIZATION_PHASE_1_DONE;
   else
-  { 
+  {
     if (optimize_stage2())
       DBUG_RETURN(1);
   }
@@ -2297,7 +2298,7 @@ int JOIN::optimize_stage2()
 
   if (unlikely(thd->check_killed()))
     DBUG_RETURN(1);
-  
+
   /* Generate an execution plan from the found optimal join order. */
   if (get_best_combination())
     DBUG_RETURN(1);
@@ -3957,7 +3958,7 @@ bool JOIN::setup_subquery_caches()
     if (tmp_having)
     {
       DBUG_ASSERT(having == NULL);
-      if (!(tmp_having= 
+      if (!(tmp_having=
             tmp_having->transform(thd,
                                   &Item::expr_cache_insert_transformer,
                                   NULL)))
@@ -4550,6 +4551,63 @@ void JOIN::cleanup_item_list(List<Item> &items) const
 
 
 /**
+  @brief
+    Look for provision of the select_handler interface by a foreign engine
+
+  @param thd   The thread handler
+
+  @details
+    The function checks that this is an upper level select and if so looks
+    through its tables searching for one whose handlerton owns a
+    create_select call-back function. If the call of this function returns
+    a select_handler interface object then the server will push the select
+    query into this engine.
+    This is a responsibility of the create_select call-back function to
+    check whether the engine can execute the query.
+
+  @retval the found select_handler if the search is successful
+          0  otherwise
+*/
+
+select_handler *find_select_handler(THD *thd,
+                                    SELECT_LEX* select_lex)
+{
+  if (select_lex->next_select())
+    return 0;
+  if (select_lex->master_unit()->outer_select())
+    return 0;
+
+  TABLE_LIST *tbl= nullptr;
+  // For SQLCOM_INSERT_SELECT the server takes TABLE_LIST
+  // from thd->lex->query_tables and skips its first table
+  // b/c it is the target table for the INSERT..SELECT.
+  if (thd->lex->sql_command != SQLCOM_INSERT_SELECT)
+  {
+    tbl= select_lex->join->tables_list;
+  }
+  else if (thd->lex->query_tables &&
+           thd->lex->query_tables->next_global)
+  {
+    tbl= thd->lex->query_tables->next_global;
+  }
+  else
+    return 0;
+
+  for (;tbl; tbl= tbl->next_global)
+  {
+    if (!tbl->table)
+      continue;
+    handlerton *ht= tbl->table->file->partition_ht();
+    if (!ht->create_select)
+      continue;
+    select_handler *sh= ht->create_select(thd, select_lex);
+    return sh;
+  }
+  return 0;
+}
+
+
+/**
   An entry point to single-unit select (a select without UNION).
 
   @param thd                  thread handler
@@ -4653,7 +4711,7 @@ mysql_select(THD *thd, TABLE_LIST *tables, List<Item> &fields, COND *conds,
   }
 
   /* Look for a table owned by an engine with the select_handler interface */
-  select_lex->pushdown_select= select_lex->find_select_handler(thd);
+  select_lex->pushdown_select= find_select_handler(thd, select_lex);
 
   if ((err= join->optimize()))
   {
@@ -6872,7 +6930,7 @@ update_ref_and_keys(THD *thd, DYNAMIC_ARRAY *keyuse,JOIN_TAB *join_tab,
   Special treatment for ft-keys.
 */
 
-bool sort_and_filter_keyuse(THD *thd, DYNAMIC_ARRAY *keyuse, 
+bool sort_and_filter_keyuse(THD *thd, DYNAMIC_ARRAY *keyuse,
                             bool skip_unprefixed_keyparts)
 {
   KEYUSE key_end, *prev, *save_pos, *use;
@@ -8110,7 +8168,7 @@ best_access_path(JOIN      *join,
   pos->use_join_buffer= best_uses_jbuf;
   pos->spl_plan= spl_plan;
   pos->range_rowid_filter_info= best_filter;
-   
+
   loose_scan_opt.save_to_position(s, loose_scan_pos);
 
   if (!best_key &&
@@ -10255,7 +10313,7 @@ bool JOIN::check_two_phase_optimization(THD *thd)
     return true;
   return false;
 }
-  
+
 
 bool JOIN::inject_cond_into_where(Item *injected_cond)
 {
@@ -10286,7 +10344,7 @@ bool JOIN::inject_cond_into_where(Item *injected_cond)
       and_args->push_back(elem, thd->mem_root);
     }
   }
-  
+
   return false;
 
 }
@@ -18431,9 +18489,9 @@ bool Create_tmp_table::add_fields(THD *thd,
       distinct_record_structure= true;
     }
   li.rewind();
-  uint uneven_delta= 0;
   while ((item=li++))
   {
+    uint uneven_delta;
     current_counter= (((param->hidden_field_count < (fieldnr + 1)) &&
                        distinct_record_structure &&
                        (!m_with_cycle ||
@@ -18496,8 +18554,8 @@ bool Create_tmp_table::add_fields(THD *thd,
 
           uneven_delta= m_uneven_bit_length;
           add_field(table, new_field, fieldnr++, param->force_not_null_cols);
-          uneven_delta= m_uneven_bit_length - uneven_delta;
           m_field_count[current_counter]++;
+          m_uneven_bit[current_counter]+= (m_uneven_bit_length - uneven_delta);
 
           if (!(new_field->flags & NOT_NULL_FLAG))
           {
@@ -18578,8 +18636,8 @@ bool Create_tmp_table::add_fields(THD *thd,
 
       uneven_delta= m_uneven_bit_length;
       add_field(table, new_field, fieldnr++, param->force_not_null_cols);
-      uneven_delta= m_uneven_bit_length - uneven_delta;
       m_field_count[current_counter]++;
+      m_uneven_bit[current_counter]+= (m_uneven_bit_length - uneven_delta);
 
       if (item->marker == 4 && item->maybe_null)
       {
@@ -18589,7 +18647,6 @@ bool Create_tmp_table::add_fields(THD *thd,
       if (current_counter == distinct)
         new_field->flags|= FIELD_PART_OF_TMP_UNIQUE;
     }
-    m_uneven_bit[current_counter]+= uneven_delta;
   }
   DBUG_ASSERT(fieldnr == m_field_count[other] + m_field_count[distinct]);
   DBUG_ASSERT(m_blob_count == m_blobs_count[other] + m_blobs_count[distinct]);
@@ -18748,7 +18805,6 @@ bool Create_tmp_table::finalize(THD *thd,
 
     if (!(field->flags & NOT_NULL_FLAG))
     {
-
       recinfo->null_bit= (uint8)1 << (null_counter[current_counter] & 7);
       recinfo->null_pos= (null_pack_base[current_counter] +
                           null_counter[current_counter]/8);
@@ -24240,7 +24296,7 @@ bool
 cp_buffer_from_ref(THD *thd, TABLE *table, TABLE_REF *ref)
 {
   Check_level_instant_set check_level_save(thd, CHECK_FIELD_IGNORE);
-  my_bitmap_map *old_map= dbug_tmp_use_all_columns(table, table->write_set);
+  MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->write_set);
   bool result= 0;
 
   for (store_key **copy=ref->key_copy ; *copy ; copy++)
@@ -24251,7 +24307,7 @@ cp_buffer_from_ref(THD *thd, TABLE *table, TABLE_REF *ref)
       break;
     }
   }
-  dbug_tmp_restore_column_map(table->write_set, old_map);
+  dbug_tmp_restore_column_map(&table->write_set, old_map);
   return result;
 }
 
@@ -25923,7 +25979,7 @@ bool JOIN::rollup_init()
   {
     if (!(rollup.null_items[i]= new (thd->mem_root) Item_null_result(thd)))
       return true;
-    
+
     List<Item> *rollup_fields= &rollup.fields[i];
     rollup_fields->empty();
     rollup.ref_pointer_arrays[i]= Ref_ptr_array(ref_array, all_fields.elements);
@@ -26436,7 +26492,7 @@ bool JOIN_TAB::save_explain_data(Explain_table_access *eta,
   {
     JOIN_TAB *ctab= bush_children->start;
     /* table */
-    size_t len= my_snprintf(table_name_buffer, 
+    size_t len= my_snprintf(table_name_buffer,
                          sizeof(table_name_buffer)-1,
                          "<subquery%d>", 
                          ctab->emb_sj_nest->sj_subq_pred->get_identifier());
@@ -27579,7 +27635,7 @@ void TABLE_LIST::print(THD *thd, table_map eliminated_tables, String *str,
 void st_select_lex::print(THD *thd, String *str, enum_query_type query_type)
 {
   DBUG_ASSERT(thd);
-  
+
   if (tvc)
   {
     tvc->print(thd, str, query_type);
@@ -29039,46 +29095,6 @@ void JOIN_TAB::partial_cleanup()
   filesort_result= NULL;
   free_cache(&read_record);
 }
-
-
-/**
-  @brief
-    Look for provision of the select_handler interface by a foreign engine
-
-  @param thd   The thread handler
-
-  @details
-    The function checks that this is an upper level select and if so looks
-    through its tables searching for one whose handlerton owns a
-    create_select call-back function. If the call of this function returns
-    a select_handler interface object then the server will push the select
-    query into this engine.
-    This is a responsibility of the create_select call-back function to
-    check whether the engine can execute the query.
-
-  @retval the found select_handler if the search is successful
-          0  otherwise
-*/
-
-select_handler *SELECT_LEX::find_select_handler(THD *thd)
-{
-  if (next_select())
-      return 0;
-  if (master_unit()->outer_select())
-    return 0;
-  for (TABLE_LIST *tbl= join->tables_list; tbl; tbl= tbl->next_global)
-  {
-    if (!tbl->table)
-      continue;
-    handlerton *ht= tbl->table->file->partition_ht();
-    if (!ht->create_select)
-      continue;
-    select_handler *sh= ht->create_select(thd, this);
-    return sh;
-  }
-  return 0;
-}
-
 
 /**
   @brief

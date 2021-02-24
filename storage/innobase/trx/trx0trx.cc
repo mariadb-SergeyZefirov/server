@@ -143,8 +143,6 @@ trx_init(
 
 	trx->magic_n = TRX_MAGIC_N;
 
-	trx->lock.que_state = TRX_QUE_RUNNING;
-
 	trx->last_sql_stat_start.least_undo_no = 0;
 
 	ut_ad(!trx->read_view.is_open());
@@ -152,6 +150,9 @@ trx_init(
 	trx->lock.rec_cached = 0;
 
 	trx->lock.table_cached = 0;
+#ifdef WITH_WSREP
+	ut_ad(!trx->wsrep);
+#endif /* WITH_WSREP */
 }
 
 /** For managing the life-cycle of the trx_t instance that we get
@@ -186,9 +187,9 @@ struct TrxFactory {
 
 		trx->lock.lock_heap = mem_heap_create_typed(
 			1024, MEM_HEAP_FOR_LOCK_HEAP);
+		pthread_cond_init(&trx->lock.cond, nullptr);
 
-		lock_trx_lock_list_init(&trx->lock.trx_locks);
-
+		UT_LIST_INIT(trx->lock.trx_locks, &lock_t::trx_locks);
 		UT_LIST_INIT(trx->lock.evicted_tables,
 			     &dict_table_t::table_LRU);
 
@@ -196,7 +197,7 @@ struct TrxFactory {
 			trx->trx_savepoints,
 			&trx_named_savept_t::trx_savepoints);
 
-		trx->mutex.init();
+		trx->mutex_init();
 	}
 
 	/** Release resources held by the transaction object.
@@ -227,13 +228,15 @@ struct TrxFactory {
 			trx->lock.lock_heap = NULL;
 		}
 
+		pthread_cond_destroy(&trx->lock.cond);
+
 		ut_a(UT_LIST_GET_LEN(trx->lock.trx_locks) == 0);
 		ut_ad(UT_LIST_GET_LEN(trx->lock.evicted_tables) == 0);
 
 		UT_DELETE(trx->xid);
 		ut_free(trx->detailed_error);
 
-		trx->mutex.destroy();
+		trx->mutex_destroy();
 
 		trx->mod_tables.~trx_mod_tables_t();
 
@@ -491,7 +494,7 @@ inline void trx_t::release_locks()
   if (UT_LIST_GET_LEN(lock.trx_locks))
   {
     lock_release(this);
-    lock.n_rec_locks = 0;
+    ut_ad(!lock.n_rec_locks);
     ut_ad(UT_LIST_GET_LEN(lock.trx_locks) == 0);
     ut_ad(ib_vector_is_empty(autoinc_locks));
     mem_heap_empty(lock.lock_heap);
@@ -617,15 +620,12 @@ trx_resurrect_table_locks(
 				trx->mod_tables.emplace(table, 0);
 			}
 
-			if (p.second) {
-				lock_table_x_resurrect(table, trx);
-			} else {
-				lock_table_ix_resurrect(table, trx);
-			}
+			lock_table_resurrect(table, trx,
+					     p.second ? LOCK_X : LOCK_IX);
 
 			DBUG_LOG("ib_trx",
 				 "resurrect " << ib::hex(trx->id)
-				 << " IX lock on " << table->name);
+				 << " lock on " << table->name);
 
 			dict_table_close(table, FALSE, FALSE);
 		}
@@ -1165,35 +1165,49 @@ trx_finalize_for_fts(
 	trx->fts_trx = NULL;
 }
 
-/**********************************************************************//**
-If required, flushes the log to disk based on the value of
-innodb_flush_log_at_trx_commit. */
-static
-void
-trx_flush_log_if_needed_low(
-/*========================*/
-	lsn_t	lsn)	/*!< in: lsn up to which logs are to be
-			flushed. */
+extern "C" MYSQL_THD thd_increment_pending_ops();
+extern "C" void thd_decrement_pending_ops(MYSQL_THD);
+
+
+#include "../log/log0sync.h"
+
+/*
+  If required, initiates write and optionally flush of the log to
+  disk
+  @param[in] lsn - lsn up to which logs are to be flushed.
+  @param[in] trx_state - if trx_state is PREPARED, the function will
+  also wait for the flush to complete.
+*/
+static void trx_flush_log_if_needed_low(lsn_t lsn, trx_state_t trx_state)
 {
-	bool	flush = srv_file_flush_method != SRV_NOSYNC;
+  if (!srv_flush_log_at_trx_commit)
+    return;
 
-	switch (srv_flush_log_at_trx_commit) {
-	case 3:
-	case 2:
-		/* Write the log but do not flush it to disk */
-		flush = false;
-		/* fall through */
-	case 1:
-		/* Write the log and optionally flush it to disk */
-		log_write_up_to(lsn, flush);
-		srv_inc_activity_count();
-		return;
-	case 0:
-		/* Do nothing */
-		return;
-	}
+  if (log_sys.get_flushed_lsn() > lsn)
+    return;
 
-	ut_error;
+  bool flush= srv_file_flush_method != SRV_NOSYNC &&
+              srv_flush_log_at_trx_commit == 1;
+
+  if (trx_state == TRX_STATE_PREPARED)
+  {
+    /* XA, which is used with binlog as well.
+    Be conservative, use synchronous wait.*/
+    log_write_up_to(lsn, flush);
+    return;
+  }
+
+  completion_callback cb;
+  if ((cb.m_param = thd_increment_pending_ops()))
+  {
+    cb.m_callback = (void (*)(void *)) thd_decrement_pending_ops;
+    log_write_up_to(lsn, flush, false, &cb);
+  }
+  else
+  {
+    /* No THD, synchronous write */
+    log_write_up_to(lsn, flush);
+  }
 }
 
 /**********************************************************************//**
@@ -1208,70 +1222,56 @@ trx_flush_log_if_needed(
 	trx_t*	trx)	/*!< in/out: transaction */
 {
 	trx->op_info = "flushing log";
-	trx_flush_log_if_needed_low(lsn);
+	trx_flush_log_if_needed_low(lsn,trx->state);
 	trx->op_info = "";
 }
 
-/**********************************************************************//**
-For each table that has been modified by the given transaction: update
-its dict_table_t::update_time with the current timestamp. Clear the list
-of the modified tables at the end. */
-static
-void
-trx_update_mod_tables_timestamp(
-/*============================*/
-	trx_t*	trx)	/*!< in: transaction */
+/** Process tables that were modified by the committing transaction. */
+inline void trx_t::commit_tables()
 {
-	/* consider using trx->start_time if calling time() is too
-	expensive here */
-	const time_t now = time(NULL);
+  if (mod_tables.empty())
+    return;
 
+  if (undo_no)
+  {
 #if defined SAFE_MUTEX && defined UNIV_DEBUG
-	const bool preserve_tables = !innodb_evict_tables_on_commit_debug
-		|| trx->is_recovered /* avoid trouble with XA recovery */
+    const bool preserve_tables= !innodb_evict_tables_on_commit_debug ||
+      is_recovered || /* avoid trouble with XA recovery */
 # if 1 /* if dict_stats_exec_sql() were not playing dirty tricks */
-		|| dict_sys.mutex_is_locked()
+      dict_sys.mutex_is_locked();
 # else /* this would be more proper way to do it */
-		|| trx->dict_operation_lock_mode || trx->dict_operation
+      dict_operation_lock_mode || dict_operation;
 # endif
-		;
 #endif
 
-	for (const auto& p : trx->mod_tables) {
-		/* This could be executed by multiple threads concurrently
-		on the same table object. This is fine because time_t is
-		word size or less. And _purely_ _theoretically_, even if
-		time_t write is not atomic, likely the value of 'now' is
-		the same in all threads and even if it is not, getting a
-		"garbage" in table->update_time is justified because
-		protecting it with a latch here would be too performance
-		intrusive. */
-		dict_table_t* table = p.first;
-		table->update_time = now;
+    const trx_id_t max_trx_id= trx_sys.get_max_trx_id();
+    const auto now= start_time;
+
+    for (const auto& p : mod_tables)
+    {
+      dict_table_t *table= p.first;
+      table->update_time= now;
+      table->query_cache_inv_trx_id= max_trx_id;
+
 #if defined SAFE_MUTEX && defined UNIV_DEBUG
-		if (preserve_tables || table->get_ref_count()
-		    || table->is_temporary()
-		    || UT_LIST_GET_LEN(table->locks)) {
-			/* do not evict when committing DDL operations
-			or if some other transaction is holding the
-			table handle */
-			continue;
-		}
-		/* recheck while holding the mutex that blocks
-		table->acquire() */
-		dict_sys.mutex_lock();
-		lock_sys.mutex_lock();
-		const bool do_evict = !table->get_ref_count()
-			&& !UT_LIST_GET_LEN(table->locks);
-		lock_sys.mutex_unlock();
-		if (do_evict) {
-			dict_sys.remove(table, true);
-		}
-		dict_sys.mutex_unlock();
+      if (preserve_tables || table->get_ref_count() || table->is_temporary() ||
+          UT_LIST_GET_LEN(table->locks))
+        /* do not evict when committing DDL operations or if some other
+        transaction is holding the table handle */
+        continue;
+      /* recheck while holding the mutex that blocks table->acquire() */
+      dict_sys.mutex_lock();
+      {
+        LockMutexGuard g{SRW_LOCK_CALL};
+        if (!table->get_ref_count() && !UT_LIST_GET_LEN(table->locks))
+          dict_sys.remove(table, true);
+      }
+      dict_sys.mutex_unlock();
 #endif
-	}
+    }
+  }
 
-	trx->mod_tables.clear();
+  mod_tables.clear();
 }
 
 /** Evict a table definition due to the rollback of ALTER TABLE.
@@ -1369,7 +1369,7 @@ inline void trx_t::commit_in_memory(const mtr_t *mtr)
     }
     else
     {
-      trx_update_mod_tables_timestamp(this);
+      commit_tables();
       MONITOR_INC(MONITOR_TRX_RW_COMMIT);
       is_recovered= false;
     }
@@ -1466,7 +1466,8 @@ inline void trx_t::commit_in_memory(const mtr_t *mtr)
     wsrep= false;
     wsrep_commit_ordered(mysql_thd);
   }
-  lock.was_chosen_as_wsrep_victim= false;
+  ut_ad(!(lock.was_chosen_as_deadlock_victim & byte(~2U)));
+  lock.was_chosen_as_deadlock_victim= false;
 #endif /* WITH_WSREP */
   mutex.wr_lock();
   dict_operation= TRX_DICT_OP_NONE;
@@ -1573,19 +1574,7 @@ trx_commit_or_rollback_prepare(
 	case TRX_STATE_ACTIVE:
 	case TRX_STATE_PREPARED:
 	case TRX_STATE_PREPARED_RECOVERED:
-		/* If the trx is in a lock wait state, moves the waiting
-		query thread to the suspended state */
-
-		if (trx->lock.que_state == TRX_QUE_LOCK_WAIT) {
-
-			ut_a(trx->lock.wait_thr != NULL);
-			trx->lock.wait_thr->state = QUE_THR_SUSPENDED;
-			trx->lock.wait_thr = NULL;
-
-			trx->lock.que_state = TRX_QUE_RUNNING;
-		}
-
-		ut_ad(trx->lock.n_active_thrs == 1);
+		trx->lock.wait_thr = NULL;
 		return;
 
 	case TRX_STATE_COMMITTED_IN_MEMORY:
@@ -1638,14 +1627,11 @@ trx_commit_step(
 		trx = thr_get_trx(thr);
 
 		ut_a(trx->lock.wait_thr == NULL);
-		ut_a(trx->lock.que_state != TRX_QUE_LOCK_WAIT);
 
 		trx_commit_or_rollback_prepare(trx);
 
-		trx->lock.que_state = TRX_QUE_COMMITTING;
 		trx->commit();
 		ut_ad(trx->lock.wait_thr == NULL);
-		trx->lock.que_state = TRX_QUE_RUNNING;
 
 		thr = NULL;
 	} else {
@@ -1766,7 +1752,11 @@ trx_print_low(
 	ibool		newline;
 	const char*	op_info;
 
-	fprintf(f, "TRANSACTION " TRX_ID_FMT, trx_get_id_for_print(trx));
+	if (const trx_id_t id = trx->id) {
+		fprintf(f, "TRANSACTION " TRX_ID_FMT, trx->id);
+	} else {
+		fprintf(f, "TRANSACTION (%p)", trx);
+	}
 
 	switch (trx->state) {
 	case TRX_STATE_NOT_STARTED:
@@ -1811,21 +1801,12 @@ state_ok:
 
 	newline = TRUE;
 
-	/* trx->lock.que_state of an ACTIVE transaction may change
-	while we are not holding trx->mutex. We perform a dirty read
-	for performance reasons. */
-
-	switch (trx->lock.que_state) {
-	case TRX_QUE_RUNNING:
-		newline = FALSE; break;
-	case TRX_QUE_LOCK_WAIT:
-		fputs("LOCK WAIT ", f); break;
-	case TRX_QUE_ROLLING_BACK:
-		fputs("ROLLING BACK ", f); break;
-	case TRX_QUE_COMMITTING:
-		fputs("COMMITTING ", f); break;
-	default:
-		fprintf(f, "que state %lu ", (ulong) trx->lock.que_state);
+	if (trx->in_rollback) { /* dirty read for performance reasons */
+		fputs("ROLLING BACK ", f);
+	} else if (trx->lock.wait_lock) {
+		fputs("LOCK WAIT ", f);
+	} else {
+		newline = FALSE;
 	}
 
 	if (n_trx_locks > 0 || heap_size > 400) {
@@ -1855,7 +1836,7 @@ state_ok:
 
 /**********************************************************************//**
 Prints info about a transaction.
-The caller must hold lock_sys.mutex.
+The caller must hold lock_sys.latch.
 When possible, use trx_print() instead. */
 void
 trx_print_latched(
@@ -1865,7 +1846,7 @@ trx_print_latched(
 	ulint		max_query_len)	/*!< in: max query length to print,
 					or 0 to use the default max length */
 {
-	lock_sys.mutex_assert_locked();
+	lock_sys.assert_locked();
 
 	trx_print_low(f, trx, max_query_len,
 		      trx->lock.n_rec_locks,
@@ -1875,7 +1856,7 @@ trx_print_latched(
 
 /**********************************************************************//**
 Prints info about a transaction.
-Acquires and releases lock_sys.mutex. */
+Acquires and releases lock_sys.latch. */
 void
 trx_print(
 /*======*/
@@ -1884,18 +1865,15 @@ trx_print(
 	ulint		max_query_len)	/*!< in: max query length to print,
 					or 0 to use the default max length */
 {
-	ulint	n_rec_locks;
-	ulint	n_trx_locks;
-	ulint	heap_size;
+  ulint n_rec_locks, n_trx_locks, heap_size;
+  {
+    LockMutexGuard g{SRW_LOCK_CALL};
+    n_rec_locks= trx->lock.n_rec_locks;
+    n_trx_locks= UT_LIST_GET_LEN(trx->lock.trx_locks);
+    heap_size= mem_heap_get_size(trx->lock.lock_heap);
+  }
 
-	lock_sys.mutex_lock();
-	n_rec_locks = trx->lock.n_rec_locks;
-	n_trx_locks = UT_LIST_GET_LEN(trx->lock.trx_locks);
-	heap_size = mem_heap_get_size(trx->lock.lock_heap);
-	lock_sys.mutex_unlock();
-
-	trx_print_low(f, trx, max_query_len,
-		      n_rec_locks, n_trx_locks, heap_size);
+  trx_print_low(f, trx, max_query_len, n_rec_locks, n_trx_locks, heap_size);
 }
 
 /** Prepare a transaction.
@@ -1967,9 +1945,9 @@ trx_prepare(
 	DBUG_EXECUTE_IF("ib_trx_crash_during_xa_prepare_step", DBUG_SUICIDE(););
 
 	ut_a(trx->state == TRX_STATE_ACTIVE);
-	trx->mutex.wr_lock();
+	trx->mutex_lock();
 	trx->state = TRX_STATE_PREPARED;
-	trx->mutex.wr_unlock();
+	trx->mutex_unlock();
 
 	if (lsn) {
 		/* Depending on the my.cnf options, we may now write the log
@@ -2111,7 +2089,7 @@ static my_bool trx_get_trx_by_xid_callback(rw_trx_hash_element_t *element,
   mysql_mutex_lock(&element->mutex);
   if (trx_t *trx= element->trx)
   {
-    trx->mutex.wr_lock();
+    trx->mutex_lock();
     if (trx->is_recovered &&
 	(trx_state_eq(trx, TRX_STATE_PREPARED) ||
 	 trx_state_eq(trx, TRX_STATE_PREPARED_RECOVERED)) &&
@@ -2128,7 +2106,7 @@ static my_bool trx_get_trx_by_xid_callback(rw_trx_hash_element_t *element,
       arg->trx= trx;
       found= 1;
     }
-    trx->mutex.wr_unlock();
+    trx->mutex_unlock();
   }
   mysql_mutex_unlock(&element->mutex);
   return found;

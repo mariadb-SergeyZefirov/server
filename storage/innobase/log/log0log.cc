@@ -2,7 +2,7 @@
 
 Copyright (c) 1995, 2017, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2009, Google Inc.
-Copyright (c) 2014, 2020, MariaDB Corporation.
+Copyright (c) 2014, 2021, MariaDB Corporation.
 
 Portions of this file contain modifications contributed and copyrighted by
 Google, Inc. Those modifications are gratefully acknowledged and are described
@@ -771,6 +771,7 @@ bool log_write_lock_own()
 }
 #endif
 
+
 /** Ensure that the log has been written to the log file up to a given
 log entry (such as that of a transaction commit). Start a new write, or
 wait and check if an already running write is covering the request.
@@ -779,7 +780,8 @@ included in the redo log file write
 @param[in]	flush_to_disk	whether the written log should also
 be flushed to the file system
 @param[in]	rotate_key	whether to rotate the encryption key */
-void log_write_up_to(lsn_t lsn, bool flush_to_disk, bool rotate_key)
+void log_write_up_to(lsn_t lsn, bool flush_to_disk, bool rotate_key,
+                     const completion_callback *callback)
 {
   ut_ad(!srv_read_only_mode);
   ut_ad(!rotate_key || flush_to_disk);
@@ -788,16 +790,18 @@ void log_write_up_to(lsn_t lsn, bool flush_to_disk, bool rotate_key)
   {
     /* Recovery is running and no operations on the log files are
     allowed yet (the variable name .._no_ibuf_.. is misleading) */
+    ut_a(!callback);
     return;
   }
 
   if (flush_to_disk &&
-    flush_lock.acquire(lsn) != group_commit_lock::ACQUIRED)
+    flush_lock.acquire(lsn, callback) != group_commit_lock::ACQUIRED)
   {
     return;
   }
 
-  if (write_lock.acquire(lsn) == group_commit_lock::ACQUIRED)
+  if (write_lock.acquire(lsn, flush_to_disk?0:callback) ==
+      group_commit_lock::ACQUIRED)
   {
     mysql_mutex_lock(&log_sys.mutex);
     lsn_t write_lsn= log_sys.get_lsn();
@@ -1010,7 +1014,7 @@ ATTRIBUTE_COLD void logs_empty_and_mark_files_at_shutdown()
 		buf_dump_start();
 	}
 	srv_monitor_timer.reset();
-	lock_sys.timeout_timer.reset();
+
 	if (do_srv_shutdown) {
 		srv_shutdown(srv_fast_shutdown == 0);
 	}
@@ -1084,7 +1088,7 @@ wait_suspend_loop:
 
 	if (buf_page_cleaner_is_active) {
 		thread_name = "page cleaner thread";
-		mysql_cond_signal(&buf_pool.do_flush_list);
+		pthread_cond_signal(&buf_pool.do_flush_list);
 		goto wait_suspend_loop;
 	}
 

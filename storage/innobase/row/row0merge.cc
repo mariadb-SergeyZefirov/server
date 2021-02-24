@@ -1697,7 +1697,7 @@ row_merge_read_clustered_index(
 	doc_id_t		doc_id = 0;
 	doc_id_t		max_doc_id = 0;
 	ibool			add_doc_id = FALSE;
-	mysql_cond_t*		fts_parallel_sort_cond = nullptr;
+	pthread_cond_t*		fts_parallel_sort_cond = nullptr;
 	index_tuple_info_t**	sp_tuples = NULL;
 	mem_heap_t*		sp_heap = NULL;
 	ulint			num_spatial = 0;
@@ -2785,8 +2785,8 @@ wait_again:
 		timespec abstime;
 		set_timespec(abstime, 1);
 		mysql_mutex_lock(&psort_info[0].mutex);
-		mysql_cond_timedwait(fts_parallel_sort_cond,
-				     &psort_info[0].mutex, &abstime);
+		my_cond_timedwait(fts_parallel_sort_cond,
+				  &psort_info[0].mutex.m_mutex, &abstime);
 		mysql_mutex_unlock(&psort_info[0].mutex);
 
 		for (ulint i = 0; i < fts_sort_pll_degree; i++) {
@@ -2838,12 +2838,8 @@ wait_again:
 	}
 
 	if (vers_update_trt) {
-		trx_mod_table_time_t& time =
-			trx->mod_tables
-				.insert(trx_mod_tables_t::value_type(
-					const_cast<dict_table_t*>(new_table), 0))
-				.first->second;
-		time.set_versioned(0);
+		trx->mod_tables.emplace(new_table, 0)
+			.first->second.set_versioned(0);
 	}
 
 	trx->op_info = "";

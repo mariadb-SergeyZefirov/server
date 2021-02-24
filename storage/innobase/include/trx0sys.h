@@ -517,12 +517,12 @@ class rw_trx_hash_t
     ut_ad(!trx->read_only || !trx->rsegs.m_redo.rseg);
     ut_ad(!trx_is_autocommit_non_locking(trx));
     /* trx->state can be anything except TRX_STATE_NOT_STARTED */
-    ut_d(trx->mutex.wr_lock());
+    ut_d(trx->mutex_lock());
     ut_ad(trx_state_eq(trx, TRX_STATE_ACTIVE) ||
           trx_state_eq(trx, TRX_STATE_COMMITTED_IN_MEMORY) ||
           trx_state_eq(trx, TRX_STATE_PREPARED_RECOVERED) ||
           trx_state_eq(trx, TRX_STATE_PREPARED));
-    ut_d(trx->mutex.wr_unlock());
+    ut_d(trx->mutex_unlock());
   }
 
 
@@ -593,10 +593,10 @@ public:
     the transaction may get committed before this method returns.
 
     With do_ref_count == false the caller may dereference returned trx pointer
-    only if lock_sys.mutex was acquired before calling find().
+    only if lock_sys.latch was acquired before calling find().
 
     With do_ref_count == true caller may dereference trx even if it is not
-    holding lock_sys.mutex. Caller is responsible for calling
+    holding lock_sys.latch. Caller is responsible for calling
     trx->release_reference() when it is done playing with trx.
 
     Ideally this method should get caller rw_trx_hash_pins along with trx

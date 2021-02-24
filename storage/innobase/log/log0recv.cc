@@ -2,7 +2,7 @@
 
 Copyright (c) 1997, 2017, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
-Copyright (c) 2013, 2020, MariaDB Corporation.
+Copyright (c) 2013, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -490,7 +490,7 @@ page_corrupted:
         llen= len;
         if ((b & 0x70) == MEMSET)
         {
-          ut_ad(rlen < llen);
+          ut_ad(rlen <= llen);
           if (UNIV_UNLIKELY(rlen != 1))
           {
             size_t s;
@@ -499,7 +499,7 @@ page_corrupted:
             memcpy(frame + last_offset + s, l, llen - s);
           }
           else
-          memset(frame + last_offset, *l, llen);
+            memset(frame + last_offset, *l, llen);
           goto next_after_applying_write;
         }
         const size_t slen= mlog_decode_varint_length(*l);
@@ -939,7 +939,7 @@ void recv_sys_t::close()
 
     last_stored_lsn= 0;
     mysql_mutex_destroy(&mutex);
-    mysql_cond_destroy(&cond);
+    pthread_cond_destroy(&cond);
   }
 
   recv_spaces.clear();
@@ -954,7 +954,7 @@ void recv_sys_t::create()
 	ut_ad(this == &recv_sys);
 	ut_ad(!is_initialised());
 	mysql_mutex_init(recv_sys_mutex_key, &mutex, nullptr);
-	mysql_cond_init(0, &cond, nullptr);
+	pthread_cond_init(&cond, nullptr);
 
 	apply_log_recs = false;
 	apply_batch_on = false;
@@ -998,7 +998,7 @@ inline void recv_sys_t::clear()
     block= prev_block;
   }
 
-  mysql_cond_broadcast(&cond);
+  pthread_cond_broadcast(&cond);
 }
 
 /** Free most recovery data structures. */
@@ -2272,12 +2272,13 @@ static void recv_recover_page(buf_block_t* block, mtr_t& mtr,
 	ut_d(lsn_t recv_start_lsn = 0);
 	const lsn_t init_lsn = init ? init->lsn : 0;
 
+	bool skipped_after_init = false;
+
 	for (const log_rec_t* recv : p->second.log) {
 		const log_phys_t* l = static_cast<const log_phys_t*>(recv);
 		ut_ad(l->lsn);
 		ut_ad(end_lsn <= l->lsn);
-		end_lsn = l->lsn;
-		ut_ad(end_lsn <= log_sys.log.scanned_lsn);
+		ut_ad(l->lsn <= log_sys.log.scanned_lsn);
 
 		ut_ad(l->start_lsn);
 		ut_ad(recv_start_lsn <= l->start_lsn);
@@ -2290,6 +2291,8 @@ static void recv_recover_page(buf_block_t* block, mtr_t& mtr,
 					      block->page.id().space(),
 					      block->page.id().page_no(),
 					      l->start_lsn, page_lsn));
+			skipped_after_init = true;
+			end_lsn = l->lsn;
 			continue;
 		}
 
@@ -2299,9 +2302,24 @@ static void recv_recover_page(buf_block_t* block, mtr_t& mtr,
 					      block->page.id().space(),
 					      block->page.id().page_no(),
 					      l->start_lsn, init_lsn));
+			skipped_after_init = false;
+			end_lsn = l->lsn;
 			continue;
 		}
 
+		/* There is no need to check LSN for just initialized pages. */
+		if (skipped_after_init) {
+			skipped_after_init = false;
+			ut_ad(end_lsn == page_lsn);
+			if (end_lsn != page_lsn)
+				ib::warn()
+					<< "The last skipped log record LSN "
+					<< end_lsn
+					<< " is not equal to page LSN "
+					<< page_lsn;
+		}
+
+		end_lsn = l->lsn;
 
 		if (UNIV_UNLIKELY(srv_print_verbose_log == 2)) {
 			ib::info() << "apply " << l->start_lsn
@@ -2447,7 +2465,7 @@ ATTRIBUTE_COLD void recv_sys_t::free_corrupted_page(page_id_t page_id)
     pages.erase(p);
   }
   if (pages.empty())
-    mysql_cond_broadcast(&cond);
+    pthread_cond_broadcast(&cond);
   mysql_mutex_unlock(&mutex);
 }
 
@@ -2457,14 +2475,14 @@ inline void recv_sys_t::maybe_finish_batch()
   mysql_mutex_assert_owner(&mutex);
   ut_ad(recovery_on);
   if (!apply_batch_on || pages.empty() || is_corrupt_log() || is_corrupt_fs())
-    mysql_cond_broadcast(&cond);
+    pthread_cond_broadcast(&cond);
 }
 
 ATTRIBUTE_COLD void recv_sys_t::set_corrupt_log()
 {
   mysql_mutex_lock(&mutex);
   found_corrupt_log= true;
-  mysql_cond_broadcast(&cond);
+  pthread_cond_broadcast(&cond);
   mysql_mutex_unlock(&mutex);
 }
 
@@ -2472,7 +2490,7 @@ ATTRIBUTE_COLD void recv_sys_t::set_corrupt_fs()
 {
   mysql_mutex_lock(&mutex);
   found_corrupt_fs= true;
-  mysql_cond_broadcast(&cond);
+  pthread_cond_broadcast(&cond);
   mysql_mutex_unlock(&mutex);
 }
 
@@ -2593,7 +2611,7 @@ inline buf_block_t *recv_sys_t::recover_low(const page_id_t page_id,
       map::iterator r= p++;
       pages.erase(r);
       if (pages.empty())
-        mysql_cond_signal(&cond);
+        pthread_cond_signal(&cond);
     }
     space->release();
   }
@@ -2650,13 +2668,13 @@ void recv_sys_t::apply(bool last_batch)
     if (last_batch)
     {
       mysql_mutex_assert_not_owner(&log_sys.mutex);
-      mysql_cond_wait(&cond, &mutex);
+      my_cond_wait(&cond, &mutex.m_mutex);
     }
     else
     {
       mysql_mutex_unlock(&mutex);
       set_timespec_nsec(abstime, 500000000ULL); /* 0.5s */
-      mysql_cond_timedwait(&cond, &log_sys.mutex, &abstime);
+      my_cond_timedwait(&cond, &log_sys.mutex.m_mutex, &abstime);
       mysql_mutex_lock(&mutex);
     }
   }
@@ -2664,8 +2682,6 @@ void recv_sys_t::apply(bool last_batch)
   recv_no_ibuf_operations = !last_batch ||
     srv_operation == SRV_OPERATION_RESTORE ||
     srv_operation == SRV_OPERATION_RESTORE_EXPORT;
-
-  ut_d(recv_no_log_write = recv_no_ibuf_operations);
 
   mtr_t mtr;
 
@@ -2751,7 +2767,7 @@ next_page:
         {
           mysql_mutex_assert_not_owner(&log_sys.mutex);
           if (!empty)
-            mysql_cond_wait(&cond, &mutex);
+            my_cond_wait(&cond, &mutex.m_mutex);
           else
           {
             mysql_mutex_unlock(&mutex);
@@ -2765,7 +2781,7 @@ next_page:
         {
           mysql_mutex_unlock(&mutex);
           set_timespec_nsec(abstime, 500000000ULL); /* 0.5s */
-          mysql_cond_timedwait(&cond, &log_sys.mutex, &abstime);
+          my_cond_timedwait(&cond, &log_sys.mutex.m_mutex, &abstime);
           mysql_mutex_lock(&mutex);
         }
         continue;
@@ -3619,7 +3635,8 @@ completed:
 		mysql_mutex_unlock(&log_sys.mutex);
 
 		ib::error() << "Recovered only to lsn:"
-			    << recv_sys.recovered_lsn << " checkpoint_lsn: " << checkpoint_lsn;
+			    << recv_sys.recovered_lsn
+			    << " checkpoint_lsn: " << checkpoint_lsn;
 
 		return(DB_ERROR);
 	}
@@ -3650,6 +3667,9 @@ completed:
 
 	mysql_mutex_lock(&recv_sys.mutex);
 	recv_sys.apply_log_recs = true;
+	recv_no_ibuf_operations = false;
+	ut_d(recv_no_log_write = srv_operation == SRV_OPERATION_RESTORE
+	     || srv_operation == SRV_OPERATION_RESTORE_EXPORT);
 	mysql_mutex_unlock(&recv_sys.mutex);
 	mysql_mutex_unlock(&log_sys.mutex);
 

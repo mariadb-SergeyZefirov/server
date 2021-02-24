@@ -707,11 +707,12 @@ row_ins_foreign_trx_print(
 
 	ut_ad(!srv_read_only_mode);
 
-	lock_sys.mutex_lock();
-	n_rec_locks = trx->lock.n_rec_locks;
-	n_trx_locks = UT_LIST_GET_LEN(trx->lock.trx_locks);
-	heap_size = mem_heap_get_size(trx->lock.lock_heap);
-	lock_sys.mutex_unlock();
+	{
+		LockMutexGuard g{SRW_LOCK_CALL};
+		n_rec_locks = trx->lock.n_rec_locks;
+		n_trx_locks = UT_LIST_GET_LEN(trx->lock.trx_locks);
+		heap_size = mem_heap_get_size(trx->lock.lock_heap);
+	}
 
 	mysql_mutex_lock(&dict_foreign_err_mutex);
 	rewind(dict_foreign_err_file);
@@ -1018,8 +1019,8 @@ row_ins_foreign_check_on_constraint(
 	/* Since we are going to delete or update a row, we have to invalidate
 	the MySQL query cache for table. A deadlock of threads is not possible
 	here because the caller of this function does not hold any latches with
-	the mutex rank above the lock_sys_t::mutex. The query cache mutex
-	has a rank just above the lock_sys_t::mutex. */
+	the mutex rank above the lock_sys.latch. The query cache mutex
+	has a rank just above the lock_sys.latch. */
 
 	row_ins_invalidate_query_cache(thr, table->name.m_name);
 
@@ -1166,7 +1167,7 @@ row_ins_foreign_check_on_constraint(
 
 	/* Set an X-lock on the row to delete or update in the child table */
 
-	err = lock_table(0, table, LOCK_IX, thr);
+	err = lock_table(table, LOCK_IX, thr);
 
 	if (err == DB_SUCCESS) {
 		/* Here it suffices to use a LOCK_REC_NOT_GAP type lock;
@@ -1609,7 +1610,7 @@ row_ins_check_foreign_constraint(
 		/* We already have a LOCK_IX on table, but not necessarily
 		on check_table */
 
-		err = lock_table(0, check_table, LOCK_IS, thr);
+		err = lock_table(check_table, LOCK_IS, thr);
 
 		if (err != DB_SUCCESS) {
 
@@ -1825,25 +1826,22 @@ do_possible_lock_wait:
 	if (err == DB_LOCK_WAIT) {
 		trx->error_state = err;
 
-		que_thr_stop_for_mysql(thr);
-
 		thr->lock_state = QUE_THR_LOCK_ROW;
 
 		check_table->inc_fk_checks();
 
-		lock_wait_suspend_thread(thr);
+		err = lock_wait(thr);
 
 		thr->lock_state = QUE_THR_LOCK_NOLOCK;
 
-		err = trx->error_state;
+		check_table->dec_fk_checks();
+
 		if (err != DB_SUCCESS) {
 		} else if (check_table->to_be_dropped) {
 			err = DB_LOCK_WAIT_TIMEOUT;
 		} else {
 			err = DB_LOCK_WAIT;
 		}
-
-		check_table->dec_fk_checks();
 	}
 
 exit_func:
@@ -2670,7 +2668,7 @@ commit_exit:
 		DEBUG_SYNC_C("empty_root_page_insert");
 
 		if (!index->table->is_temporary()) {
-			err = lock_table(0, index->table, LOCK_X, thr);
+			err = lock_table(index->table, LOCK_X, thr);
 
 			if (err != DB_SUCCESS) {
 				trx->error_state = err;
@@ -3800,7 +3798,7 @@ row_ins_step(
 			goto same_trx;
 		}
 
-		err = lock_table(0, node->table, LOCK_IX, thr);
+		err = lock_table(node->table, LOCK_IX, thr);
 
 		DBUG_EXECUTE_IF("ib_row_ins_ix_lock_wait",
 				err = DB_LOCK_WAIT;);

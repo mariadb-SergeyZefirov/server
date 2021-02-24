@@ -2936,23 +2936,7 @@ void kill_delayed_threads(void)
     mysql_mutex_lock(&di->thd.LOCK_thd_kill);
     if (di->thd.killed < KILL_CONNECTION)
       di->thd.set_killed_no_mutex(KILL_CONNECTION);
-    if (di->thd.mysys_var)
-    {
-      mysql_mutex_lock(&di->thd.mysys_var->mutex);
-      if (di->thd.mysys_var->current_cond)
-      {
-	/*
-	  We need the following test because the main mutex may be locked
-	  in handle_delayed_insert()
-	*/
-	if (&di->mutex != di->thd.mysys_var->current_mutex)
-          mysql_mutex_lock(di->thd.mysys_var->current_mutex);
-        mysql_cond_broadcast(di->thd.mysys_var->current_cond);
-	if (&di->mutex != di->thd.mysys_var->current_mutex)
-          mysql_mutex_unlock(di->thd.mysys_var->current_mutex);
-      }
-      mysql_mutex_unlock(&di->thd.mysys_var->mutex);
-    }
+    di->thd.abort_current_cond_wait(false);
     mysql_mutex_unlock(&di->thd.LOCK_thd_kill);
   }
   mysql_mutex_unlock(&LOCK_delayed_insert); // For unlink from list
@@ -4746,7 +4730,8 @@ select_create::prepare(List<Item> &_values, SELECT_LEX_UNIT *u)
   if (thd->locked_tables_mode <= LTM_LOCK_TABLES)
   {
     table->file->ha_start_bulk_insert((ha_rows) 0);
-    table->file->extra(HA_EXTRA_BEGIN_ALTER_COPY);
+    if (thd->lex->duplicates == DUP_ERROR && !thd->lex->ignore)
+      table->file->extra(HA_EXTRA_BEGIN_ALTER_COPY);
   }
   thd->abort_on_warning= !info.ignore && thd->is_strict_mode();
   if (check_that_all_fields_are_given_values(thd, table, table_list))

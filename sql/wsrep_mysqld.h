@@ -100,8 +100,9 @@ extern ulong       wsrep_running_applier_threads;
 extern ulong       wsrep_running_rollbacker_threads;
 extern bool        wsrep_new_cluster;
 extern bool        wsrep_gtid_mode;
-extern my_bool     wsrep_strict_ddl;
 extern uint        wsrep_gtid_domain_id;
+extern ulonglong   wsrep_mode;
+extern my_bool     wsrep_strict_ddl;
 
 enum enum_wsrep_reject_types {
   WSREP_REJECT_NONE,    /* nothing rejected */
@@ -131,6 +132,12 @@ enum enum_wsrep_ignore_apply_error {
     WSREP_IGNORE_ERRORS_ON_RECONCILING_DML= 0x2,
     WSREP_IGNORE_ERRORS_ON_DDL= 0x4,
     WSREP_IGNORE_ERRORS_MAX= 0x7
+};
+
+enum enum_wsrep_mode {
+  WSREP_MODE_STRICT_REPLICATION= (1ULL << 0),
+  WSREP_MODE_BINLOG_ROW_FORMAT_ONLY= (1ULL << 1),
+  WSREP_MODE_REQUIRED_PRIMARY_KEY= (1ULL << 2)
 };
 
 // Streaming Replication
@@ -207,8 +214,12 @@ extern void wsrep_close_applier_threads(int count);
 
 /* new defines */
 extern void wsrep_stop_replication(THD *thd);
-extern bool wsrep_start_replication();
+extern bool wsrep_start_replication(const char *wsrep_cluster_address);
 extern void wsrep_shutdown_replication();
+extern bool wsrep_check_mode (enum_wsrep_mode mask);
+extern bool wsrep_check_mode_after_open_table (THD *thd, const handlerton *hton,
+                                               TABLE_LIST *tables);
+extern bool wsrep_check_mode_before_cmd_execute (THD *thd);
 extern bool wsrep_must_sync_wait (THD* thd, uint mask= WSREP_SYNC_WAIT_BEFORE_READ);
 extern bool wsrep_sync_wait (THD* thd, uint mask= WSREP_SYNC_WAIT_BEFORE_READ);
 extern enum wsrep::provider::status
@@ -216,7 +227,7 @@ wsrep_sync_wait_upto (THD* thd, wsrep_gtid_t* upto, int timeout);
 extern void wsrep_last_committed_id (wsrep_gtid_t* gtid);
 extern int  wsrep_check_opts();
 extern void wsrep_prepend_PATH (const char* path);
-void wsrep_append_fk_parent_table(THD* thd, TABLE_LIST* table, wsrep::key_array* keys);
+extern bool wsrep_append_fk_parent_table(THD* thd, TABLE_LIST* table, wsrep::key_array* keys);
 
 /* Other global variables */
 extern wsrep_seqno_t wsrep_locked_seqno;
@@ -284,6 +295,13 @@ void WSREP_LOG(void (*fun)(const char* fmt, ...), const char* fmt, ...);
 
 #define WSREP_PROVIDER_EXISTS                                                  \
   (wsrep_provider && strncasecmp(wsrep_provider, WSREP_NONE, FN_REFLEN))
+
+static inline bool wsrep_cluster_address_exists()
+{
+  if (mysqld_server_started)
+    mysql_mutex_assert_owner(&LOCK_global_system_variables);
+  return wsrep_cluster_address && wsrep_cluster_address[0];
+}
 
 #define WSREP_QUERY(thd) (thd->query())
 
@@ -369,7 +387,7 @@ int wsrep_to_isolation_begin(THD *thd, const char *db_, const char *table_,
                              const wsrep::key_array *fk_tables= nullptr,
                              const HA_CREATE_INFO* create_info= nullptr);
 
-bool wsrep_should_replicate_ddl(THD* thd, const enum legacy_db_type db_type);
+bool wsrep_should_replicate_ddl(THD* thd, const handlerton *db_type);
 bool wsrep_should_replicate_ddl_iterate(THD* thd, const TABLE_LIST* table_list);
 
 void wsrep_to_isolation_end(THD *thd);
@@ -636,6 +654,7 @@ wsrep::key wsrep_prepare_key_for_toi(const char* db, const char* table,
 #define wsrep_init_globals() do {} while(0)
 #define wsrep_create_appliers(X) do {} while(0)
 #define wsrep_should_replicate_ddl(X,Y) (1)
+#define wsrep_cluster_address_exists() (false)
 
 #endif /* WITH_WSREP */
 

@@ -310,7 +310,7 @@ char *opt_incremental_history_name;
 char *opt_incremental_history_uuid;
 
 char *opt_user;
-char *opt_password;
+const char *opt_password;
 char *opt_host;
 char *opt_defaults_group;
 char *opt_socket;
@@ -1506,7 +1506,7 @@ struct my_option xb_server_options[] =
    "With which method to flush data.",
    &srv_file_flush_method, &srv_file_flush_method,
    &innodb_flush_method_typelib, GET_ENUM, REQUIRED_ARG,
-   IF_WIN(SRV_ALL_O_DIRECT_FSYNC, SRV_FSYNC), 0, 0, 0, 0, 0},
+   IF_WIN(SRV_ALL_O_DIRECT_FSYNC, SRV_O_DIRECT), 0, 0, 0, 0, 0},
 
   {"innodb_log_buffer_size", OPT_INNODB_LOG_BUFFER_SIZE,
    "The size of the buffer which InnoDB uses to write log to the log files on disk.",
@@ -1846,7 +1846,7 @@ check_if_param_set(const char *param)
 
 my_bool
 xb_get_one_option(const struct my_option *opt,
-		  char *argument, const char *)
+		  const char *argument, const char *)
 {
   switch(opt->id) {
   case 'h':
@@ -6323,9 +6323,10 @@ void handle_options(int argc, char **argv, char ***argv_server,
 
         if (opt_password)
         {
-          char *argument= opt_password;
-          char *start= argument;
-          opt_password= my_strdup(PSI_NOT_INSTRUMENTED, opt_password, MYF(MY_FAE));
+          char *argument= (char*) opt_password;
+          char *start= (char*) opt_password;
+          opt_password= my_strdup(PSI_NOT_INSTRUMENTED, opt_password,
+                                  MYF(MY_FAE));
           while (*argument)
             *argument++= 'x'; // Destroy argument
           if (*start)

@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2017, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2015, 2020, MariaDB Corporation.
+Copyright (c) 2015, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -1999,7 +1999,9 @@ row_upd_sec_index_entry(
 		break;
 	}
 
-	if (!index->is_committed()) {
+	bool uncommitted = !index->is_committed();
+
+	if (uncommitted) {
 		/* The index->online_status may change if the index is
 		or was being created online, but not committed yet. It
 		is protected by index->lock. */
@@ -2202,10 +2204,37 @@ row_upd_sec_index_entry(
 
 	mem_heap_empty(heap);
 
+	DEBUG_SYNC_C_IF_THD(trx->mysql_thd,
+			    "before_row_upd_sec_new_index_entry");
+
+	uncommitted = !index->is_committed();
+	if (uncommitted) {
+		mtr.start();
+		/* The index->online_status may change if the index is
+		being rollbacked. It is protected by index->lock. */
+
+		mtr_s_lock_index(index, &mtr);
+
+		switch (dict_index_get_online_status(index)) {
+		case ONLINE_INDEX_COMPLETE:
+		case ONLINE_INDEX_CREATION:
+		       break;
+		case ONLINE_INDEX_ABORTED:
+		case ONLINE_INDEX_ABORTED_DROPPED:
+		       mtr_commit(&mtr);
+		       goto func_exit;
+		}
+
+	}
+
 	/* Build a new index entry */
 	entry = row_build_index_entry(node->upd_row, node->upd_ext,
 				      index, heap);
 	ut_a(entry);
+
+	if (uncommitted) {
+		mtr_commit(&mtr);
+	}
 
 	/* Insert new index entry */
 	err = row_ins_sec_index_entry(index, entry, thr, !node->is_delete);
@@ -2840,7 +2869,7 @@ row_upd_clust_step(
 
 	if (!flags && !node->has_clust_rec_x_lock) {
 		err = lock_clust_rec_modify_check_and_lock(
-			0, btr_pcur_get_block(pcur),
+			btr_pcur_get_block(pcur),
 			rec, index, offsets, thr);
 		if (err != DB_SUCCESS) {
 			mtr.commit();
@@ -2850,8 +2879,8 @@ row_upd_clust_step(
 
 	ut_ad(index->table->no_rollback() || index->table->is_temporary()
 	      || row_get_rec_trx_id(rec, index, offsets) == trx->id
-	      || lock_trx_has_expl_x_lock(trx, index->table,
-					  btr_pcur_get_block(pcur),
+	      || lock_trx_has_expl_x_lock(*trx, *index->table,
+					  btr_pcur_get_block(pcur)->page.id(),
 					  page_rec_get_heap_no(rec)));
 
 	/* NOTE: the following function calls will also commit mtr */
@@ -3084,7 +3113,7 @@ row_upd_step(
 			/* It may be that the current session has not yet
 			started its transaction, or it has been committed: */
 
-			err = lock_table(0, node->table, LOCK_IX, thr);
+			err = lock_table(node->table, LOCK_IX, thr);
 
 			if (err != DB_SUCCESS) {
 

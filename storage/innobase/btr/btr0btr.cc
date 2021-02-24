@@ -1118,7 +1118,11 @@ static
 void
 btr_free_but_not_root(
 	buf_block_t*	block,
-	mtr_log_t	log_mode)
+	mtr_log_t	log_mode
+#ifdef BTR_CUR_HASH_ADAPT
+	,bool		ahi=false
+#endif
+	)
 {
 	mtr_t	mtr;
 
@@ -1147,7 +1151,11 @@ leaf_loop:
 	fsp0fsp. */
 
 	bool finished = fseg_free_step(root + PAGE_HEADER + PAGE_BTR_SEG_LEAF,
-				       &mtr);
+				       &mtr
+#ifdef BTR_CUR_HASH_ADAPT
+				       , ahi
+#endif /* BTR_CUR_HASH_ADAPT */
+				       );
 	mtr_commit(&mtr);
 
 	if (!finished) {
@@ -1167,7 +1175,11 @@ top_loop:
 #endif /* UNIV_BTR_DEBUG */
 
 	finished = fseg_free_step_not_header(
-		root + PAGE_HEADER + PAGE_BTR_SEG_TOP, &mtr);
+		root + PAGE_HEADER + PAGE_BTR_SEG_TOP, &mtr
+#ifdef BTR_CUR_HASH_ADAPT
+		,ahi
+#endif /* BTR_CUR_HASH_ADAPT */
+		);
 	mtr_commit(&mtr);
 
 	if (!finished) {
@@ -1191,7 +1203,17 @@ void dict_index_t::clear(que_thr_t *thr)
                                             table->space->zip_size(),
                                             RW_X_LATCH, &mtr))
   {
-    btr_free_but_not_root(root_block, mtr.get_log_mode());
+    btr_free_but_not_root(root_block, mtr.get_log_mode()
+#ifdef BTR_CUR_HASH_ADAPT
+		          ,n_ahi_pages() != 0
+#endif
+                         );
+
+#ifdef BTR_CUR_HASH_ADAPT
+    if (root_block->index)
+      btr_search_drop_page_hash_index(root_block);
+    ut_ad(n_ahi_pages() == 0);
+#endif
     mtr.memset(root_block, PAGE_HEADER + PAGE_BTR_SEG_LEAF,
                FSEG_HEADER_SIZE, 0);
     if (fseg_create(table->space, PAGE_HEADER + PAGE_BTR_SEG_LEAF, &mtr, false,
@@ -1851,6 +1873,8 @@ btr_root_raise_and_insert(
 	ut_a(!root_page_zip || page_zip_validate(root_page_zip, root->frame,
 						 index));
 #endif /* UNIV_ZIP_DEBUG */
+	const page_id_t root_id{root->page.id()};
+
 #ifdef UNIV_BTR_DEBUG
 	if (!dict_index_is_ibuf(index)) {
 		ulint	space = index->table->space_id;
@@ -1861,7 +1885,7 @@ btr_root_raise_and_insert(
 					    + root->frame, space));
 	}
 
-	ut_a(dict_index_get_page(index) == root->page.id().page_no());
+	ut_a(dict_index_get_page(index) == root_id.page_no());
 #endif /* UNIV_BTR_DEBUG */
 	ut_ad(mtr->memo_contains_flagged(&index->lock, MTR_MEMO_X_LOCK
 					 | MTR_MEMO_SX_LOCK));
@@ -1919,7 +1943,7 @@ btr_root_raise_and_insert(
 
 		/* Move any existing predicate locks */
 		if (dict_index_is_spatial(index)) {
-			lock_prdt_rec_move(new_block, root);
+			lock_prdt_rec_move(new_block, root_id);
 		} else {
 			btr_search_move_or_delete_hash_entries(
 				new_block, root);
@@ -1964,7 +1988,7 @@ btr_root_raise_and_insert(
 	root page: we cannot discard the lock structs on the root page */
 
 	if (!dict_table_is_locking_disabled(index->table)) {
-		lock_update_root_raise(new_block, root);
+		lock_update_root_raise(*new_block, root_id);
 	}
 
 	/* Create a memory heap where the node pointer is stored */
@@ -3320,7 +3344,7 @@ btr_lift_page_up(
 
 		/* Also update the predicate locks */
 		if (dict_index_is_spatial(index)) {
-			lock_prdt_rec_move(father_block, block);
+			lock_prdt_rec_move(father_block, block->page.id());
 		} else {
 			btr_search_move_or_delete_hash_entries(
 				father_block, block);
@@ -3328,14 +3352,13 @@ btr_lift_page_up(
 	}
 
 	if (!dict_table_is_locking_disabled(index->table)) {
+		const page_id_t id{block->page.id()};
 		/* Free predicate page locks on the block */
-		if (dict_index_is_spatial(index)) {
-			lock_sys.mutex_lock();
-			lock_prdt_page_free_from_discard(
-				block, &lock_sys.prdt_page_hash);
-			lock_sys.mutex_unlock();
+		if (index->is_spatial()) {
+			lock_sys.prdt_page_free_from_discard(id);
+		} else {
+			lock_update_copy_and_discard(*father_block, id);
 		}
-		lock_update_copy_and_discard(father_block, block);
 	}
 
 	/* Go upward to root page, decrementing levels by one. */
@@ -3554,6 +3577,8 @@ retry:
 		/* Remove the page from the level list */
 		btr_level_list_remove(*block, *index, mtr);
 
+		const page_id_t id{block->page.id()};
+
 		if (dict_index_is_spatial(index)) {
 			rec_t*  my_rec = father_cursor.page_cur.rec;
 
@@ -3583,16 +3608,12 @@ retry:
 			}
 
 			/* No GAP lock needs to be worrying about */
-			lock_sys.mutex_lock();
-			lock_prdt_page_free_from_discard(
-				block, &lock_sys.prdt_page_hash);
-			lock_rec_free_all_from_discard_page(block);
-			lock_sys.mutex_unlock();
+			lock_sys.prdt_page_free_from_discard(id);
 		} else {
 			btr_cur_node_ptr_delete(&father_cursor, mtr);
 			if (!dict_table_is_locking_disabled(index->table)) {
 				lock_update_merge_left(
-					merge_block, orig_pred, block);
+					*merge_block, orig_pred, id);
 			}
 		}
 
@@ -3736,11 +3757,8 @@ retry:
 							 offsets2, offsets,
 							 merge_page, mtr);
 			}
-			lock_sys.mutex_lock();
-			lock_prdt_page_free_from_discard(
-				block, &lock_sys.prdt_page_hash);
-			lock_rec_free_all_from_discard_page(block);
-			lock_sys.mutex_unlock();
+			const page_id_t id{block->page.id()};
+			lock_sys.prdt_page_free_from_discard(id);
 		} else {
 
 			compressed = btr_cur_pessimistic_delete(&err, TRUE,

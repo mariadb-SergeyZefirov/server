@@ -3280,10 +3280,8 @@ commit_exit:
 		ibuf_mtr_commit(&bitmap_mtr);
 		goto fail_exit;
 	} else {
-		lock_sys.mutex_lock();
-		const auto lock_exists = lock_sys.get_first(page_id);
-		lock_sys.mutex_unlock();
-		if (lock_exists) {
+		LockGuard g{lock_sys.rec_hash, page_id};
+		if (lock_sys.rec_hash.get_first(page_id)) {
 			goto commit_exit;
 		}
 	}
@@ -3790,7 +3788,8 @@ dump:
 						    &page_cur);
 
 		ut_ad(!cmp_dtuple_rec(entry, rec, offsets));
-		lock_rec_restore_from_page_infimum(block, rec, block);
+		lock_rec_restore_from_page_infimum(*block, rec,
+						   block->page.id());
 	} else {
 		offsets = NULL;
 		ibuf_insert_to_index_page_low(entry, block, index,

@@ -5669,7 +5669,7 @@ static Sys_var_tz Sys_time_zone(
 
 static Sys_var_charptr_fscs Sys_wsrep_provider(
        "wsrep_provider", "Path to replication provider library",
-       PREALLOCATED GLOBAL_VAR(wsrep_provider), CMD_LINE(REQUIRED_ARG),
+       PREALLOCATED READ_ONLY GLOBAL_VAR(wsrep_provider), CMD_LINE(REQUIRED_ARG),
        DEFAULT(WSREP_NONE),
        NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(wsrep_provider_check), ON_UPDATE(wsrep_provider_update));
@@ -5696,13 +5696,12 @@ static Sys_var_charptr Sys_wsrep_cluster_name(
        ON_CHECK(wsrep_cluster_name_check),
        ON_UPDATE(wsrep_cluster_name_update));
 
-static PolyLock_mutex PLock_wsrep_cluster_config(&LOCK_wsrep_cluster_config);
 static Sys_var_charptr Sys_wsrep_cluster_address (
        "wsrep_cluster_address", "Address to initially connect to cluster",
        PREALLOCATED GLOBAL_VAR(wsrep_cluster_address), 
        CMD_LINE(REQUIRED_ARG),
        DEFAULT(""),
-       &PLock_wsrep_cluster_config, NOT_IN_BINLOG,
+       NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(wsrep_cluster_address_check), 
        ON_UPDATE(wsrep_cluster_address_update));
 
@@ -5733,7 +5732,7 @@ static Sys_var_ulong Sys_wsrep_slave_threads(
        "wsrep_slave_threads", "Number of slave appliers to launch",
        GLOBAL_VAR(wsrep_slave_threads), CMD_LINE(REQUIRED_ARG),
        VALID_RANGE(1, 512), DEFAULT(1), BLOCK_SIZE(1),
-       &PLock_wsrep_cluster_config, NOT_IN_BINLOG,
+       NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(0),
        ON_UPDATE(wsrep_slave_threads_update));
 
@@ -5886,7 +5885,7 @@ static Sys_var_ulong Sys_wsrep_max_ws_rows (
 
 static Sys_var_charptr Sys_wsrep_notify_cmd(
        "wsrep_notify_cmd", "",
-       GLOBAL_VAR(wsrep_notify_cmd),CMD_LINE(REQUIRED_ARG),
+       READ_ONLY GLOBAL_VAR(wsrep_notify_cmd), CMD_LINE(REQUIRED_ARG),
        DEFAULT(""));
 
 static Sys_var_mybool Sys_wsrep_certify_nonPK(
@@ -5927,6 +5926,22 @@ static Sys_var_uint Sys_wsrep_sync_wait(
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
        ON_UPDATE(wsrep_sync_wait_update));
 
+static const char *wsrep_mode_names[]= 
+{
+  "STRICT_REPLICATION",
+  "BINLOG_ROW_FORMAT_ONLY",
+  "REQUIRED_PRIMARY_KEY",
+  NullS
+};
+static Sys_var_set Sys_wsrep_mode(
+       "wsrep_mode",
+       "Set of WSREP features that are enabled.",
+       GLOBAL_VAR(wsrep_mode), CMD_LINE(REQUIRED_ARG),
+       wsrep_mode_names,
+       DEFAULT(0),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG,
+       ON_CHECK(wsrep_mode_check));
+
 static const char *wsrep_OSU_method_names[]= { "TOI", "RSU", NullS };
 static Sys_var_enum Sys_wsrep_OSU_method(
        "wsrep_OSU_method", "Method for Online Schema Upgrade",
@@ -5943,12 +5958,14 @@ static Sys_var_mybool Sys_wsrep_desync (
        ON_UPDATE(wsrep_desync_update));
 
 static Sys_var_mybool Sys_wsrep_strict_ddl (
-       "wsrep_strict_ddl", "If set, reject DDL on affected tables not supporting Galera replication",
+       "wsrep_strict_ddl",
+       "If set, reject DDL on affected tables not supporting Galera replication",
        GLOBAL_VAR(wsrep_strict_ddl),
        CMD_LINE(OPT_ARG), DEFAULT(FALSE),
        NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(0),
-       ON_UPDATE(0));
+       ON_UPDATE(wsrep_strict_ddl_update),
+       DEPRECATED("'@@wsrep_mode=STRICT_REPLICATION'")); // since 10.6.0
 
 static const char *wsrep_reject_queries_names[]= { "NONE", "ALL", "ALL_KILL", NullS };
 static Sys_var_enum Sys_wsrep_reject_queries(
@@ -6692,6 +6709,12 @@ static Sys_var_uint Sys_in_subquery_conversion_threshold(
        "0 to disable the conversion.",
        SESSION_VAR(in_subquery_conversion_threshold), CMD_LINE(REQUIRED_ARG),
        VALID_RANGE(0, UINT_MAX), DEFAULT(IN_SUBQUERY_CONVERSION_THRESHOLD), BLOCK_SIZE(1));
+
+static Sys_var_ulong Sys_optimizer_max_sel_arg_weight(
+       "optimizer_max_sel_arg_weight",
+       "The maximum weight of the SEL_ARG graph. Set to 0 for no limit",
+       SESSION_VAR(optimizer_max_sel_arg_weight), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, ULONG_MAX), DEFAULT(SEL_ARG::MAX_WEIGHT), BLOCK_SIZE(1));
 
 static Sys_var_enum Sys_secure_timestamp(
        "secure_timestamp", "Restricts direct setting of a session "

@@ -64,49 +64,44 @@ operator<<(std::ostream& out, const lock_table_t& lock)
 	return(lock.print(out));
 }
 
-/** Convert the member 'type_mode' into a human readable string.
-@return human readable string */
-inline
-std::string
-ib_lock_t::type_mode_string() const
-{
-	std::ostringstream sout;
-	sout << type_string();
-	sout << " | " << lock_mode_string(mode());
-
-	if (is_record_not_gap()) {
-		sout << " | LOCK_REC_NOT_GAP";
-	}
-
-	if (is_waiting()) {
-		sout << " | LOCK_WAIT";
-	}
-
-	if (is_gap()) {
-		sout << " | LOCK_GAP";
-	}
-
-	if (is_insert_intention()) {
-		sout << " | LOCK_INSERT_INTENTION";
-	}
-	return(sout.str());
-}
-
 inline
 std::ostream&
 ib_lock_t::print(std::ostream& out) const
 {
-	out << "[lock_t: type_mode=" << type_mode << "("
-		<< type_mode_string() << ")";
+  static_assert(LOCK_MODE_MASK == 7, "compatibility");
+  static_assert(LOCK_IS == 0, "compatibility");
+  static_assert(LOCK_IX == 1, "compatibility");
+  static_assert(LOCK_S == 2, "compatibility");
+  static_assert(LOCK_X == 3, "compatibility");
+  static_assert(LOCK_AUTO_INC == 4, "compatibility");
+  static_assert(LOCK_NONE == 5, "compatibility");
+  static_assert(LOCK_NONE_UNSET == 7, "compatibility");
+  const char *const modes[8]=
+  { "IS", "IX", "S", "X", "AUTO_INC", "NONE", "?", "NONE_UNSET" };
 
-	if (is_record_lock()) {
-		out << un_member.rec_lock;
-	} else {
-		out << un_member.tab_lock;
-	}
+  out << "[lock_t: type_mode=" << type_mode << "(" << type_string()
+      << " | LOCK_" << modes[mode()];
 
-	out << "]";
-	return(out);
+  if (is_record_not_gap())
+    out << " | LOCK_REC_NOT_GAP";
+  if (is_waiting())
+    out << " | LOCK_WAIT";
+
+  if (is_gap())
+    out << " | LOCK_GAP";
+
+  if (is_insert_intention())
+    out << " | LOCK_INSERT_INTENTION";
+
+  out << ")";
+
+  if (is_table())
+    out << un_member.tab_lock;
+  else
+    out << un_member.rec_lock;
+
+  out << "]";
+  return out;
 }
 
 inline
@@ -119,24 +114,6 @@ operator<<(std::ostream& out, const ib_lock_t& lock)
 #ifdef UNIV_DEBUG
 extern ibool	lock_print_waits;
 #endif /* UNIV_DEBUG */
-
-/** Restricts the length of search we will do in the waits-for
-graph of transactions */
-static const ulint	LOCK_MAX_N_STEPS_IN_DEADLOCK_CHECK = 1000000;
-
-/** Restricts the search depth we will do in the waits-for graph of
-transactions */
-static const ulint	LOCK_MAX_DEPTH_IN_DEADLOCK_CHECK = 200;
-
-/** When releasing transaction locks, this specifies how often we release
-the lock mutex for a moment to give also others access to it */
-static const ulint	LOCK_RELEASE_INTERVAL = 1000;
-
-/* Safety margin when creating a new record lock: this many extra records
-can be inserted to the page without need to create a lock with a bigger
-bitmap */
-
-static const ulint	LOCK_PAGE_BITMAP_MARGIN = 64;
 
 /* An explicit record lock affects both the record and the gap before it.
 An implicit x-lock does not affect the gap, it only locks the index
@@ -414,9 +391,6 @@ static const byte lock_strength_matrix[5][5] = {
  /* AI */ {  FALSE, FALSE, FALSE, FALSE,  TRUE}
 };
 
-/** Maximum depth of the DFS stack. */
-static const ulint MAX_STACK_SIZE = 4096;
-
 #define PRDT_HEAPNO	PAGE_HEAP_NO_INFIMUM
 /** Record locking request status */
 enum lock_rec_req_status {
@@ -434,15 +408,6 @@ static const ulint      lock_types = UT_ARR_SIZE(lock_compatibility_matrix);
 #endif /* UNIV_DEBUG */
 
 /*********************************************************************//**
-Gets the type of a lock.
-@return LOCK_TABLE or LOCK_REC */
-UNIV_INLINE
-ulint
-lock_get_type_low(
-/*==============*/
-	const lock_t*	lock);	/*!< in: lock */
-
-/*********************************************************************//**
 Gets the previous record lock set on a record.
 @return previous lock on the same record, NULL if none exists */
 const lock_t*
@@ -450,14 +415,6 @@ lock_rec_get_prev(
 /*==============*/
 	const lock_t*	in_lock,/*!< in: record lock */
 	ulint		heap_no);/*!< in: heap number of the record */
-
-/*********************************************************************//**
-Cancels a waiting lock request and releases possible other transactions
-waiting behind it. */
-void
-lock_cancel_waiting_and_release(
-/*============================*/
-	lock_t*	lock);	/*!< in/out: waiting lock request */
 
 /*********************************************************************//**
 Checks if some transaction has an implicit x-lock on a record in a clustered
@@ -515,8 +472,8 @@ lock_rec_set_nth_bit(
 @return previous value of the bit */
 inline byte lock_rec_reset_nth_bit(lock_t* lock, ulint i)
 {
-	lock_sys.mutex_assert_locked();
-	ut_ad(lock_get_type_low(lock) == LOCK_REC);
+	ut_ad(!lock->is_table());
+	ut_ad(lock_sys.is_writer() || lock->trx->mutex_is_owner());
 	ut_ad(i < lock->un_member.rec_lock.n_bits);
 
 	byte*	b = reinterpret_cast<byte*>(&lock[1]) + (i >> 3);
@@ -562,25 +519,21 @@ lock_rec_get_next_const(
 	ulint		heap_no,/*!< in: heap number of the record */
 	const lock_t*	lock);	/*!< in: lock */
 
-/*********************************************************************//**
-Gets the first explicit lock request on a record.
-@return first lock, NULL if none exists */
-UNIV_INLINE
-lock_t*
-lock_rec_get_first(
-/*===============*/
-	hash_table_t*		hash,	/*!< in: hash chain the lock on */
-	const buf_block_t*	block,	/*!< in: block containing the record */
-	ulint			heap_no);/*!< in: heap number of the record */
-
-/*********************************************************************//**
-Gets the mode of a lock.
-@return mode */
-UNIV_INLINE
-enum lock_mode
-lock_get_mode(
-/*==========*/
-	const lock_t*	lock);	/*!< in: lock */
+/** Get the first explicit lock request on a record.
+@param hash     lock hash table
+@param id       page identifier
+@param heap_no  record identifier in page
+@return first lock
+@retval nullptr if none exists */
+inline lock_t *lock_sys_t::get_first(lock_sys_t::hash_table &hash,
+                                     const page_id_t id, ulint heap_no)
+{
+  for (lock_t *lock= hash.get_first(id);
+       lock; lock= lock_rec_get_next_on_page(lock))
+    if (lock_rec_get_nth_bit(lock, heap_no))
+      return lock;
+  return nullptr;
+}
 
 /*********************************************************************//**
 Calculates if lock mode 1 is compatible with lock mode 2.
@@ -603,15 +556,6 @@ lock_mode_stronger_or_eq(
 	enum lock_mode	mode2);	/*!< in: lock mode */
 
 /*********************************************************************//**
-Gets the wait flag of a lock.
-@return LOCK_WAIT if waiting, 0 if not */
-UNIV_INLINE
-ulint
-lock_get_wait(
-/*==========*/
-	const lock_t*	lock);	/*!< in: lock */
-
-/*********************************************************************//**
 Checks if a transaction has the specified table lock, or stronger. This
 function should only be called by the thread that owns the transaction.
 @return lock or NULL */
@@ -622,32 +566,6 @@ lock_table_has(
 	const trx_t*		trx,	/*!< in: transaction */
 	const dict_table_t*	table,	/*!< in: table */
 	enum lock_mode		mode);	/*!< in: lock mode */
-
-/** Set the wait status of a lock.
-@param[in,out]	lock	lock that will be waited for
-@param[in,out]	trx	transaction that will wait for the lock */
-inline void lock_set_lock_and_trx_wait(lock_t* lock, trx_t* trx)
-{
-	ut_ad(lock);
-	ut_ad(lock->trx == trx);
-	ut_ad(trx->lock.wait_lock == NULL);
-	lock_sys.mutex_assert_locked();
-
-	trx->lock.wait_lock = lock;
-	lock->type_mode |= LOCK_WAIT;
-}
-
-/** Reset the wait status of a lock.
-@param[in,out]	lock	lock that was possibly being waited for */
-inline void lock_reset_lock_and_trx_wait(lock_t* lock)
-{
-	ut_ad(lock_get_wait(lock));
-	lock_sys.mutex_assert_locked();
-	ut_ad(lock->trx->lock.wait_lock == NULL
-	      || lock->trx->lock.wait_lock == lock);
-	lock->trx->lock.wait_lock = NULL;
-	lock->type_mode &= ~LOCK_WAIT;
-}
 
 #include "lock0priv.ic"
 

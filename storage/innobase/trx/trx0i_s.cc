@@ -156,7 +156,7 @@ struct trx_i_s_cache_t {
 	ha_storage_t*	storage;	/*!< storage for external volatile
 					data that may become unavailable
 					when we release
-					lock_sys.mutex */
+					lock_sys.latch */
 	ulint		mem_allocd;	/*!< the amount of memory
 					allocated with mem_alloc*() */
 	bool		is_truncated;	/*!< this is true if the memory
@@ -177,7 +177,7 @@ trx_i_s_cache_t*	trx_i_s_cache = &trx_i_s_cache_static;
 @retval 0xFFFF for table locks */
 static uint16_t wait_lock_get_heap_no(const lock_t *lock)
 {
-  return lock_get_type(lock) == LOCK_REC
+  return !lock->is_table()
     ? static_cast<uint16_t>(lock_rec_find_set_bit(lock))
     : uint16_t{0xFFFF};
 }
@@ -422,23 +422,31 @@ fill_trx_row(
 {
 	const char*	s;
 
-	lock_sys.mutex_assert_locked();
+	lock_sys.assert_locked();
 
-	row->trx_id = trx_get_id_for_print(trx);
+	const lock_t* wait_lock = trx->lock.wait_lock;
+
+	row->trx_id = trx->id;
 	row->trx_started = trx->start_time;
-	row->trx_state = trx_get_que_state_str(trx);
+	if (trx->in_rollback) {
+		row->trx_state = "ROLLING BACK";
+	} else if (trx->state == TRX_STATE_COMMITTED_IN_MEMORY) {
+		row->trx_state = "COMMITTING";
+	} else if (wait_lock) {
+		row->trx_state = "LOCK WAIT";
+	} else {
+		row->trx_state = "RUNNING";
+	}
+
 	row->requested_lock_row = requested_lock_row;
 	ut_ad(requested_lock_row == NULL
 	      || i_s_locks_row_validate(requested_lock_row));
 
-	if (trx->lock.wait_lock != NULL) {
+	ut_ad(!wait_lock == !requested_lock_row);
 
-		ut_a(requested_lock_row != NULL);
-		row->trx_wait_started = trx->lock.wait_started;
-	} else {
-		ut_a(requested_lock_row == NULL);
-		row->trx_wait_started = 0;
-	}
+	row->trx_wait_started = wait_lock
+		? hrtime_to_time(trx->lock.suspend_time)
+		: 0;
 
 	row->trx_weight = static_cast<uintmax_t>(TRX_WEIGHT(trx));
 
@@ -479,9 +487,8 @@ thd_done:
 
 	row->trx_tables_locked = lock_number_of_tables_locked(&trx->lock);
 
-	/* These are protected by both trx->mutex or lock_sys.mutex,
-	or just lock_sys.mutex. For reading, it suffices to hold
-	lock_sys.mutex. */
+	/* These are protected by lock_sys.latch (which we are holding)
+	and sometimes also trx->mutex. */
 
 	row->trx_lock_structs = UT_LIST_GET_LEN(trx->lock.trx_locks);
 
@@ -593,7 +600,7 @@ fill_lock_data(
 	trx_i_s_cache_t*	cache)	/*!< in/out: cache where to store
 					volatile data */
 {
-	ut_a(lock_get_type(lock) == LOCK_REC);
+	ut_a(!lock->is_table());
 
 	switch (heap_no) {
 	case PAGE_HEAP_NO_INFIMUM:
@@ -697,12 +704,10 @@ static bool fill_locks_row(
 				volatile strings */
 {
 	row->lock_trx_id = lock->trx->id;
-	const auto lock_type = lock_get_type(lock);
-	ut_ad(lock_type == LOCK_REC || lock_type == LOCK_TABLE);
-
-	const bool is_gap_lock = lock_type == LOCK_REC
-		&& (lock->type_mode & LOCK_GAP);
-	switch (lock->type_mode & LOCK_MODE_MASK) {
+	const bool is_table = lock->is_table();
+	const bool is_gap_lock = lock->is_gap();
+	ut_ad(!is_gap_lock || !is_table);
+	switch (lock->mode()) {
 	case LOCK_S:
 		row->lock_mode = uint8_t(1 + is_gap_lock);
 		break;
@@ -733,9 +738,9 @@ static bool fill_locks_row(
 		return false;
 	}
 
-	if (lock_type == LOCK_REC) {
+	if (!is_table) {
 		row->lock_index = ha_storage_put_str_memlim(
-			cache->storage, lock_rec_get_index_name(lock),
+			cache->storage, lock_rec_get_index(lock)->name,
 			MAX_ALLOWED_FOR_STORAGE(cache));
 
 		/* memory could not be allocated */
@@ -816,26 +821,19 @@ fold_lock(
 #else
 	ulint	ret;
 
-	switch (lock_get_type(lock)) {
-	case LOCK_REC:
+	if (!lock->is_table()) {
 		ut_a(heap_no != 0xFFFF);
 		ret = ut_fold_ulint_pair((ulint) lock->trx->id,
 					 lock->un_member.rec_lock.page_id.
 					 fold());
 		ret = ut_fold_ulint_pair(ret, heap_no);
-
-		break;
-	case LOCK_TABLE:
+	} else {
 		/* this check is actually not necessary for continuing
 		correct operation, but something must have gone wrong if
 		it fails. */
 		ut_a(heap_no == 0xFFFF);
 
 		ret = (ulint) lock_get_table_id(lock);
-
-		break;
-	default:
-		ut_error;
 	}
 
 	return(ret);
@@ -859,15 +857,13 @@ locks_row_eq_lock(
 #ifdef TEST_NO_LOCKS_ROW_IS_EVER_EQUAL_TO_LOCK_T
 	return(0);
 #else
-	switch (lock_get_type(lock)) {
-	case LOCK_REC:
+	if (!lock->is_table()) {
 		ut_a(heap_no != 0xFFFF);
 
 		return(row->lock_trx_id == lock->trx->id
 		       && row->lock_page == lock->un_member.rec_lock.page_id
 		       && row->lock_rec == heap_no);
-
-	case LOCK_TABLE:
+	} else {
 		/* this check is actually not necessary for continuing
 		correct operation, but something must have gone wrong if
 		it fails. */
@@ -875,10 +871,6 @@ locks_row_eq_lock(
 
 		return(row->lock_trx_id == lock->trx->id
 		       && row->lock_table_id == lock_get_table_id(lock));
-
-	default:
-		ut_error;
-		return(FALSE);
 	}
 #endif
 }
@@ -1045,25 +1037,22 @@ add_trx_relevant_locks_to_cache(
 					requested lock row, or NULL or
 					undefined */
 {
-	lock_sys.mutex_assert_locked();
+	lock_sys.assert_locked();
 
 	/* If transaction is waiting we add the wait lock and all locks
 	from another transactions that are blocking the wait lock. */
-	if (trx->lock.que_state == TRX_QUE_LOCK_WAIT) {
+	if (const lock_t *wait_lock = trx->lock.wait_lock) {
 
 		const lock_t*		curr_lock;
 		i_s_locks_row_t*	blocking_lock_row;
 		lock_queue_iterator_t	iter;
 
-		ut_a(trx->lock.wait_lock != NULL);
-
 		uint16_t wait_lock_heap_no
-			= wait_lock_get_heap_no(trx->lock.wait_lock);
+			= wait_lock_get_heap_no(wait_lock);
 
 		/* add the requested lock */
-		*requested_lock_row
-			= add_lock_to_cache(cache, trx->lock.wait_lock,
-					    wait_lock_heap_no);
+		*requested_lock_row = add_lock_to_cache(cache, wait_lock,
+							wait_lock_heap_no);
 
 		/* memory could not be allocated */
 		if (*requested_lock_row == NULL) {
@@ -1074,18 +1063,16 @@ add_trx_relevant_locks_to_cache(
 		/* then iterate over the locks before the wait lock and
 		add the ones that are blocking it */
 
-		lock_queue_iterator_reset(&iter, trx->lock.wait_lock,
-					  ULINT_UNDEFINED);
+		lock_queue_iterator_reset(&iter, wait_lock, ULINT_UNDEFINED);
 
 		for (curr_lock = lock_queue_iterator_get_prev(&iter);
 		     curr_lock != NULL;
 		     curr_lock = lock_queue_iterator_get_prev(&iter)) {
 
-			if (lock_has_to_wait(trx->lock.wait_lock,
-					     curr_lock)) {
+			if (lock_has_to_wait(wait_lock, curr_lock)) {
 
 				/* add the lock that is
-				blocking trx->lock.wait_lock */
+				blocking wait_lock */
 				blocking_lock_row
 					= add_lock_to_cache(
 						cache, curr_lock,
@@ -1193,7 +1180,7 @@ static void fetch_data_into_cache_low(trx_i_s_cache_t *cache, const trx_t *trx)
 
 static void fetch_data_into_cache(trx_i_s_cache_t *cache)
 {
-  lock_sys.mutex_assert_locked();
+  LockMutexGuard g{SRW_LOCK_CALL};
   trx_i_s_cache_clear(cache);
 
   /* Capture the state of transactions */
@@ -1223,10 +1210,7 @@ trx_i_s_possibly_fetch_data_into_cache(
 	}
 
 	/* We need to read trx_sys and record/table lock queues */
-
-	lock_sys.mutex_lock();
 	fetch_data_into_cache(cache);
-	lock_sys.mutex_unlock();
 
 	/* update cache last read time */
 	cache->last_read = my_interval_timer();
@@ -1255,8 +1239,8 @@ trx_i_s_cache_init(
 {
 	/* The latching is done in the following order:
 	acquire trx_i_s_cache_t::rw_lock, rwlock
-	acquire lock mutex
-	release lock mutex
+	acquire exclusive lock_sys.latch
+	release exclusive lock_sys.latch
 	release trx_i_s_cache_t::rw_lock
 	acquire trx_i_s_cache_t::rw_lock, rdlock
 	release trx_i_s_cache_t::rw_lock */

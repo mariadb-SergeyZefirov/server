@@ -2,7 +2,7 @@
 #define HANDLER_INCLUDED
 /*
    Copyright (c) 2000, 2019, Oracle and/or its affiliates.
-   Copyright (c) 2009, 2020, MariaDB
+   Copyright (c) 2009, 2021, MariaDB
 
    This program is free software; you can redistribute it and/or
    modify it under the terms of the GNU General Public License
@@ -1529,7 +1529,7 @@ struct handlerton
    enum handler_create_iterator_result
      (*create_iterator)(handlerton *hton, enum handler_iterator_type type,
                         struct handler_iterator *fill_this_in);
-   int (*abort_transaction)(handlerton *hton, THD *bf_thd,
+   void (*abort_transaction)(handlerton *hton, THD *bf_thd,
 			    THD *victim_thd, my_bool signal);
    int (*set_checkpoint)(handlerton *hton, const XID* xid);
    int (*get_checkpoint)(handlerton *hton, XID* xid);
@@ -1681,7 +1681,8 @@ struct handlerton
   */
   int (*notify_tabledef_changed)(handlerton *hton, LEX_CSTRING *db,
                                  LEX_CSTRING *table_name, LEX_CUSTRING *frm,
-                                 LEX_CUSTRING *org_tabledef_version);
+                                 LEX_CUSTRING *org_tabledef_version,
+                                 handler *file);
 
    /*
      System Versioning
@@ -3328,7 +3329,7 @@ public:
   {
     cached_table_flags= table_flags();
   }
-  /* ha_ methods: pubilc wrappers for private virtual API */
+  /* ha_ methods: public wrappers for private virtual API */
   
   int ha_open(TABLE *table, const char *name, int mode, uint test_if_locked,
               MEM_ROOT *mem_root= 0, List<String> *partitions_to_open=NULL);

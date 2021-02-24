@@ -91,7 +91,8 @@ static monitor_info_t	innodb_counter_info[] =
 	 MONITOR_DEFAULT_START, MONITOR_MODULE_LOCK},
 
 	{"lock_deadlocks", "lock", "Number of deadlocks",
-	 MONITOR_DEFAULT_ON,
+	 static_cast<monitor_type_t>(
+	 MONITOR_EXISTING | MONITOR_DEFAULT_ON | MONITOR_DISPLAY_CURRENT),
 	 MONITOR_DEFAULT_START, MONITOR_DEADLOCK},
 
 	{"lock_timeouts", "lock", "Number of lock timeouts",
@@ -1719,32 +1720,38 @@ srv_mon_process_existing_counter(
 
 	/* innodb_row_lock_current_waits */
 	case MONITOR_OVLD_ROW_LOCK_CURRENT_WAIT:
-		value = srv_stats.n_lock_wait_current_count;
+		// dirty read without lock_sys.wait_mutex
+		value = lock_sys.get_wait_pending();
 		break;
 
 	/* innodb_row_lock_time */
 	case MONITOR_OVLD_LOCK_WAIT_TIME:
-		value = srv_stats.n_lock_wait_time / 1000;
+		// dirty read without lock_sys.wait_mutex
+		value = lock_sys.get_wait_time_cumulative() / 1000;
 		break;
 
 	/* innodb_row_lock_time_max */
 	case MONITOR_OVLD_LOCK_MAX_WAIT_TIME:
-		value = lock_sys.n_lock_max_wait_time / 1000;
+		// dirty read without lock_sys.wait_mutex
+		value = lock_sys.get_wait_time_max() / 1000;
 		break;
 
 	/* innodb_row_lock_time_avg */
 	case MONITOR_OVLD_LOCK_AVG_WAIT_TIME:
-		if (srv_stats.n_lock_wait_count > 0) {
-			value = srv_stats.n_lock_wait_time / 1000
-				/ srv_stats.n_lock_wait_count;
+		mysql_mutex_lock(&lock_sys.wait_mutex);
+		if (auto count = lock_sys.get_wait_cumulative()) {
+			value = lock_sys.get_wait_time_cumulative() / 1000
+				/ count;
 		} else {
 			value = 0;
 		}
+		mysql_mutex_unlock(&lock_sys.wait_mutex);
 		break;
 
 	/* innodb_row_lock_waits */
 	case MONITOR_OVLD_ROW_LOCK_WAIT:
-		value = srv_stats.n_lock_wait_count;
+		// dirty read without lock_sys.wait_mutex
+		value = lock_sys.get_wait_cumulative();
 		break;
 
 	case MONITOR_RSEG_HISTORY_LEN:
@@ -1872,6 +1879,9 @@ srv_mon_process_existing_counter(
 		break;
         case MONITOR_OVLD_PAGES_DECRYPTED:
 		value = srv_stats.pages_decrypted;
+		break;
+	case MONITOR_DEADLOCK:
+		value = lock_sys.deadlocks;
 		break;
 
 	default:

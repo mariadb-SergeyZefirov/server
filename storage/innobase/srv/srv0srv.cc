@@ -151,7 +151,7 @@ ulong	innodb_compression_algorithm;
 /** Used by SET GLOBAL innodb_master_thread_disabled_debug = X. */
 my_bool	srv_master_thread_disabled_debug;
 /** Event used to inform that master thread is disabled. */
-static mysql_cond_t srv_master_thread_disabled_cond;
+static pthread_cond_t srv_master_thread_disabled_cond;
 #endif /* UNIV_DEBUG */
 
 /*------------------------- LOG FILES ------------------------ */
@@ -384,12 +384,6 @@ my_bool innodb_encrypt_temporary_tables;
 
 my_bool srv_immediate_scrub_data_uncompressed;
 
-/* Array of English strings describing the current state of an
-i/o handler thread */
-
-const char* srv_io_thread_op_info[SRV_MAX_N_IO_THREADS];
-const char* srv_io_thread_function[SRV_MAX_N_IO_THREADS];
-
 static time_t	srv_last_monitor_time;
 
 static mysql_mutex_t srv_innodb_monitor_mutex;
@@ -462,19 +456,13 @@ lock			--	semaphore;
 kernel			--	kernel;
 
 query thread execution:
-(a) without lock mutex
+(a) without lock_sys.latch
 reserved		--	process executing in user mode;
-(b) with lock mutex reserved
+(b) with lock_sys.latch reserved
 			--	process executing in kernel mode;
 
-The server has several backgroind threads all running at the same
-priority as user threads. It periodically checks if here is anything
-happening in the server which requires intervention of the master
-thread. Such situations may be, for example, when flushing of dirty
-blocks is needed in the buffer pool or old version of database rows
-have to be cleaned away (purged). The user can configure a separate
-dedicated purge thread(s) too, in which case the master thread does not
-do any purging.
+The server has several background threads all running at the same
+priority as user threads.
 
 The threads which we call user threads serve the queries of the MySQL
 server. They run at normal priority.
@@ -610,33 +598,6 @@ srv_print_master_thread_info(
 		srv_log_writes_and_flush);
 }
 
-/*********************************************************************//**
-Sets the info describing an i/o thread current state. */
-void
-srv_set_io_thread_op_info(
-/*======================*/
-	ulint		i,	/*!< in: the 'segment' of the i/o thread */
-	const char*	str)	/*!< in: constant char string describing the
-				state */
-{
-	ut_a(i < SRV_MAX_N_IO_THREADS);
-
-	srv_io_thread_op_info[i] = str;
-}
-
-/*********************************************************************//**
-Resets the info describing an i/o thread current state. */
-void
-srv_reset_io_thread_op_info()
-/*=========================*/
-{
-	for (ulint i = 0; i < UT_ARR_SIZE(srv_io_thread_op_info); ++i) {
-		srv_io_thread_op_info[i] = "not started yet";
-	}
-}
-
-
-
 static void thread_pool_thread_init()
 {
 	my_thread_init();
@@ -681,7 +642,7 @@ static void srv_init()
 	UT_LIST_INIT(srv_sys.tasks, &que_thr_t::queue);
 
 	need_srv_free = true;
-	ut_d(mysql_cond_init(0, &srv_master_thread_disabled_cond, nullptr));
+	ut_d(pthread_cond_init(&srv_master_thread_disabled_cond, nullptr));
 
 	mysql_mutex_init(page_zip_stat_per_index_mutex_key,
 			 &page_zip_stat_per_index_mutex, nullptr);
@@ -705,7 +666,7 @@ srv_free(void)
 	mysql_mutex_destroy(&page_zip_stat_per_index_mutex);
 	mysql_mutex_destroy(&srv_sys.tasks_mutex);
 
-	ut_d(mysql_cond_destroy(&srv_master_thread_disabled_cond));
+	ut_d(pthread_cond_destroy(&srv_master_thread_disabled_cond));
 
 	trx_i_s_cache_free(trx_i_s_cache);
 	srv_thread_pool_end();
@@ -770,8 +731,7 @@ ibool
 srv_printf_innodb_monitor(
 /*======================*/
 	FILE*	file,		/*!< in: output stream */
-	ibool	nowait,		/*!< in: whether to wait for the
-				lock_sys_t:: mutex */
+	ibool	nowait,		/*!< in: whether to wait for lock_sys.latch */
 	ulint*	trx_start_pos,	/*!< out: file position of the start of
 				the list of active transactions */
 	ulint*	trx_end)	/*!< out: file position of the end of
@@ -833,7 +793,7 @@ srv_printf_innodb_monitor(
 	/* Only if lock_print_info_summary proceeds correctly,
 	before we call the lock_print_info_all_transactions
 	to print all the lock information. IMPORTANT NOTE: This
-	function acquires the lock mutex on success. */
+	function acquires exclusive lock_sys.latch on success. */
 	ret = lock_print_info_summary(file, nowait);
 
 	if (ret) {
@@ -846,9 +806,8 @@ srv_printf_innodb_monitor(
 			}
 		}
 
-		/* NOTE: If we get here then we have the lock mutex. This
-		function will release the lock mutex that we acquired when
-		we called the lock_print_info_summary() function earlier. */
+		/* NOTE: The following function will release the lock_sys.latch
+		that lock_print_info_summary() acquired. */
 
 		lock_print_info_all_transactions(file);
 
@@ -1139,25 +1098,21 @@ srv_export_innodb_status(void)
 
 	export_vars.innodb_pages_written = buf_pool.stat.n_pages_written;
 
-	export_vars.innodb_row_lock_waits = srv_stats.n_lock_wait_count;
+	mysql_mutex_lock(&lock_sys.wait_mutex);
+	export_vars.innodb_row_lock_waits = lock_sys.get_wait_cumulative();
 
-	export_vars.innodb_row_lock_current_waits =
-		srv_stats.n_lock_wait_current_count;
+	export_vars.innodb_row_lock_current_waits= lock_sys.get_wait_pending();
 
-	export_vars.innodb_row_lock_time = srv_stats.n_lock_wait_time / 1000;
+	export_vars.innodb_row_lock_time = lock_sys.get_wait_time_cumulative()
+		/ 1000;
+	export_vars.innodb_row_lock_time_max = lock_sys.get_wait_time_max()
+		/ 1000;
+	mysql_mutex_unlock(&lock_sys.wait_mutex);
 
-	if (srv_stats.n_lock_wait_count > 0) {
-
-		export_vars.innodb_row_lock_time_avg = (ulint)
-			(srv_stats.n_lock_wait_time
-			 / 1000 / srv_stats.n_lock_wait_count);
-
-	} else {
-		export_vars.innodb_row_lock_time_avg = 0;
-	}
-
-	export_vars.innodb_row_lock_time_max =
-		lock_sys.n_lock_max_wait_time / 1000;
+	export_vars.innodb_row_lock_time_avg= export_vars.innodb_row_lock_waits
+		? static_cast<ulint>(export_vars.innodb_row_lock_time
+				     / export_vars.innodb_row_lock_waits)
+		: 0;
 
 	export_vars.innodb_rows_read = srv_stats.n_rows_read;
 
@@ -1272,7 +1227,7 @@ static void srv_monitor()
 		if (srv_print_innodb_monitor) {
 			/* Reset mutex_skipped counter everytime
 			srv_print_innodb_monitor changes. This is to
-			ensure we will not be blocked by lock_sys.mutex
+			ensure we will not be blocked by lock_sys.latch
 			for short duration information printing */
 			if (!monitor_state.last_srv_print_monitor) {
 				monitor_state.mutex_skipped = 0;
@@ -1581,8 +1536,8 @@ static void srv_master_do_disabled_loop()
   srv_main_thread_op_info = "disabled";
   mysql_mutex_lock(&LOCK_global_system_variables);
   while (srv_master_thread_disabled_debug)
-    mysql_cond_wait(&srv_master_thread_disabled_cond,
-                    &LOCK_global_system_variables);
+    my_cond_wait(&srv_master_thread_disabled_cond,
+                 &LOCK_global_system_variables.m_mutex);
   mysql_mutex_unlock(&LOCK_global_system_variables);
   srv_main_thread_op_info = "";
 }
@@ -1598,7 +1553,7 @@ srv_master_thread_disabled_debug_update(THD*, st_mysql_sys_var*, void*,
   const bool disable= *static_cast<const my_bool*>(save);
   srv_master_thread_disabled_debug= disable;
   if (!disable)
-    mysql_cond_signal(&srv_master_thread_disabled_cond);
+    pthread_cond_signal(&srv_master_thread_disabled_cond);
 }
 
 /** Enable the master thread on shutdown. */
@@ -1608,7 +1563,7 @@ void srv_master_thread_enable()
   {
     mysql_mutex_lock(&LOCK_global_system_variables);
     srv_master_thread_disabled_debug= FALSE;
-    mysql_cond_signal(&srv_master_thread_disabled_cond);
+    pthread_cond_signal(&srv_master_thread_disabled_cond);
     mysql_mutex_unlock(&LOCK_global_system_variables);
   }
 }

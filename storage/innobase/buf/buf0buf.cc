@@ -1452,9 +1452,9 @@ bool buf_pool_t::create()
   mysql_mutex_init(flush_list_mutex_key, &flush_list_mutex,
                    MY_MUTEX_INIT_FAST);
 
-  mysql_cond_init(0, &done_flush_LRU, nullptr);
-  mysql_cond_init(0, &done_flush_list, nullptr);
-  mysql_cond_init(0, &do_flush_list, nullptr);
+  pthread_cond_init(&done_flush_LRU, nullptr);
+  pthread_cond_init(&done_flush_list, nullptr);
+  pthread_cond_init(&do_flush_list, nullptr);
 
   try_LRU_scan= true;
 
@@ -1515,9 +1515,9 @@ void buf_pool_t::close()
     allocator.deallocate_large_dodump(chunk->mem, &chunk->mem_pfx);
   }
 
-  mysql_cond_destroy(&done_flush_LRU);
-  mysql_cond_destroy(&done_flush_list);
-  mysql_cond_destroy(&do_flush_list);
+  pthread_cond_destroy(&done_flush_LRU);
+  pthread_cond_destroy(&done_flush_list);
+  pthread_cond_destroy(&do_flush_list);
 
   ut_free(chunks);
   chunks= nullptr;
@@ -1921,7 +1921,7 @@ struct find_interesting_trx
       return;
     if (trx.mysql_thd == nullptr)
       return;
-    if (withdraw_started <= trx.start_time)
+    if (withdraw_started <= trx.start_time_micro)
       return;
 
     if (!found)
@@ -1939,8 +1939,9 @@ struct find_interesting_trx
   }
 
   bool &found;
-  time_t withdraw_started;
-  time_t current_time;
+  /** microsecond_interval_timer() */
+  const ulonglong withdraw_started;
+  const my_hrtime_t current_time;
 };
 
 } // namespace
@@ -2004,8 +2005,8 @@ inline void buf_pool_t::resize()
 
 	buf_resize_status("Withdrawing blocks to be shrunken.");
 
-	time_t		withdraw_started = time(NULL);
-	double		message_interval = 60;
+	ulonglong	withdraw_started = microsecond_interval_timer();
+	ulonglong	message_interval = 60ULL * 1000 * 1000;
 	ulint		retry_interval = 1;
 
 withdraw_retry:
@@ -2021,24 +2022,24 @@ withdraw_retry:
 	/* abort buffer pool load */
 	buf_load_abort();
 
-	const time_t current_time = time(NULL);
+	const ulonglong current_time = microsecond_interval_timer();
 
 	if (should_retry_withdraw
-	    && difftime(current_time, withdraw_started) >= message_interval) {
+	    && current_time - withdraw_started >= message_interval) {
 
-		if (message_interval > 900) {
-			message_interval = 1800;
+		if (message_interval > 900000000) {
+			message_interval = 1800000000;
 		} else {
 			message_interval *= 2;
 		}
 
-		lock_sys.mutex_lock();
-		bool	found = false;
-		trx_sys.trx_list.for_each(find_interesting_trx{
-			found, withdraw_started, current_time});
-		lock_sys.mutex_unlock();
-
+		bool found= false;
+		find_interesting_trx f
+			{found, withdraw_started, my_hrtime_coarse()};
 		withdraw_started = current_time;
+
+		LockMutexGuard g{SRW_LOCK_CALL};
+		trx_sys.trx_list.for_each(f);
 	}
 
 	if (should_retry_withdraw) {
@@ -3541,8 +3542,8 @@ loop:
           We must not hold buf_pool.mutex while waiting. */
           timespec abstime;
           set_timespec_nsec(abstime, 1000000);
-          mysql_cond_timedwait(&buf_pool.done_flush_list, &buf_pool.mutex,
-                               &abstime);
+          my_cond_timedwait(&buf_pool.done_flush_list, &buf_pool.mutex.m_mutex,
+                            &abstime);
         }
         mtr_memo_push(mtr, block, MTR_MEMO_PAGE_X_FIX);
       }
@@ -3566,8 +3567,8 @@ loop:
         /* Wait for buf_page_write_complete() to release the I/O fix. */
         timespec abstime;
         set_timespec_nsec(abstime, 1000000);
-        mysql_cond_timedwait(&buf_pool.done_flush_list, &buf_pool.mutex,
-                             &abstime);
+        my_cond_timedwait(&buf_pool.done_flush_list, &buf_pool.mutex.m_mutex,
+                          &abstime);
         goto loop;
       }
 

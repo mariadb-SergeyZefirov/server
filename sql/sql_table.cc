@@ -80,9 +80,8 @@ static int append_system_key_parts(THD *thd, HA_CREATE_INFO *create_info,
 static int mysql_prepare_create_table(THD *, HA_CREATE_INFO *, Alter_info *,
                                       uint *, handler *, KEY **, uint *, int);
 static uint blob_length_by_type(enum_field_types type);
-static bool fix_constraints_names(THD *thd, List<Virtual_column_info>
-                                  *check_constraint_list,
-                                  const HA_CREATE_INFO *create_info);
+static bool fix_constraints_names(THD *, List<Virtual_column_info> *,
+                                  const HA_CREATE_INFO *);
 
 /**
   @brief Helper function for explain_filename
@@ -2474,7 +2473,7 @@ int mysql_rm_table_no_locks(THD *thd, TABLE_LIST *tables, bool if_exists,
     }
     else
     {
-      if (WSREP(thd) && hton && !wsrep_should_replicate_ddl(thd, hton->db_type))
+      if (WSREP(thd) && hton && !wsrep_should_replicate_ddl(thd, hton))
       {
         error= 1;
         goto err;
@@ -4250,8 +4249,7 @@ mysql_prepare_create_table(THD *thd, HA_CREATE_INFO *create_info,
               key_part_length= MY_MIN(max_key_length, file->max_key_part_length());
               /* not a critical problem */
               push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
-                                  ER_TOO_LONG_KEY,
-                                  ER_THD(thd, ER_TOO_LONG_KEY),
+                                  ER_TOO_LONG_KEY, ER_THD(thd, ER_TOO_LONG_KEY),
                                   key_part_length);
               /* Align key length to multibyte char boundary */
               key_part_length-= key_part_length % sql_field->charset->mbmaxlen;
@@ -4295,7 +4293,7 @@ mysql_prepare_create_table(THD *thd, HA_CREATE_INFO *create_info,
         {
           key_part_length= file->max_key_part_length();
           /* not a critical problem */
-          push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
+          push_warning_printf(thd, Sql_condition::WARN_LEVEL_NOTE,
                               ER_TOO_LONG_KEY, ER_THD(thd, ER_TOO_LONG_KEY),
                               key_part_length);
           /* Align key length to multibyte char boundary */
@@ -4546,8 +4544,6 @@ without_overlaps_err:
         const Virtual_column_info *dup_check;
         while ((dup_check= dup_it++) && dup_check != check)
         {
-          if (!dup_check->name.length || dup_check->automatic_name)
-            continue;
           if (!lex_string_cmp(system_charset_info,
                               &check->name, &dup_check->name))
           {
@@ -4597,7 +4593,8 @@ without_overlaps_err:
                           ER_ILLEGAL_HA_CREATE_OPTION,
                           ER_THD(thd, ER_ILLEGAL_HA_CREATE_OPTION),
                           file->engine_name()->str,
-                          "TRANSACTIONAL=1");
+                          create_info->transactional == HA_CHOICE_YES
+                          ? "TRANSACTIONAL=1" : "TRANSACTIONAL=0");
 
   if (parse_option_list(thd, file->partition_ht(), &create_info->option_struct,
                           &create_info->option_list,
@@ -5561,6 +5558,9 @@ bool mysql_create_table(THD *thd, TABLE_LIST *create_table,
   if (!opt_explicit_defaults_for_timestamp)
     promote_first_timestamp_column(&alter_info->create_list);
 
+  /* We can abort create table for any table type */
+  thd->abort_on_warning= thd->is_strict_mode();
+
   if (mysql_create_table_no_lock(thd, &create_table->db,
                                  &create_table->table_name, create_info,
                                  alter_info,
@@ -5598,6 +5598,8 @@ bool mysql_create_table(THD *thd, TABLE_LIST *create_table,
   }
 
 err:
+  thd->abort_on_warning= 0;
+
   /* In RBR or readonly server we don't need to log CREATE TEMPORARY TABLE */
   if (!result && create_info->tmp_table() &&
       (thd->is_current_stmt_binlog_format_row() || (opt_readonly && !thd->slave_thread)))
@@ -7934,7 +7936,6 @@ static bool mysql_inplace_alter_table(THD *thd,
   Alter_info *alter_info= ha_alter_info->alter_info;
   bool reopen_tables= false;
   bool res;
-  handlerton *hton;
 
   const enum_alter_inplace_result inplace_supported=
     ha_alter_info->inplace_supported;
@@ -8145,20 +8146,22 @@ static bool mysql_inplace_alter_table(THD *thd,
 
   /* Notify the engine that the table definition has changed */
 
-  hton= table->file->partition_ht();
-  if (hton->notify_tabledef_changed)
+  if (table->file->partition_ht()->notify_tabledef_changed)
   {
     char db_buff[FN_REFLEN], table_buff[FN_REFLEN];
+    handlerton *hton= table->file->ht;
     LEX_CSTRING tmp_db, tmp_table;
-    tmp_db.str=    db_buff;
-    tmp_table.str= table_buff;
+
+    tmp_db.str=       db_buff;
+    tmp_table.str=    table_buff;
     tmp_db.length=    tablename_to_filename(table_list->db.str,
                                          db_buff, sizeof(db_buff));
     tmp_table.length= tablename_to_filename(table_list->table_name.str,
                                             table_buff, sizeof(table_buff));
     if ((hton->notify_tabledef_changed)(hton, &tmp_db, &tmp_table,
                                         table->s->frm_image,
-                                        &table->s->tabledef_version))
+                                        &table->s->tabledef_version,
+                                        table->file))
     {
       my_error(HA_ERR_INCOMPATIBLE_DEFINITION, MYF(0));
       DBUG_RETURN(true);
@@ -9067,37 +9070,28 @@ mysql_prepare_alter_table(THD *thd, TABLE *table,
         }
       }
 
-      // NB: `check` is TABLE resident, we must keep it intact.
-      if (keep)
-      {
-        check= check->clone(thd);
-        if (!check)
-        {
-          my_error(ER_OUT_OF_RESOURCES, MYF(0));
-          goto err;
-        }
-      }
-
       if (share->period.constr_name.streq(check->name.str))
       {
-        if (drop_period)
-        {
-          keep= false;
-        }
-        else if(!keep)
+        if (!drop_period && !keep)
         {
           my_error(ER_PERIOD_CONSTRAINT_DROP, MYF(0), check->name.str,
                    share->period.name.str);
           goto err;
         }
-        else
+        keep= keep && !drop_period;
+
+        DBUG_ASSERT(create_info->period_info.constr == NULL || drop_period);
+
+        if (keep)
         {
-          DBUG_ASSERT(create_info->period_info.constr == NULL);
+          Item *expr_copy= check->expr->get_copy(thd);
+          check= new Virtual_column_info();
+          check->name= share->period.constr_name;
+          check->automatic_name= true;
+          check->expr= expr_copy;
           create_info->period_info.constr= check;
-          create_info->period_info.constr->automatic_name= true;
         }
       }
-
       /* see if the constraint depends on *only* on dropped fields */
       if (keep && dropped_fields)
       {
@@ -10001,7 +9995,7 @@ bool mysql_alter_table(THD *thd, const LEX_CSTRING *new_db,
       (thd->lex->sql_command == SQLCOM_ALTER_TABLE ||
        thd->lex->sql_command == SQLCOM_CREATE_INDEX ||
        thd->lex->sql_command == SQLCOM_DROP_INDEX) &&
-      !wsrep_should_replicate_ddl(thd, table_list->table->s->db_type()->db_type))
+      !wsrep_should_replicate_ddl(thd, table_list->table->s->db_type()))
     DBUG_RETURN(true);
 #endif
 

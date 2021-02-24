@@ -332,7 +332,7 @@ static my_bool opt_debugging= 0, opt_external_locking= 0, opt_console= 0;
 static my_bool opt_short_log_format= 0, opt_silent_startup= 0;
 
 ulong max_used_connections;
-static char *mysqld_user, *mysqld_chroot;
+static const char *mysqld_user, *mysqld_chroot;
 static char *default_character_set_name;
 static char *character_set_filesystem_name;
 static char *lc_messages;
@@ -348,7 +348,6 @@ static char compiled_default_collation_name[]= MYSQL_DEFAULT_COLLATION_NAME;
 Thread_cache thread_cache;
 static bool binlog_format_used= false;
 LEX_STRING opt_init_connect, opt_init_slave;
-mysql_cond_t COND_slave_background;
 static DYNAMIC_ARRAY all_options;
 static longlong start_memory_used;
 
@@ -375,6 +374,8 @@ uint volatile global_disable_checkpoint;
 #if defined(_WIN32)
 ulong slow_start_timeout;
 #endif
+static MEM_ROOT startup_root;
+
 /**
    @brief 'grant_option' is used to indicate if privileges needs
    to be checked, in which case the lock, LOCK_grant, is used
@@ -687,7 +688,7 @@ mysql_mutex_t
   LOCK_crypt,
   LOCK_global_system_variables,
   LOCK_user_conn,
-  LOCK_error_messages, LOCK_slave_background;
+  LOCK_error_messages;
 mysql_mutex_t LOCK_stats, LOCK_global_user_client_stats,
               LOCK_global_table_stats, LOCK_global_index_stats;
 
@@ -906,8 +907,7 @@ PSI_mutex_key key_LOCK_stats,
 PSI_mutex_key key_LOCK_gtid_waiting;
 
 PSI_mutex_key key_LOCK_after_binlog_sync;
-PSI_mutex_key key_LOCK_prepare_ordered, key_LOCK_commit_ordered,
-  key_LOCK_slave_background;
+PSI_mutex_key key_LOCK_prepare_ordered, key_LOCK_commit_ordered;
 PSI_mutex_key key_TABLE_SHARE_LOCK_share;
 PSI_mutex_key key_LOCK_ack_receiver;
 
@@ -980,7 +980,6 @@ static PSI_mutex_info all_server_mutexes[]=
   { &key_LOCK_prepare_ordered, "LOCK_prepare_ordered", PSI_FLAG_GLOBAL},
   { &key_LOCK_after_binlog_sync, "LOCK_after_binlog_sync", PSI_FLAG_GLOBAL},
   { &key_LOCK_commit_ordered, "LOCK_commit_ordered", PSI_FLAG_GLOBAL},
-  { &key_LOCK_slave_background, "LOCK_slave_background", PSI_FLAG_GLOBAL},
   { &key_PARTITION_LOCK_auto_inc, "HA_DATA_PARTITION::LOCK_auto_inc", 0},
   { &key_LOCK_slave_state, "LOCK_slave_state", 0},
   { &key_LOCK_start_thread, "LOCK_start_thread", PSI_FLAG_GLOBAL},
@@ -1049,7 +1048,7 @@ PSI_cond_key key_TC_LOG_MMAP_COND_queue_busy;
 PSI_cond_key key_COND_rpl_thread_queue, key_COND_rpl_thread,
   key_COND_rpl_thread_stop, key_COND_rpl_thread_pool,
   key_COND_parallel_entry, key_COND_group_commit_orderer,
-  key_COND_prepare_ordered, key_COND_slave_background;
+  key_COND_prepare_ordered;
 PSI_cond_key key_COND_wait_gtid, key_COND_gtid_ignore_duplicates;
 PSI_cond_key key_COND_ack_receiver;
 
@@ -1095,7 +1094,6 @@ static PSI_cond_info all_server_conds[]=
   { &key_COND_parallel_entry, "COND_parallel_entry", 0},
   { &key_COND_group_commit_orderer, "COND_group_commit_orderer", 0},
   { &key_COND_prepare_ordered, "COND_prepare_ordered", 0},
-  { &key_COND_slave_background, "COND_slave_background", 0},
   { &key_COND_start_thread, "COND_start_thread", PSI_FLAG_GLOBAL},
   { &key_COND_wait_gtid, "COND_wait_gtid", 0},
   { &key_COND_gtid_ignore_duplicates, "COND_gtid_ignore_duplicates", 0},
@@ -1476,7 +1474,8 @@ static int mysql_init_variables(void);
 static int get_options(int *argc_ptr, char ***argv_ptr);
 static bool add_terminator(DYNAMIC_ARRAY *options);
 static bool add_many_options(DYNAMIC_ARRAY *, my_option *, size_t);
-extern "C" my_bool mysqld_get_one_option(const struct my_option *, char *, const char *);
+extern "C" my_bool mysqld_get_one_option(const struct my_option *, const char *,
+                                         const char *);
 static int init_thread_environment();
 static char *get_relative_path(const char *path);
 static int fix_paths(void);
@@ -1511,31 +1510,9 @@ static void end_ssl();
 /* common callee of two shutdown phases */
 static void kill_thread(THD *thd)
 {
-  if (WSREP(thd)) mysql_mutex_lock(&thd->LOCK_thd_data);
   mysql_mutex_lock(&thd->LOCK_thd_kill);
-  if (thd->mysys_var)
-  {
-    thd->mysys_var->abort= 1;
-    mysql_mutex_lock(&thd->mysys_var->mutex);
-    if (thd->mysys_var->current_cond)
-    {
-      for (uint i= 0; i < 2; i++)
-      {
-        int ret= mysql_mutex_trylock(thd->mysys_var->current_mutex);
-        mysql_cond_broadcast(thd->mysys_var->current_cond);
-        if (!ret)
-        {
-          /* Thread has surely got the signal, unlock and abort */
-          mysql_mutex_unlock(thd->mysys_var->current_mutex);
-          break;
-        }
-        sleep(1);
-      }
-    }
-    mysql_mutex_unlock(&thd->mysys_var->mutex);
-  }
+  thd->abort_current_cond_wait(true);
   mysql_mutex_unlock(&thd->LOCK_thd_kill);
-  if (WSREP(thd)) mysql_mutex_unlock(&thd->LOCK_thd_data);
 }
 
 
@@ -1889,6 +1866,7 @@ extern "C" void unireg_abort(int exit_code)
     wsrep_deinit(true);
     wsrep_deinit_server();
   }
+  wsrep_sst_auth_free();
 #endif // WITH_WSREP
 
   clean_up(!opt_abort && (exit_code || !opt_bootstrap)); /* purecov: inspected */
@@ -2028,6 +2006,7 @@ static void clean_up(bool print_message)
   thread_scheduler= 0;
   mysql_library_end();
   finish_client_errs();
+  free_root(&startup_root, MYF(0));
   cleanup_errmsgs();
   free_error_messages();
   /* Tell main we are ready */
@@ -2120,8 +2099,6 @@ static void clean_up_mutexes()
   mysql_cond_destroy(&COND_prepare_ordered);
   mysql_mutex_destroy(&LOCK_after_binlog_sync);
   mysql_mutex_destroy(&LOCK_commit_ordered);
-  mysql_mutex_destroy(&LOCK_slave_background);
-  mysql_cond_destroy(&COND_slave_background);
 #ifndef EMBEDDED_LIBRARY
   mysql_mutex_destroy(&LOCK_error_log);
 #endif
@@ -3628,6 +3605,7 @@ static int init_early_variables()
   set_current_thd(0);
   set_malloc_size_cb(my_malloc_size_cb_func);
   global_status_var.global_memory_used= 0;
+  init_alloc_root(PSI_NOT_INSTRUMENTED, &startup_root, 1024, 0, MYF(0));
   return 0;
 }
 
@@ -4256,9 +4234,6 @@ static int init_thread_environment()
                    MY_MUTEX_INIT_SLOW);
   mysql_mutex_init(key_LOCK_commit_ordered, &LOCK_commit_ordered,
                    MY_MUTEX_INIT_SLOW);
-  mysql_mutex_init(key_LOCK_slave_background, &LOCK_slave_background,
-                   MY_MUTEX_INIT_SLOW);
-  mysql_cond_init(key_COND_slave_background, &COND_slave_background, NULL);
 
 #ifdef HAVE_OPENSSL
   mysql_mutex_init(key_LOCK_des_key_file,
@@ -5061,6 +5036,10 @@ static int init_server_components()
       that there are unprocessed options.
     */
     my_getopt_skip_unknown= 0;
+#ifdef WITH_WSREP
+    if (wsrep_recovery)
+      my_getopt_skip_unknown= TRUE;
+#endif
 
     if ((ho_error= handle_options(&remaining_argc, &remaining_argv, removed_opts,
                                   mysqld_get_one_option)))
@@ -5070,19 +5049,26 @@ static int init_server_components()
     remaining_argv--;
     my_getopt_skip_unknown= TRUE;
 
-    if (remaining_argc > 1)
+#ifdef WITH_WSREP
+    if (!wsrep_recovery)
     {
-      fprintf(stderr, "%s: Too many arguments (first extra is '%s').\n",
-              my_progname, remaining_argv[1]);
-      unireg_abort(1);
+#endif
+      if (remaining_argc > 1)
+      {
+        fprintf(stderr, "%s: Too many arguments (first extra is '%s').\n",
+                my_progname, remaining_argv[1]);
+        unireg_abort(1);
+      }
+#ifdef WITH_WSREP
     }
+#endif
   }
-
-  if (init_io_cache_encryption())
-    unireg_abort(1);
 
   if (opt_abort)
     unireg_abort(0);
+
+  if (init_io_cache_encryption())
+    unireg_abort(1);
 
   /* if the errmsg.sys is not loaded, terminate to maintain behaviour */
   if (!DEFAULT_ERRMSGS[0][0])
@@ -5610,9 +5596,12 @@ int mysqld_main(int argc, char **argv)
         wsrep_init_startup(false);
       }
       wsrep_new_cluster= false;
-      WSREP_DEBUG("Startup creating %ld applier threads running %lu",
-	      wsrep_slave_threads - 1, wsrep_running_applier_threads);
-      wsrep_create_appliers(wsrep_slave_threads - 1);
+      if (wsrep_cluster_address_exists())
+      {
+        WSREP_DEBUG("Startup creating %ld applier threads running %lu",
+                wsrep_slave_threads - 1, wsrep_running_applier_threads);
+        wsrep_create_appliers(wsrep_slave_threads - 1);
+      }
     }
   }
 #endif /* WITH_WSREP */
@@ -7674,7 +7663,7 @@ static int mysql_init_variables(void)
 }
 
 my_bool
-mysqld_get_one_option(const struct my_option *opt, char *argument,
+mysqld_get_one_option(const struct my_option *opt, const char *argument,
                       const char *filename)
 {
   if (opt->app_type)
@@ -7851,31 +7840,43 @@ mysqld_get_one_option(const struct my_option *opt, char *argument,
   case (int)OPT_REPLICATE_REWRITE_DB:
   {
     /* See also OPT_REWRITE_DB handling in client/mysqlbinlog.cc */
-    char* key = argument,*p, *val;
+    const char* key= argument, *ptr, *val;
 
-    if (!(p= strstr(argument, "->")))
+    // Skipp pre-space in key
+    while (*key && my_isspace(mysqld_charset, *key))
+      key++;
+
+    // Where val begins
+    if (!(ptr= strstr(key, "->")))
     {
-      sql_print_error("Bad syntax in replicate-rewrite-db - missing '->'!");
+      sql_print_error("Bad syntax in replicate-rewrite-db: missing '->'");
       return 1;
     }
-    val= p--;
-    while (my_isspace(mysqld_charset, *p) && p > argument)
-      *p-- = 0;
-    /* Db name can be one char also */
-    if (p == argument && my_isspace(mysqld_charset, *p))
+    val= ptr+2;
+
+    // Skip blanks at the end of key
+    while (ptr > key && my_isspace(mysqld_charset, ptr[-1]))
+      ptr--;
+    if (ptr == key)
     {
-      sql_print_error("Bad syntax in replicate-rewrite-db - empty FROM db!");
+      sql_print_error("Bad syntax in replicate-rewrite-db - empty FROM db");
       return 1;
     }
-    *val= 0;
-    val+= 2;
+    key= strmake_root(&startup_root, key, (size_t) (ptr-key));
+
+    /* Skipp pre space in value */
     while (*val && my_isspace(mysqld_charset, *val))
       val++;
-    if (!*val)
+
+    // Value ends with \0 or space
+    for (ptr= val; *ptr && !my_isspace(&my_charset_latin1, *ptr) ; ptr++)
+    {}
+    if (ptr == val)
     {
-      sql_print_error("Bad syntax in replicate-rewrite-db - empty TO db!");
+      sql_print_error("Bad syntax in replicate-rewrite-db - empty TO db");
       return 1;
     }
+    val= strmake_root(&startup_root, val, (size_t) (ptr-val));
 
     cur_rpl_filter->add_db_rewrite(key, val);
     break;
@@ -7902,7 +7903,7 @@ mysqld_get_one_option(const struct my_option *opt, char *argument,
   {
     if (cur_rpl_filter->add_do_table(argument))
     {
-      sql_print_error("Could not add do table rule '%s'!", argument);
+      sql_print_error("Could not add do table rule '%s'", argument);
       return 1;
     }
     break;
@@ -7911,7 +7912,7 @@ mysqld_get_one_option(const struct my_option *opt, char *argument,
   {
     if (cur_rpl_filter->add_wild_do_table(argument))
     {
-      sql_print_error("Could not add do table rule '%s'!", argument);
+      sql_print_error("Could not add do table rule '%s'", argument);
       return 1;
     }
     break;
@@ -7920,7 +7921,7 @@ mysqld_get_one_option(const struct my_option *opt, char *argument,
   {
     if (cur_rpl_filter->add_wild_ignore_table(argument))
     {
-      sql_print_error("Could not add ignore table rule '%s'!", argument);
+      sql_print_error("Could not add ignore table rule '%s'", argument);
       return 1;
     }
     break;
@@ -7929,7 +7930,7 @@ mysqld_get_one_option(const struct my_option *opt, char *argument,
   {
     if (cur_rpl_filter->add_ignore_table(argument))
     {
-      sql_print_error("Could not add ignore table rule '%s'!", argument);
+      sql_print_error("Could not add ignore table rule '%s'", argument);
       return 1;
     }
     break;
@@ -8040,10 +8041,14 @@ mysqld_get_one_option(const struct my_option *opt, char *argument,
 #ifdef WITH_PERFSCHEMA_STORAGE_ENGINE
 #ifndef EMBEDDED_LIBRARY
     /* Parse instrument name and value from argument string */
-    char* name = argument,*p, *val;
+    const char *name= argument, *ptr, *val;
+
+    /* Trim leading spaces from instrument name */
+    while (*name && my_isspace(mysqld_charset, *name))
+      name++;
 
     /* Assignment required */
-    if (!(p= strchr(argument, '=')))
+    if (!(ptr= strchr(name, '=')))
     {
        my_getopt_error_reporter(WARNING_LEVEL,
                              "Missing value for performance_schema_instrument "
@@ -8052,54 +8057,43 @@ mysqld_get_one_option(const struct my_option *opt, char *argument,
     }
 
     /* Option value */
-    val= p + 1;
-    if (!*val)
-    {
-       my_getopt_error_reporter(WARNING_LEVEL,
-                             "Missing value for performance_schema_instrument "
-                             "'%s'", argument);
-      return 0;
-    }
-
-    /* Trim leading spaces from instrument name */
-    while (*name && my_isspace(mysqld_charset, *name))
-      name++;
+    val= ptr + 1;
 
     /* Trim trailing spaces and slashes from instrument name */
-    while (p > argument && (my_isspace(mysqld_charset, p[-1]) || p[-1] == '/'))
-      p--;
-    *p= 0;
-
-    if (!*name)
+    while (ptr > name && (my_isspace(mysqld_charset, ptr[-1]) ||
+                          ptr[-1] == '/'))
+      ptr--;
+    if (ptr == name)
     {
        my_getopt_error_reporter(WARNING_LEVEL,
                              "Invalid instrument name for "
-                             "performance_schema_instrument '%s'", argument);
-      return 0;
+                             "performance_schema_instrument '%s'", name);
+       return 0;
     }
+    name= strmake_root(&startup_root, name, (size_t) (ptr - name));
 
     /* Trim leading spaces from option value */
     while (*val && my_isspace(mysqld_charset, *val))
       val++;
 
-    /* Trim trailing spaces from option value */
-    if ((p= my_strchr(mysqld_charset, val, val+strlen(val), ' ')) != NULL)
-      *p= 0;
-
-    if (!*val)
+    /* Find end of value */
+    for (ptr= val; *ptr && !my_isspace(mysqld_charset, *ptr) ; ptr++)
+    {}
+    if (ptr == val)
     {
        my_getopt_error_reporter(WARNING_LEVEL,
-                             "Invalid value for performance_schema_instrument "
-                             "'%s'", argument);
+                             "No value for performance_schema_instrument "
+                             "'%s'", name);
       return 0;
     }
+    val= strmake_root(&startup_root, val, (size_t) (ptr - val));
 
     /* Add instrument name and value to array of configuration options */
     if (add_pfs_instr_to_array(name, val))
     {
        my_getopt_error_reporter(WARNING_LEVEL,
                              "Invalid value for performance_schema_instrument "
-                             "'%s'", argument);
+                             "'%s'", name);
       return 0;
     }
 #endif /* EMBEDDED_LIBRARY */
@@ -8266,7 +8260,8 @@ static int get_options(int *argc_ptr, char ***argv_ptr)
   /* Skip unknown options so that they may be processed later by plugins */
   my_getopt_skip_unknown= TRUE;
 
-  if ((ho_error= handle_options(argc_ptr, argv_ptr, (my_option*)(all_options.buffer),
+  if ((ho_error= handle_options(argc_ptr, argv_ptr,
+                                (my_option*) (all_options.buffer),
                                 mysqld_get_one_option)))
     return ho_error;
 

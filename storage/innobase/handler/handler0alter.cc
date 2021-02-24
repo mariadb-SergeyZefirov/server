@@ -3360,9 +3360,9 @@ innobase_row_to_mysql(
 		}
 	}
 	if (table->vfield) {
-		my_bitmap_map*	old_read_set = tmp_use_all_columns(table, table->read_set);
+		MY_BITMAP*	old_read_set = tmp_use_all_columns(table, &table->read_set);
 		table->update_virtual_fields(table->file, VCOL_UPDATE_FOR_READ);
-		tmp_restore_column_map(table->read_set, old_read_set);
+		tmp_restore_column_map(&table->read_set, old_read_set);
 	}
 }
 
@@ -7083,8 +7083,6 @@ op_ok:
 	row_mysql_unlock_data_dictionary(ctx->trx);
 	dict_locked = false;
 
-	ut_ad(!ctx->trx->lock.n_active_thrs);
-
 	if (ctx->old_table->fts) {
 		fts_sync_during_ddl(ctx->old_table);
 	}
@@ -8900,6 +8898,7 @@ innobase_rename_column_try(
 	const char*			to)
 {
 	dberr_t		error;
+	bool clust_has_prefixes = false;
 
 	DBUG_ENTER("innobase_rename_column_try");
 
@@ -8959,6 +8958,39 @@ innobase_rename_column_try(
 			if (error != DB_SUCCESS) {
 				goto err_exit;
 			}
+
+			if (!has_prefixes || !clust_has_prefixes
+			    || f.prefix_len) {
+				continue;
+			}
+
+			/* For secondary indexes, the
+			has_prefixes check can be 'polluted'
+			by PRIMARY KEY column prefix. Try also
+			the simpler encoding of SYS_FIELDS.POS. */
+			info = pars_info_create();
+
+			pars_info_add_ull_literal(info, "indexid", index->id);
+			pars_info_add_int4_literal(info, "nth", i);
+			pars_info_add_str_literal(info, "new", to);
+
+			error = que_eval_sql(
+				info,
+				"PROCEDURE RENAME_SYS_FIELDS_PROC () IS\n"
+				"BEGIN\n"
+				"UPDATE SYS_FIELDS SET COL_NAME=:new\n"
+				"WHERE INDEX_ID=:indexid\n"
+				"AND POS=:nth;\n"
+				"END;\n",
+				FALSE, trx);
+
+			if (error != DB_SUCCESS) {
+				goto err_exit;
+			}
+		}
+
+		if (index == dict_table_get_first_index(ctx.old_table)) {
+			clust_has_prefixes = has_prefixes;
 		}
 	}
 
@@ -11260,12 +11292,18 @@ foreign_fail:
 		&& m_prebuilt->table->n_v_cols
 		&& ha_alter_info->handler_flags & ALTER_STORED_COLUMN_ORDER)) {
 		DBUG_ASSERT(ctx0->old_table->get_ref_count() == 1);
+		ut_ad(ctx0->prebuilt == m_prebuilt);
 		trx_commit_for_mysql(m_prebuilt->trx);
 
-		m_prebuilt->table = innobase_reload_table(m_user_thd,
-							  m_prebuilt->table,
-							  table->s->table_name,
-							  *ctx0);
+		for (inplace_alter_handler_ctx** pctx = ctx_array; *pctx;
+		     pctx++) {
+			auto ctx= static_cast<ha_innobase_inplace_ctx*>(*pctx);
+			ctx->prebuilt->table = innobase_reload_table(
+				m_user_thd, ctx->prebuilt->table,
+				table->s->table_name, *ctx);
+			innobase_copy_frm_flags_from_table_share(
+				ctx->prebuilt->table, altered_table->s);
+		}
 
 		row_mysql_unlock_data_dictionary(trx);
 		trx->free();

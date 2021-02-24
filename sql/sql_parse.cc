@@ -1168,24 +1168,54 @@ static enum enum_server_command fetch_command(THD *thd, char *packet)
 
 /**
   Read one command from connection and execute it (query or simple command).
-  This function is called in loop from thread function.
+  This function is to be used by different schedulers (one-thread-per-connection,
+  pool-of-threads)
 
   For profiling to work, it must never be called recursively.
 
+  @param thd - client connection context
+
+  @param blocking - wait for command to finish.
+                    if false (nonblocking), then the function might
+                    return when command is "half-finished", with
+                    DISPATCH_COMMAND_WOULDBLOCK.
+                    Currenly, this can *only* happen when using
+                    threadpool. The command will resume, after all outstanding
+                    async operations (i.e group commit) finish.
+                    Threadpool scheduler takes care of "resume".
+
   @retval
-    0  success
+    DISPATCH_COMMAND_SUCCESS - success
   @retval
-    1  request of thread shutdown (see dispatch_command() description)
+    DISPATCH_COMMAND_CLOSE_CONNECTION  request of THD shutdown
+          (s. dispatch_command() description)
+  @retval
+    DISPATCH_COMMAND_WOULDBLOCK - need to wait for asyncronous operations
+                                  to finish. Only returned if parameter
+                                  'blocking' is false.
 */
 
-bool do_command(THD *thd)
+dispatch_command_return do_command(THD *thd, bool blocking)
 {
-  bool return_value;
+  dispatch_command_return return_value;
   char *packet= 0;
   ulong packet_length;
   NET *net= &thd->net;
   enum enum_server_command command;
   DBUG_ENTER("do_command");
+
+  DBUG_ASSERT(!thd->async_state.pending_ops());
+  if (thd->async_state.m_state == thd_async_state::enum_async_state::RESUMED)
+  {
+    /*
+     Resuming previously suspended command.
+     Restore the state
+    */
+    command = thd->async_state.m_command;
+    packet = thd->async_state.m_packet.str;
+    packet_length = (ulong)thd->async_state.m_packet.length;
+    goto resume;
+  }
 
   /*
     indicator of uninitialized lex => normal flow of errors handling
@@ -1253,12 +1283,12 @@ bool do_command(THD *thd)
 
     if (net->error != 3)
     {
-      return_value= TRUE;                       // We have to close it.
+      return_value= DISPATCH_COMMAND_CLOSE_CONNECTION;     // We have to close it.
       goto out;
     }
 
     net->error= 0;
-    return_value= FALSE;
+    return_value= DISPATCH_COMMAND_SUCCESS;
     goto out;
   }
 
@@ -1325,7 +1355,7 @@ bool do_command(THD *thd)
       MYSQL_END_STATEMENT(thd->m_statement_psi, thd->get_stmt_da());
       thd->m_statement_psi= NULL;
       thd->m_digest= NULL;
-      return_value= FALSE;
+      return_value= DISPATCH_COMMAND_SUCCESS;
 
       wsrep_after_command_before_result(thd);
       goto out;
@@ -1351,7 +1381,7 @@ bool do_command(THD *thd)
       thd->m_statement_psi= NULL;
       thd->m_digest= NULL;
 
-      return_value= FALSE;
+      return_value= DISPATCH_COMMAND_SUCCESS;
       wsrep_after_command_before_result(thd);
       goto out;
     }
@@ -1362,8 +1392,18 @@ bool do_command(THD *thd)
 
   DBUG_ASSERT(packet_length);
   DBUG_ASSERT(!thd->apc_target.is_enabled());
+
+resume:
   return_value= dispatch_command(command, thd, packet+1,
-                                 (uint) (packet_length-1));
+                                 (uint) (packet_length-1), blocking);
+  if (return_value == DISPATCH_COMMAND_WOULDBLOCK)
+  {
+    /* Save current state, and resume later.*/
+    thd->async_state.m_command= command;
+    thd->async_state.m_packet={packet,packet_length};
+    DBUG_RETURN(return_value);
+  }
+
   DBUG_ASSERT(!thd->apc_target.is_enabled());
 
 out:
@@ -1510,6 +1550,13 @@ public:
   @param packet_length   length of packet + 1 (to show that data is
                          null-terminated) except for COM_SLEEP, where it
                          can be zero.
+  @param blocking        if false (nonblocking), then the function might
+                         return when command is "half-finished", with
+                         DISPATCH_COMMAND_WOULDBLOCK.
+                         Currenly, this can *only* happen when using threadpool.
+                         The current command will resume, after all outstanding
+                         async operations (i.e group commit) finish.
+                         Threadpool scheduler takes care of "resume".
 
   @todo
     set thd->lex->sql_command to SQLCOM_END here.
@@ -1522,8 +1569,8 @@ public:
     1   request of thread shutdown, i. e. if command is
         COM_QUIT/COM_SHUTDOWN
 */
-bool dispatch_command(enum enum_server_command command, THD *thd,
-		      char* packet, uint packet_length)
+dispatch_command_return dispatch_command(enum enum_server_command command, THD *thd,
+		      char* packet, uint packet_length, bool blocking)
 {
   NET *net= &thd->net;
   bool error= 0;
@@ -1534,6 +1581,12 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
                        command_name[command].str :
                        "<?>")));
   bool drop_more_results= 0;
+
+  if (thd->async_state.m_state == thd_async_state::enum_async_state::RESUMED)
+  {
+    thd->async_state.m_state = thd_async_state::enum_async_state::NONE;
+    goto resume;
+  }
 
   /* keep it withing 1 byte */
   compile_time_assert(COM_END == 255);
@@ -2186,6 +2239,7 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
       break;
     general_log_print(thd, command, NullS);
     status_var_increment(thd->status_var.com_stat[SQLCOM_SHOW_STATUS]);
+    *current_global_status_var= global_status_var;
     calc_sum_of_all_status(current_global_status_var);
     if (!(uptime= (ulong) (thd->start_time - server_start_time)))
       queries_per_second1000= 0;
@@ -2265,6 +2319,7 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
     general_log_print(thd, command, NullS);
     my_eof(thd);
     break;
+
   case COM_SLEEP:
   case COM_CONNECT:				// Impossible here
   case COM_TIME:				// Impossible from client
@@ -2278,7 +2333,18 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
   }
 
 dispatch_end:
-  do_end_of_statement= true;
+  /*
+   For the threadpool i.e if non-blocking call, if not all async operations
+   are finished, return without cleanup. The cleanup will be done on
+   later, when command execution is resumed.
+  */
+  if (!blocking && !error && thd->async_state.pending_ops())
+  {
+    DBUG_RETURN(DISPATCH_COMMAND_WOULDBLOCK);
+  }
+
+resume:
+
 #ifdef WITH_WSREP
   /*
     Next test should really be WSREP(thd), but that causes a failure when doing
@@ -2382,7 +2448,7 @@ dispatch_end:
   /* Check that some variables are reset properly */
   DBUG_ASSERT(thd->abort_on_warning == 0);
   thd->lex->restore_set_statement_var();
-  DBUG_RETURN(error);
+  DBUG_RETURN(error?DISPATCH_COMMAND_CLOSE_CONNECTION: DISPATCH_COMMAND_SUCCESS);
 }
 
 static bool slow_filter_masked(THD *thd, ulonglong mask)
@@ -3707,6 +3773,11 @@ mysql_execute_command(THD *thd)
   thd->set_query_timer();
 
 #ifdef WITH_WSREP
+  /* Check wsrep_mode rules before command execution. */
+  if (WSREP(thd) &&
+      wsrep_thd_is_local(thd) && !wsrep_check_mode_before_cmd_execute(thd))
+    goto error;
+
   /*
     Always start a new transaction for a wsrep THD unless the
     current command is DDL or explicit BEGIN. This will guarantee that
@@ -9020,10 +9091,9 @@ struct find_thread_callback_arg
 };
 
 
-my_bool find_thread_callback(THD *thd, find_thread_callback_arg *arg)
+static my_bool find_thread_callback(THD *thd, find_thread_callback_arg *arg)
 {
-  if (thd->get_command() != COM_DAEMON &&
-      arg->id == (arg->query_id ? thd->query_id : (longlong) thd->thread_id))
+  if (arg->id == (arg->query_id ? thd->query_id : (longlong) thd->thread_id))
   {
     mysql_mutex_lock(&thd->LOCK_thd_kill);    // Lock from delete
     arg->thd= thd;
@@ -9039,27 +9109,6 @@ THD *find_thread_by_id(longlong id, bool query_id)
   server_threads.iterate(find_thread_callback, &arg);
   return arg.thd;
 }
-
-#ifdef WITH_WSREP
-my_bool find_thread_with_thd_data_lock_callback(THD *thd, find_thread_callback_arg *arg)
-{
-  if (thd->get_command() != COM_DAEMON &&
-      arg->id == (arg->query_id ? thd->query_id : (longlong) thd->thread_id))
-  {
-    if (WSREP(thd)) mysql_mutex_lock(&thd->LOCK_thd_data);
-    mysql_mutex_lock(&thd->LOCK_thd_kill);    // Lock from delete
-    arg->thd= thd;
-    return 1;
-  }
-  return 0;
-}
-THD *find_thread_by_id_with_thd_data_lock(longlong id, bool query_id)
-{
-  find_thread_callback_arg arg(id, query_id);
-  server_threads.iterate(find_thread_with_thd_data_lock_callback, &arg);
-  return arg.thd;
-}
-#endif
 
 /**
   kill one thread.
@@ -9077,11 +9126,11 @@ kill_one_thread(THD *thd, longlong id, killed_state kill_signal, killed_type typ
   uint error= (type == KILL_TYPE_QUERY ? ER_NO_SUCH_QUERY : ER_NO_SUCH_THREAD);
   DBUG_ENTER("kill_one_thread");
   DBUG_PRINT("enter", ("id: %lld  signal: %u", id, (uint) kill_signal));
-#ifdef WITH_WSREP
-  if (id && (tmp= find_thread_by_id_with_thd_data_lock(id, type == KILL_TYPE_QUERY)))
-#else
-  if (id && (tmp= find_thread_by_id(id, type == KILL_TYPE_QUERY)))
-#endif
+  tmp= find_thread_by_id(id, type == KILL_TYPE_QUERY);
+  if (!tmp)
+    DBUG_RETURN(error);
+
+  if (tmp->get_command() != COM_DAEMON)
   {
     /*
       If we're SUPER, we can KILL anything, including system-threads.
@@ -9104,6 +9153,7 @@ kill_one_thread(THD *thd, longlong id, killed_state kill_signal, killed_type typ
       faster and do a harder kill than KILL_SYSTEM_THREAD;
     */
 
+    mysql_mutex_lock(&tmp->LOCK_thd_data); // for various wsrep* checks below
 #ifdef WITH_WSREP
     if (((thd->security_ctx->master_access & PRIV_KILL_OTHER_USER_PROCESS) ||
         thd->security_ctx->user_matches(tmp->security_ctx)) &&
@@ -9125,8 +9175,8 @@ kill_one_thread(THD *thd, longlong id, killed_state kill_signal, killed_type typ
       else
 #endif /* WITH_WSREP */
       {
-      WSREP_DEBUG("kill_one_thread %llu, victim: %llu wsrep_aborter %llu by signal %d",
-                  thd->thread_id, id, tmp->wsrep_aborter, kill_signal);
+        WSREP_DEBUG("kill_one_thread %llu, victim: %llu wsrep_aborter %llu by signal %d",
+                    thd->thread_id, id, tmp->wsrep_aborter, kill_signal);
         tmp->awake_no_mutex(kill_signal);
         WSREP_DEBUG("victim: %llu taken care of", id);
         error= 0;
@@ -9135,11 +9185,9 @@ kill_one_thread(THD *thd, longlong id, killed_state kill_signal, killed_type typ
     else
       error= (type == KILL_TYPE_QUERY ? ER_KILL_QUERY_DENIED_ERROR :
                                         ER_KILL_DENIED_ERROR);
-#ifdef WITH_WSREP
-    if (WSREP(tmp)) mysql_mutex_unlock(&tmp->LOCK_thd_data);
-#endif
-    mysql_mutex_unlock(&tmp->LOCK_thd_kill);
+    mysql_mutex_unlock(&tmp->LOCK_thd_data);
   }
+  mysql_mutex_unlock(&tmp->LOCK_thd_kill);
   DBUG_PRINT("exit", ("%d", error));
   DBUG_RETURN(error);
 }
@@ -9186,8 +9234,8 @@ static my_bool kill_threads_callback(THD *thd, kill_threads_callback_arg *arg)
         return 1;
       if (!arg->threads_to_kill.push_back(thd, arg->thd->mem_root))
       {
-        if (WSREP(thd)) mysql_mutex_lock(&thd->LOCK_thd_data);
         mysql_mutex_lock(&thd->LOCK_thd_kill); // Lock from delete
+        mysql_mutex_lock(&thd->LOCK_thd_data);
       }
     }
   }
@@ -9230,7 +9278,7 @@ static uint kill_threads_for_user(THD *thd, LEX_USER *user,
       */
       next_ptr= it2++;
       mysql_mutex_unlock(&ptr->LOCK_thd_kill);
-      if (WSREP(ptr)) mysql_mutex_unlock(&ptr->LOCK_thd_data);
+      mysql_mutex_unlock(&ptr->LOCK_thd_data);
       (*rows)++;
     } while ((ptr= next_ptr));
   }

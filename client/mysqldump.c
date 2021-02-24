@@ -42,6 +42,11 @@
 /* on merge conflict, bump to a higher version again */
 #define DUMP_VERSION "10.19"
 
+/**
+  First mysql version supporting sequences.
+*/
+#define FIRST_SEQUENCE_VERSION 100300
+
 #include <my_global.h>
 #include <my_sys.h>
 #include <my_user.h>
@@ -92,6 +97,11 @@
 
 /* Max length GTID position that we will output. */
 #define MAX_GTID_LENGTH 1024
+
+/* Dump sequence/tables control */
+#define DUMP_TABLE_ALL -1
+#define DUMP_TABLE_TABLE 0
+#define DUMP_TABLE_SEQUENCE 1
 
 static my_bool ignore_table_data(const uchar *hash_key, size_t len);
 static void add_load_option(DYNAMIC_STRING *str, const char *option,
@@ -144,9 +154,9 @@ static char  *opt_password=0,*current_user=0,
              *current_host=0,*path=0,*fields_terminated=0,
              *lines_terminated=0, *enclosed=0, *opt_enclosed=0, *escaped=0,
              *where=0, *order_by=0,
-             *opt_compatible_mode_str= 0,
              *err_ptr= 0,
              *log_error_file= NULL;
+static const char *opt_compatible_mode_str= 0;
 static char **defaults_argv= 0;
 static char compatible_mode_normal_str[255];
 /* Server supports character_set_results session variable? */
@@ -279,7 +289,7 @@ static struct my_option my_long_options[] =
    "no_table_options, no_field_options. One can use several modes separated "
    "by commas. Note: Requires MariaDB server version 4.1.0 or higher. "
    "This option is ignored with earlier server versions.",
-   &opt_compatible_mode_str, &opt_compatible_mode_str, 0,
+   (char**) &opt_compatible_mode_str, (char**) &opt_compatible_mode_str, 0,
    GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
   {"compact", OPT_COMPACT,
    "Give less verbose output (useful for debugging). Disables structure "
@@ -849,7 +859,8 @@ uchar* get_table_key(const char *entry, size_t *length,
 
 static my_bool
 get_one_option(const struct my_option *opt,
-               char *argument, const char *filename __attribute__((unused)))
+               const char *argument,
+               const char *filename __attribute__((unused)))
 {
   switch (opt->id) {
   case 'p':
@@ -857,10 +868,15 @@ get_one_option(const struct my_option *opt,
       argument= (char*) "";                     /* Don't require password */
     if (argument)
     {
-      char *start=argument;
+      /*
+        One should not really change the argument, but we make an
+        exception for passwords
+      */
+      char *start= (char*) argument;
       my_free(opt_password);
       opt_password= my_strdup(PSI_NOT_INSTRUMENTED, argument, MYF(MY_FAE));
-      while (*argument) *argument++= 'x';               /* Destroy argument */
+      while (*argument)
+        *(char*) argument++= 'x';               /* Destroy argument */
       if (*start)
         start[1]=0;                             /* Cut length of argument */
       tty_password= 0;
@@ -1072,6 +1088,22 @@ static int get_options(int *argc, char ***argv)
 
   if ((ho_error= handle_options(argc, argv, my_long_options, get_one_option)))
     return(ho_error);
+
+  /*
+    Dumping under --system=stats with --replace or --inser-ignore is safe and will not
+    retult into race condition. Otherwise dump only structure and ignore data by default
+    while dumping.
+  */
+  if (!(opt_system & OPT_SYSTEM_STATS) && !(opt_ignore || opt_replace_into))
+  {
+    if (my_hash_insert(&ignore_data,
+                       (uchar*) my_strdup(PSI_NOT_INSTRUMENTED,
+                                          "mysql.innodb_index_stats", MYF(MY_WME))) ||
+        my_hash_insert(&ignore_data,
+                       (uchar*) my_strdup(PSI_NOT_INSTRUMENTED,
+                                          "mysql.innodb_table_stats", MYF(MY_WME))))
+      return(EX_EOM);
+  }
 
   if (opt_system & OPT_SYSTEM_ALL)
       opt_system|= ~0;
@@ -3926,14 +3958,6 @@ static void dump_table(const char *table, const char *db, const uchar *hash_key,
   DBUG_ENTER("dump_table");
 
   /*
-    Check does table has a sequence structure and if has apply different sql queries
-  */
-  if (check_if_ignore_table(table, table_type) & IGNORE_SEQUENCE_TABLE)
-  {
-    get_sequence_structure(table, db);
-    DBUG_VOID_RETURN;
-  }
-  /*
     Make sure you get the create table info before the following check for
     --no-data flag below. Otherwise, the create table info won't be printed.
   */
@@ -4434,18 +4458,36 @@ err:
 } /* dump_table */
 
 
-static char *getTableName(int reset)
+static char *getTableName(int reset, int want_sequences)
 {
   MYSQL_ROW row;
 
   if (!get_table_name_result)
   {
-    if (!(get_table_name_result= mysql_list_tables(mysql,NullS)))
-      return(NULL);
+    if (mysql_get_server_version(mysql) >= FIRST_SEQUENCE_VERSION)
+    {
+      const char *query= "SHOW FULL TABLES";
+      if (mysql_query_with_error_report(mysql, 0, query))
+        return (NULL);
+
+      if (!(get_table_name_result= mysql_store_result(mysql)))
+        return (NULL);
+    }
+    else
+    {
+      if (!(get_table_name_result= mysql_list_tables(mysql,NullS)))
+        return(NULL);
+    }
   }
   if ((row= mysql_fetch_row(get_table_name_result)))
-    return((char*) row[0]);
+  {
+    if (want_sequences != DUMP_TABLE_ALL)
+      while (row && MY_TEST(strcmp(row[1], "SEQUENCE")) == want_sequences)
+        row= mysql_fetch_row(get_table_name_result);
 
+    if (row)
+      return((char*) row[0]);
+  }
   if (reset)
     mysql_data_seek(get_table_name_result,0);      /* We want to read again */
   else
@@ -4838,7 +4880,7 @@ static int dump_all_servers()
 
 static int dump_all_stats()
 {
-  my_bool prev_no_create_info;
+  my_bool prev_no_create_info, prev_opt_replace_into;
 
   if (mysql_select_db(mysql, "mysql"))
   {
@@ -4846,6 +4888,8 @@ static int dump_all_stats()
     return 1;                   /* If --force */
   }
   fprintf(md_result_file,"\nUSE mysql;\n");
+  prev_opt_replace_into= opt_replace_into;
+  opt_replace_into|= !opt_ignore;
   prev_no_create_info= opt_no_create_info;
   opt_no_create_info= 1; /* don't overwrite recreate tables */
   /* EITS added in 10.0.1 */
@@ -4864,6 +4908,7 @@ static int dump_all_stats()
     dump_table("innodb_table_stats", "mysql", NULL, 0);
   }
   opt_no_create_info= prev_no_create_info;
+  opt_replace_into= prev_opt_replace_into;
   return 0;
 }
 
@@ -4874,12 +4919,14 @@ static int dump_all_stats()
 
 static int dump_all_timezones()
 {
-  my_bool opt_prev_no_create_info;
+  my_bool opt_prev_no_create_info, opt_prev_replace_into;
   if (mysql_select_db(mysql, "mysql"))
   {
     DB_error(mysql, "when selecting the database");
     return 1;                   /* If --force */
   }
+  opt_prev_replace_into= opt_replace_into;
+  opt_replace_into|= !opt_ignore;
   opt_prev_no_create_info= opt_no_create_info;
   opt_no_create_info= 1;
   fprintf(md_result_file,"\nUSE mysql;\n");
@@ -4889,6 +4936,7 @@ static int dump_all_timezones()
   dump_table("time_zone_transition", "mysql", NULL, 0);
   dump_table("time_zone_transition_type", "mysql", NULL, 0);
   opt_no_create_info= opt_prev_no_create_info;
+  opt_replace_into= opt_prev_replace_into;
   return 0;
 }
 
@@ -5378,7 +5426,7 @@ static int dump_all_tables_in_db(char *database)
   {
     DYNAMIC_STRING query;
     init_dynamic_string_checked(&query, "LOCK TABLES ", 256, 1024);
-    for (numrows= 0 ; (table= getTableName(1)) ; )
+    for (numrows= 0 ; (table= getTableName(1, DUMP_TABLE_ALL)) ; )
     {
       char *end= strmov(afterdot, table);
       if (include_table((uchar*) hash_key,end - hash_key))
@@ -5412,7 +5460,19 @@ static int dump_all_tables_in_db(char *database)
       DBUG_RETURN(1);
     }
   }
-  while ((table= getTableName(0)))
+
+  if (mysql_get_server_version(mysql) >= FIRST_SEQUENCE_VERSION &&
+      !opt_no_create_info)
+  {
+    // First process sequences
+    while ((table= getTableName(1, DUMP_TABLE_SEQUENCE)))
+    {
+      char *end= strmov(afterdot, table);
+      if (include_table((uchar*) hash_key, end - hash_key))
+        get_sequence_structure(table, database);
+    }
+  }
+  while ((table= getTableName(0, DUMP_TABLE_TABLE)))
   {
     char *end= strmov(afterdot, table);
     if (include_table((uchar*) hash_key, end - hash_key))
@@ -5561,7 +5621,7 @@ static my_bool dump_all_views_in_db(char *database)
   {
     DYNAMIC_STRING query;
     init_dynamic_string_checked(&query, "LOCK TABLES ", 256, 1024);
-    for (numrows= 0 ; (table= getTableName(1)); )
+    for (numrows= 0 ; (table= getTableName(1, DUMP_TABLE_TABLE)); )
     {
       char *end= strmov(afterdot, table);
       if (include_table((uchar*) hash_key,end - hash_key))
@@ -5584,7 +5644,7 @@ static my_bool dump_all_views_in_db(char *database)
     else
       verbose_msg("-- dump_all_views_in_db : logs flushed successfully!\n");
   }
-  while ((table= getTableName(0)))
+  while ((table= getTableName(0, DUMP_TABLE_TABLE)))
   {
     char *end= strmov(afterdot, table);
     if (include_table((uchar*) hash_key, end - hash_key))
@@ -5714,7 +5774,7 @@ static int get_sys_var_lower_case_table_names()
 
 static int dump_selected_tables(char *db, char **table_names, int tables)
 {
-  char table_buff[NAME_LEN*2+3];
+  char table_buff[NAME_LEN*2+3], table_type[NAME_LEN];
   DYNAMIC_STRING lock_tables_query;
   char **dump_tables, **pos, **end;
   int lower_case_table_names;
@@ -5811,9 +5871,22 @@ static int dump_selected_tables(char *db, char **table_names, int tables)
       DBUG_RETURN(1);
     }
   }
+
+  if (mysql_get_server_version(mysql) >= FIRST_SEQUENCE_VERSION)
+  {
+    /* Dump Sequence first */
+    for (pos= dump_tables; pos < end; pos++)
+    {
+      DBUG_PRINT("info",("Dumping sequence(?) %s", *pos));
+      if (check_if_ignore_table(*pos, table_type) & IGNORE_SEQUENCE_TABLE)
+        get_sequence_structure(*pos, db);
+    }
+  }
   /* Dump each selected table */
   for (pos= dump_tables; pos < end; pos++)
   {
+    if (check_if_ignore_table(*pos, table_type) & IGNORE_SEQUENCE_TABLE)
+      continue;
     DBUG_PRINT("info",("Dumping table %s", *pos));
     dump_table(*pos, db, NULL, 0);
     if (opt_dump_triggers &&

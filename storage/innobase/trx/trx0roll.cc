@@ -90,7 +90,6 @@ inline bool trx_t::rollback_finish()
     undo= nullptr;
   }
   commit_low();
-  lock.que_state= TRX_QUE_RUNNING;
   return false;
 }
 
@@ -143,7 +142,6 @@ inline void trx_t::rollback_low(trx_savept_t *savept)
         mod_tables.erase(j);
       }
     }
-    lock.que_state= TRX_QUE_RUNNING;
     MONITOR_INC(MONITOR_TRX_ROLLBACK_SAVEPOINT);
   }
 
@@ -157,6 +155,7 @@ inline void trx_t::rollback_low(trx_savept_t *savept)
 @return error code or DB_SUCCESS */
 dberr_t trx_t::rollback(trx_savept_t *savept)
 {
+  ut_ad(!mutex_is_owner());
   if (state == TRX_STATE_NOT_STARTED)
   {
     error_state= DB_SUCCESS;
@@ -210,7 +209,7 @@ dberr_t trx_rollback_for_mysql(trx_t* trx)
 		ut_ad(trx->mysql_thd);
 #ifdef WITH_WSREP
 		trx->wsrep= false;
-		trx->lock.was_chosen_as_wsrep_victim= false;
+		trx->lock.was_chosen_as_deadlock_victim= false;
 #endif
 		return(DB_SUCCESS);
 
@@ -432,7 +431,7 @@ trx_rollback_to_savepoint_for_mysql_low(
 
 	trx->op_info = "";
 #ifdef WITH_WSREP
-	trx->lock.was_chosen_as_wsrep_victim = false;
+	trx->lock.was_chosen_as_deadlock_victim = false;
 #endif
 	return(err);
 }
@@ -604,7 +603,7 @@ trx_rollback_active(
 
 	heap = mem_heap_create(512);
 
-	fork = que_fork_create(NULL, NULL, QUE_FORK_RECOVERY, heap);
+	fork = que_fork_create(heap);
 	fork->trx = trx;
 
 	thr = que_thr_create(fork, heap, NULL);
@@ -639,8 +638,6 @@ trx_rollback_active(
 		ut_ad(!dictionary_locked);
 		goto func_exit;
 	}
-
-	ut_a(trx->lock.que_state == TRX_QUE_RUNNING);
 
 	if (!dictionary_locked || !trx->table_id) {
 	} else if (dict_table_t* table = dict_table_open_on_id(
@@ -728,10 +725,10 @@ static my_bool trx_rollback_recovered_callback(rw_trx_hash_element_t *element,
   mysql_mutex_lock(&element->mutex);
   if (trx_t *trx= element->trx)
   {
-    trx->mutex.wr_lock();
+    trx->mutex_lock();
     if (trx_state_eq(trx, TRX_STATE_ACTIVE) && trx->is_recovered)
       trx_list->push_back(trx);
-    trx->mutex.wr_unlock();
+    trx->mutex_unlock();
   }
   mysql_mutex_unlock(&element->mutex);
   return 0;
@@ -773,10 +770,10 @@ void trx_rollback_recovered(bool all)
     trx_list.pop_back();
 
     ut_ad(trx);
-    ut_d(trx->mutex.wr_lock());
+    ut_d(trx->mutex_lock());
     ut_ad(trx->is_recovered);
     ut_ad(trx_state_eq(trx, TRX_STATE_ACTIVE));
-    ut_d(trx->mutex.wr_unlock());
+    ut_d(trx->mutex_unlock());
 
     if (srv_shutdown_state != SRV_SHUTDOWN_NONE && !srv_undo_sources &&
         srv_fast_shutdown)
@@ -870,8 +867,9 @@ trx_roll_graph_build(
 	que_fork_t*	fork;
 	que_thr_t*	thr;
 
+	ut_ad(trx->mutex_is_owner());
 	heap = mem_heap_create(512);
-	fork = que_fork_create(NULL, NULL, QUE_FORK_ROLLBACK, heap);
+	fork = que_fork_create(heap);
 	fork->trx = trx;
 
 	thr = que_thr_create(fork, heap, NULL);
@@ -896,6 +894,7 @@ trx_rollback_start(
 {
 	/* Initialize the rollback field in the transaction */
 
+	ut_ad(trx->mutex_is_owner());
 	ut_ad(!trx->roll_limit);
 	ut_ad(!trx->in_rollback);
 
@@ -911,8 +910,6 @@ trx_rollback_start(
 	que_t*	roll_graph = trx_roll_graph_build(trx);
 
 	trx->graph = roll_graph;
-
-	trx->lock.que_state = TRX_QUE_ROLLING_BACK;
 
 	return(que_fork_start_command(roll_graph));
 }
@@ -966,13 +963,13 @@ trx_rollback_step(
 
 		roll_limit = node->savept ? node->savept->least_undo_no : 0;
 
-		trx->mutex.wr_lock();
+		trx->mutex_lock();
 
 		trx_commit_or_rollback_prepare(trx);
 
 		node->undo_thr = trx_rollback_start(trx, roll_limit);
 
-		trx->mutex.wr_unlock();
+		trx->mutex_unlock();
 	} else {
 		ut_ad(node->state == ROLL_NODE_WAIT);
 

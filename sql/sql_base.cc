@@ -4430,37 +4430,25 @@ restart:
       else
         tbl->reginfo.lock_type= tables->lock_type;
     }
-  }
-
 #ifdef WITH_WSREP
-  if (WSREP(thd)                                       &&
-      wsrep_replicate_myisam                           &&
-      (*start)                                         &&
-      (*start)->table                                  &&
-      (*start)->table->file->ht == myisam_hton         &&
-      wsrep_thd_is_local(thd)                          &&
-      !is_stat_table(&(*start)->db, &(*start)->alias)  &&
-      thd->get_command() != COM_STMT_PREPARE           &&
-      ((thd->lex->sql_command == SQLCOM_INSERT         ||
-        thd->lex->sql_command == SQLCOM_INSERT_SELECT  ||
-        thd->lex->sql_command == SQLCOM_REPLACE        ||
-        thd->lex->sql_command == SQLCOM_REPLACE_SELECT ||
-        thd->lex->sql_command == SQLCOM_UPDATE         ||
-        thd->lex->sql_command == SQLCOM_UPDATE_MULTI   ||
-        thd->lex->sql_command == SQLCOM_LOAD           ||
-        thd->lex->sql_command == SQLCOM_DELETE)))
-  {
-      wsrep_before_rollback(thd, true);
-      wsrep_after_rollback(thd, true);
-      wsrep_after_statement(thd);
-      WSREP_TO_ISOLATION_BEGIN(NULL, NULL, (*start));
+    /*
+       At this point we have SE associated with table so we can check wsrep_mode
+       rules at this point.
+    */
+    if (WSREP(thd) &&
+        wsrep_thd_is_local(thd) &&
+        tbl &&
+        tables == *start &&
+        !wsrep_check_mode_after_open_table(thd,
+                                           tbl->file->ht, tables))
+    {
+      error= TRUE;
+      goto error;
+    }
+#endif
   }
-#endif /* WITH_WSREP */
 
 error:
-#ifdef WITH_WSREP
-wsrep_error_label:
-#endif
   THD_STAGE_INFO(thd, stage_after_opening_tables);
   thd_proc_info(thd, 0);
 

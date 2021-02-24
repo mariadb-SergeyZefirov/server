@@ -68,6 +68,9 @@ Created 10/16/1994 Heikki Tuuri
 #include "mysql_com.h"
 #include "dict0stats.h"
 #include "row0ins.h"
+#ifdef WITH_WSREP
+#include "mysql/service_wsrep.h"
+#endif /* WITH_WSREP */
 
 /** Buffered B-tree operation types, introduced as part of delete buffering. */
 enum btr_op_t {
@@ -1498,7 +1501,8 @@ x_latch_index:
 		if (!srv_read_only_mode) {
 			if (s_latch_by_caller) {
 				ut_ad(mtr->memo_contains_flagged(
-					      &index->lock, MTR_MEMO_S_LOCK));
+					      &index->lock, MTR_MEMO_S_LOCK
+					      | MTR_MEMO_SX_LOCK));
 			} else if (!modify_external) {
 				/* BTR_SEARCH_TREE is intended to be used with
 				BTR_ALREADY_S_LATCHED */
@@ -1998,11 +2002,13 @@ retry_page_get:
 		trx_t*		trx = thr_get_trx(cursor->thr);
 		lock_prdt_t	prdt;
 
-		lock_sys.mutex_lock();
+		lock_sys.rd_lock(SRW_LOCK_CALL);
+		trx->mutex_lock();
 		lock_init_prdt_from_mbr(
 			&prdt, &cursor->rtr_info->mbr, mode,
 			trx->lock.lock_heap);
-		lock_sys.mutex_unlock();
+		lock_sys.rd_unlock();
+		trx->mutex_unlock();
 
 		if (rw_latch == RW_NO_LATCH && height != 0) {
 			block->lock.s_lock();
@@ -3231,7 +3237,8 @@ btr_cur_ins_lock_and_undo(
 
 	/* Check if there is predicate or GAP lock preventing the insertion */
 	if (!(flags & BTR_NO_LOCKING_FLAG)) {
-		if (index->is_spatial()) {
+		const unsigned type = index->type;
+		if (UNIV_UNLIKELY(type & DICT_SPATIAL)) {
 			lock_prdt_t	prdt;
 			rtr_mbr_t	mbr;
 
@@ -3240,8 +3247,7 @@ btr_cur_ins_lock_and_undo(
 			/* Use on stack MBR variable to test if a lock is
 			needed. If so, the predicate (MBR) will be allocated
 			from lock heap in lock_prdt_insert_check_and_lock() */
-			lock_init_prdt_from_mbr(
-				&prdt, &mbr, 0, NULL);
+			lock_init_prdt_from_mbr(&prdt, &mbr, 0, nullptr);
 
 			if (dberr_t err = lock_prdt_insert_check_and_lock(
 				    rec, btr_cur_get_block(cursor),
@@ -3253,6 +3259,24 @@ btr_cur_ins_lock_and_undo(
 			ut_ad(!dict_index_is_online_ddl(index)
 			      || index->is_primary()
 			      || (flags & BTR_CREATE_FLAG));
+#ifdef WITH_WSREP
+			trx_t* trx= thr_get_trx(thr);
+			/* If transaction scanning an unique secondary
+			key is wsrep high priority thread (brute
+			force) this scanning may involve GAP-locking
+			in the index. As this locking happens also
+			when applying replication events in high
+			priority applier threads, there is a
+			probability for lock conflicts between two
+			wsrep high priority threads. To avoid this
+			GAP-locking we mark that this transaction
+			is using unique key scan here. */
+			if ((type & (DICT_CLUSTERED | DICT_UNIQUE)) == DICT_UNIQUE
+			    && trx->is_wsrep()
+			    && wsrep_thd_is_BF(trx->mysql_thd, false)) {
+				trx->wsrep = 3;
+			}
+#endif /* WITH_WSREP */
 			if (dberr_t err = lock_rec_insert_check_and_lock(
 				    rec, btr_cur_get_block(cursor),
 				    index, thr, mtr, inherit)) {
@@ -3310,15 +3334,15 @@ static void btr_cur_prefetch_siblings(const buf_block_t *block,
   uint32_t prev= mach_read_from_4(my_assume_aligned<4>(page + FIL_PAGE_PREV));
   uint32_t next= mach_read_from_4(my_assume_aligned<4>(page + FIL_PAGE_NEXT));
 
+  fil_space_t *space= index->table->space;
+
   if (prev == FIL_NULL);
-  else if (index->table->space->acquire())
-    buf_read_page_background(index->table->space,
-                             page_id_t(block->page.id().space(), prev),
+  else if (space->acquire())
+    buf_read_page_background(space, page_id_t(space->id, prev),
                              block->zip_size(), false);
   if (next == FIL_NULL);
-  else if (index->table->space->acquire())
-    buf_read_page_background(index->table->space,
-                             page_id_t(block->page.id().space(), next),
+  else if (space->acquire())
+    buf_read_page_background(space, page_id_t(space->id, next),
                              block->zip_size(), false);
 }
 
@@ -3858,7 +3882,7 @@ btr_cur_upd_lock_and_undo(
 
 	if (!(flags & BTR_NO_LOCKING_FLAG)) {
 		err = lock_clust_rec_modify_check_and_lock(
-			flags, btr_cur_get_block(cursor), rec, index,
+			btr_cur_get_block(cursor), rec, index,
 			offsets, thr);
 		if (err != DB_SUCCESS) {
 			return(err);
@@ -4149,7 +4173,16 @@ void btr_cur_upd_rec_in_place(rec_t *rec, const dict_index_t *index,
 			}
 
 			ut_ad(!index->table->not_redundant());
-			if (ulint size = rec_get_nth_field_size(rec, n)) {
+			switch (ulint size = rec_get_nth_field_size(rec, n)) {
+			case 0:
+				break;
+			case 1:
+				mtr->write<1,mtr_t::MAYBE_NOP>(
+					*block,
+					rec_get_field_start_offs(rec, n) + rec,
+					0U);
+				break;
+			default:
 				mtr->memset(
 					block,
 					page_offset(rec_get_field_start_offs(
@@ -4750,7 +4783,8 @@ any_extern:
 		btr_page_reorganize(page_cursor, index, mtr);
 	} else if (!dict_table_is_locking_disabled(index->table)) {
 		/* Restore the old explicit lock state on the record */
-		lock_rec_restore_from_page_infimum(block, rec, block);
+		lock_rec_restore_from_page_infimum(*block, rec,
+						   block->page.id());
 	}
 
 	page_cur_move_to_next(page_cursor);
@@ -4804,10 +4838,11 @@ btr_cur_pess_upd_restore_supremum(
 
 	const uint32_t	prev_page_no = btr_page_get_prev(page);
 
-	const page_id_t	page_id(block->page.id().space(), prev_page_no);
+	const page_id_t block_id{block->page.id()};
+	const page_id_t	prev_id(block_id.space(), prev_page_no);
 
 	ut_ad(prev_page_no != FIL_NULL);
-	prev_block = buf_page_get_with_no_latch(page_id, block->zip_size(),
+	prev_block = buf_page_get_with_no_latch(prev_id, block->zip_size(),
 						mtr);
 #ifdef UNIV_BTR_DEBUG
 	ut_a(btr_page_get_next(prev_block->frame)
@@ -4817,7 +4852,7 @@ btr_cur_pess_upd_restore_supremum(
 	/* We must already have an x-latch on prev_block! */
 	ut_ad(mtr->memo_contains_flagged(prev_block, MTR_MEMO_PAGE_X_FIX));
 
-	lock_rec_reset_and_inherit_gap_locks(prev_block, block,
+	lock_rec_reset_and_inherit_gap_locks(*prev_block, block_id,
 					     PAGE_HEAP_NO_SUPREMUM,
 					     page_rec_get_heap_no(rec));
 }
@@ -5105,7 +5140,8 @@ btr_cur_pessimistic_update(
 			}
 		} else if (!dict_table_is_locking_disabled(index->table)) {
 			lock_rec_restore_from_page_infimum(
-				btr_cur_get_block(cursor), rec, block);
+				*btr_cur_get_block(cursor), rec,
+				block->page.id());
 		}
 
 		if (!rec_get_deleted_flag(rec, rec_offs_comp(*offsets))
@@ -5250,7 +5286,7 @@ btr_cur_pessimistic_update(
 		rec = page_cursor->rec;
 	} else if (!dict_table_is_locking_disabled(index->table)) {
 		lock_rec_restore_from_page_infimum(
-			btr_cur_get_block(cursor), rec, block);
+			*btr_cur_get_block(cursor), rec, block->page.id());
 	}
 
 	/* If necessary, restore also the correct lock state for a new,
@@ -5350,14 +5386,6 @@ btr_cur_del_mark_set_clust_rec(
 		return(DB_SUCCESS);
 	}
 
-	err = lock_clust_rec_modify_check_and_lock(BTR_NO_LOCKING_FLAG, block,
-						   rec, index, offsets, thr);
-
-	if (err != DB_SUCCESS) {
-
-		return(err);
-	}
-
 	err = trx_undo_report_row_operation(thr, index,
 					    entry, NULL, 0, rec, offsets,
 					    &roll_ptr);
@@ -5377,7 +5405,7 @@ btr_cur_del_mark_set_clust_rec(
 	DBUG_LOG("ib_cur",
 		 "delete-mark clust " << index->table->name
 		 << " (" << index->id << ") by "
-		 << ib::hex(trx_get_id_for_print(trx)) << ": "
+		 << ib::hex(trx->id) << ": "
 		 << rec_printer(rec, offsets).str());
 
 	if (dict_index_is_online_ddl(index)) {

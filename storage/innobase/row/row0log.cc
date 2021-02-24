@@ -326,6 +326,25 @@ row_log_block_free(
 	DBUG_VOID_RETURN;
 }
 
+/** Empty the online log.
+@param index	index log to be cleared */
+static void row_log_empty(dict_index_t *index)
+{
+  ut_ad(index->lock.have_s());
+  row_log_t *log= index->online_log;
+
+  mysql_mutex_lock(&log->mutex);
+  UT_DELETE(log->blobs);
+  log->blobs= nullptr;
+  row_log_block_free(log->tail);
+  row_log_block_free(log->head);
+  row_merge_file_destroy_low(log->fd);
+  log->fd= OS_FILE_CLOSED;
+  log->tail.total= log->tail.blocks= log->tail.bytes= 0;
+  log->head.total= log->head.blocks= log->head.bytes= 0;
+  mysql_mutex_unlock(&log->mutex);
+}
+
 /******************************************************//**
 Logs an operation to a secondary index that is (or was) being created. */
 void
@@ -358,6 +377,7 @@ row_log_online_op(
 	extra_size+1 (and reserve 0 as the end-of-chunk marker). */
 
 	if (!tuple) {
+		row_log_empty(index);
 		mrec_size = 4;
 		extra_size = 0;
 		size = 2;
@@ -3609,8 +3629,7 @@ row_log_apply_op(
 	case ROW_OP_EMPTY:
 	{
 		mem_heap_t* heap = mem_heap_create(512);
-		que_fork_t* fork = que_fork_create(
-			NULL, NULL, QUE_FORK_MYSQL_INTERFACE, heap);
+		que_fork_t* fork = que_fork_create(heap);
 		que_thr_t* thr = que_thr_create(fork, heap, nullptr);
 		index->clear(thr);
 		mem_heap_free(heap);
@@ -4064,6 +4083,7 @@ row_log_apply(
 static void row_log_table_empty(dict_index_t *index)
 {
   ut_ad(index->lock.have_s());
+  row_log_empty(index);
   row_log_t* log= index->online_log;
   ulint	avail_size;
   if (byte *b= row_log_table_open(log, 1, &avail_size))
